@@ -1,0 +1,26 @@
+{
+  "name": "power-platform-project",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Canvas, Dataverse and Power Automate project scaffold",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "mcp:playwright": "playwright-mcp --browser chrome --host 127.0.0.1 --port 8931 --allowed-hosts 127.0.0.1:8931 --shared-browser-context --user-data-dir .workflow/browser-profile --output-dir test-results/mcp",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "test:report": "playwright show-report",
+    "toolkit:build": "node scripts/build-power-platform-toolkit.mjs",
+    "postinstall": "npm run toolkit:build",
+    "test:toolkit": "playwright test --config playwright.toolkit.config.cjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@playwright/mcp": "0.0.83",
+    "@playwright/test": "1.63.0",
+    "power-platform-playwright-toolkit": "file:vendor/power-platform-playwright-toolkit",
+    "typescript": "5.9.3",
+    "@types/node": "25.0.3"
+  }
+}

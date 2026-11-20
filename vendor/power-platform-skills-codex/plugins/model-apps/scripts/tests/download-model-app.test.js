@@ -1,0 +1,5100 @@
+'use strict';
+// Also guards https://github.com/microsoft/power-platform-skills/issues/494 — download did not read
+// artifact descriptions back, so a downloaded spec silently lost every description on rebuild.
+const { test } = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { untypedColumnNames, collectGlobalChoices, finalizeGlobalChoices, resolveAppId, collectSitemap, parseDownloadedPages, entityFromMetadata, readEntityWithDescriptions, readDescriptionInventory, iconWebResources, readDashboards, readRelationships, droppedSubareaCount, preserveAuthoredLanguageCode } = require('../download-model-app.js');
+const { currentReadSdk, APP: COMPONENT_APP_ID, CURRENT: COMPONENT_LAYER_ID } = require('./helpers/app-membership-sdk.js');
+const { fakeGenpage } = require('./helpers/fake-genpage.js');
+
+test('resolveAppId returns a guid as-is, else resolves by uniquename', async () => {
+  const guid = '11111111-2222-3333-4444-555555555555';
+  assert.deepStrictEqual(await resolveAppId({}, guid), { appId: guid });
+  const sdk = { queryRecords: async (l, o) => { assert.match(o.filter, /uniquename eq 'new_app'/); return [{ appmoduleid: 'app-1' }]; } };
+  assert.deepStrictEqual(await resolveAppId(sdk, 'new_app'), { appId: 'app-1', matchedBy: 'uniqueName' });
+});
+
+test('resolveAppId escapes apostrophes and reports an actionable error for a missing app', async () => {
+  const calls = [];
+  const sdk = { queryRecords: async (logical, opts) => { calls.push({ logical, opts }); return []; } };
+  const r = await resolveAppId(sdk, "new_bob's_app");
+  assert.match(r.error, /not found/);
+  // The dead-end "app 'x' not found" gave an operator holding a display name nowhere to go.
+  assert.match(r.error, /unique name/);
+  assert.strictEqual(r.appId, undefined);
+  assert.strictEqual(calls[0].logical, 'appmodule');
+  assert.match(calls[0].opts.filter, /uniquename eq 'new_bob''s_app'/);
+  // The display-name fallback must escape the apostrophe the same way, or it is an OData syntax error.
+  assert.match(calls[1].opts.filter, /name eq 'new_bob''s_app'/);
+});
+
+// A live tester hit this: the maker portal shows a DISPLAY name, but --app only accepted the unique
+// name, so the obvious input failed with a dead-end error.
+test('resolveAppId falls back to an unambiguous display name and reports the unique name', async () => {
+  const sdk = {
+    queryRecords: async (_l, o) => (/uniquename eq/.test(o.filter) ? [] : [{ appmoduleid: 'app-9', uniquename: 'new_smokeapp', name: 'Smoke App' }]),
+  };
+  assert.deepStrictEqual(await resolveAppId(sdk, 'Smoke App'), { appId: 'app-9', matchedBy: 'displayName', uniqueName: 'new_smokeapp' });
+});
+
+// Display names are mutable AND non-unique, so guessing could download a different app than the
+// operator meant — refuse and hand back the unique names instead.
+test('resolveAppId fails closed when a display name matches more than one app', async () => {
+  const sdk = {
+    queryRecords: async (_l, o) => (/uniquename eq/.test(o.filter) ? [] : [
+      { appmoduleid: 'app-1', uniquename: 'new_sales', name: 'Sales' },
+      { appmoduleid: 'app-2', uniquename: 'contoso_sales', name: 'Sales' },
+    ]),
+  };
+  const r = await resolveAppId(sdk, 'Sales');
+  assert.strictEqual(r.appId, undefined, 'must not pick one of the ambiguous matches');
+  assert.match(r.error, /shared by 2 apps/);
+  assert.match(r.error, /new_sales, contoso_sales/);
+});
+
+// A display name read twice by a paginating server is still one app; an answer that says more apps carry the name
+// than it returned does not prove the name unique, so it is refused like an ambiguous one.
+test('resolveAppId counts distinct apps, and refuses a display-name answer cut short', async () => {
+  const row = { appmoduleid: 'app-9', uniquename: 'new_smokeapp', name: 'Smoke App' };
+  const repeated = { queryRecords: async (_l, o) => (/uniquename eq/.test(o.filter) ? [] : [row, { ...row }]) };
+  assert.deepStrictEqual(await resolveAppId(repeated, 'Smoke App'), { appId: 'app-9', matchedBy: 'displayName', uniqueName: 'new_smokeapp' });
+  const partial = [row];
+  Object.defineProperty(partial, 'hasMore', { value: true, enumerable: false });
+  const cut = { queryRecords: async (_l, o) => (/uniquename eq/.test(o.filter) ? [] : partial) };
+  const r = await resolveAppId(cut, 'Smoke App');
+  assert.strictEqual(r.appId, undefined, 'one row of a cut-short answer is not "exactly one"');
+  assert.match(r.error, /could not prove unique/);
+  assert.match(r.error, /new_smokeapp/);
+});
+// A GUID is authoritative: resolving it must not cost a query, and must never reach the
+// display-name fallback (an app DISPLAY-named like a GUID could otherwise shadow a real id).
+test('resolveAppId issues no query for a GUID', async () => {
+  let queried = false;
+  const sdk = { queryRecords: async () => { queried = true; return []; } };
+  const r = await resolveAppId(sdk, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  assert.strictEqual(r.appId, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  assert.strictEqual(queried, false);
+});
+
+test('collectSitemap gathers distinct entities + icons from the sitemap', () => {
+  const app = { siteMap: { areas: [{ icon: 'a.png', groups: [{ subAreas: [
+    { type: 'Entity', entity: 'New_Order', icon: 'i.png' },
+    { type: 'GenPage', genPageId: 'gp' },
+    { type: 'Entity', entity: 'new_order' },
+  ] }] }] } };
+  const { entities, icons } = collectSitemap(app);
+  assert.deepStrictEqual(entities, ['new_order']);
+  assert.deepStrictEqual([...icons].sort(), ['a.png', 'i.png']);
+});
+
+test('collectSitemap separates BARE-NAME icons from platform-path customRefs (both icon + vectorIcon, areas + subareas)', () => {
+  const app = { siteMap: { areas: [{ icon: '/WebResources/crba3_area.svg', groups: [{ subAreas: [
+    { type: 'Entity', entity: 'zava_javavendor', icon: '/WebResources/msdyn_OmnichannelBase/_imgs/SitemapIcon/CDSEntity', vectorIcon: '/WebResources/crba3_/icons/approval.svg' },
+    { type: 'Entity', entity: 'new_thing', icon: 'new_declared.png' }, // a bare name → icons (fetched + re-declared)
+  ] }] }] } };
+  const { icons, customRefs } = collectSitemap(app);
+  assert.deepStrictEqual([...icons], ['new_declared.png'], 'only the bare-name icon goes to icons');
+  // Platform paths → customRefs, with the WR NAME extracted (leading /WebResources/ stripped); OOB + custom alike.
+  assert.deepStrictEqual([...customRefs].sort(), [
+    'crba3_/icons/approval.svg', 'crba3_area.svg', 'msdyn_OmnichannelBase/_imgs/SitemapIcon/CDSEntity',
+  ].sort(), 'icon + vectorIcon platform paths are gathered as customRefs (name-extracted)');
+});
+
+test('iconWebResources re-declares an OWN-PREFIX CUSTOM (unmanaged) image WR as external:true; SKIPS managed/OOB + foreign-prefix; tracks unresolved own-prefix refs', async () => {
+  const sdk = { queryRecords: async (e, o) => {
+    const name = (o.filter.match(/name eq '([^']*)'/) || [])[1];
+    if (name === 'crba3_navicon.svg') return [{ name, webresourcetype: 11, content: 'PHN2Zz4=', ismanaged: false }]; // own custom unmanaged SVG
+    if (name === 'msdyn_x/CDSEntity') return [{ name, webresourcetype: 11, content: 'x', ismanaged: true }];          // managed OOB
+    if (name === 'isv_foreign.svg') return [{ name, webresourcetype: 11, content: 'y', ismanaged: false }];           // foreign unmanaged (another publisher)
+    if (name === 'crba3_bare.png') return [{ name, webresourcetype: 5, content: 'aW1n', ismanaged: false }];          // bare-name author icon
+    if (name === 'crba3_gone.svg') return [];                                                                         // own-prefix but absent on source → unresolved
+    return [];
+  } };
+  const { webResources, unresolved } = await iconWebResources(
+    sdk, ['crba3_bare.png'], ['crba3_navicon.svg', 'msdyn_x/CDSEntity', 'isv_foreign.svg', 'crba3_gone.svg'], 'crba3', true);
+  const byName = Object.fromEntries(webResources.map((w) => [w.name, w]));
+  assert.ok(byName['crba3_navicon.svg'], 'an OWN-prefix custom unmanaged path-referenced WR is re-declared');
+  assert.strictEqual(byName['crba3_navicon.svg'].external, true, 'a re-declared path-referenced icon is flagged external (teardown skips it)');
+  assert.ok(byName['crba3_bare.png'], 'a bare-name author icon is re-declared as before');
+  assert.notStrictEqual(byName['crba3_bare.png'].external, true, 'a bare-name author icon is NOT external (teardown owns it, as before)');
+  assert.ok(!byName['msdyn_x/CDSEntity'], 'a managed/OOB path-referenced WR is NOT re-declared');
+  assert.ok(!byName['isv_foreign.svg'], 'a FOREIGN-prefix WR is NOT re-declared (would BuildHalt under an unregistered prefix on a fresh env)');
+  assert.deepStrictEqual(unresolved, ['crba3_gone.svg'], 'an own-prefix ref absent on the source env is reported unresolved (surface, do not silently drop)');
+});
+
+test('iconWebResources reports an own-prefix icon read FAILURE as unresolved (not a silent skip)', async () => {
+  const sdk = { queryRecords: async (e, o) => {
+    const name = (o.filter.match(/name eq '([^']*)'/) || [])[1];
+    if (name === 'crba3_flaky.svg') throw new Error('429 throttled');
+    return [];
+  } };
+  const { webResources, unresolved } = await iconWebResources(sdk, [], ['crba3_flaky.svg'], 'crba3', true);
+  assert.strictEqual(webResources.length, 0);
+  assert.deepStrictEqual(unresolved, ['crba3_flaky.svg'], 'a transient read failure on an own-prefix icon is surfaced');
+});
+
+test('iconWebResources with an UNVERIFIED prefix (publisher read failed) surfaces a genuine own custom icon as unresolved instead of silently dropping it; a managed/OOB ref stays silent', async () => {
+  // prefixResolved=false + a fallback prefix ('new') that does NOT match the app's real 'crba3' icons.
+  // Without the guard, crba3_nav.svg fails startsWith('new_') and is silently skipped with no warning
+  // — it must instead be surfaced as unresolved; the OOB CDSEntity ref must stay silent.
+  const sdk = { queryRecords: async (e, o) => {
+    const name = (o.filter.match(/name eq '([^']*)'/) || [])[1];
+    if (name === 'crba3_nav.svg') return [{ name, webresourcetype: 11, content: 'PHN2Zz4=', ismanaged: false }]; // genuine own custom svg
+    if (name === 'msdyn_x/CDSEntity') return [{ name, webresourcetype: 11, content: 'x', ismanaged: true }];      // managed OOB (exists everywhere)
+    return [];
+  } };
+  const { webResources, unresolved } = await iconWebResources(
+    sdk, [], ['crba3_nav.svg', 'msdyn_x/CDSEntity'], 'new', false);
+  assert.strictEqual(webResources.length, 0, 'never re-declares under an unverified prefix (would BuildHalt on a fresh env)');
+  assert.deepStrictEqual(unresolved, ['crba3_nav.svg'], 'the genuine custom icon is surfaced; the managed OOB ref stays silent (no false alarm)');
+});
+
+test('iconWebResources: a WR referenced BOTH by a bare name AND a platform path inherits external:true (overlap keeps teardown protection)', async () => {
+  // If the bare pass emitted the WR without external and `seen` then suppressed the path
+  // classification, teardown would delete a shared nav icon. The path pass runs first / the bare entry
+  // inherits external when it is also a customRef.
+  const sdk = { queryRecords: async (e, o) => {
+    const name = (o.filter.match(/name eq '([^']*)'/) || [])[1];
+    if (name === 'crba3_shared.svg') return [{ name, webresourcetype: 11, content: 'PHN2Zz4=', ismanaged: false }];
+    return [];
+  } };
+  const { webResources } = await iconWebResources(
+    sdk, ['crba3_shared.svg'], ['crba3_shared.svg'], 'crba3', true);
+  assert.strictEqual(webResources.length, 1, 'the overlapping WR is re-declared exactly once (deduped)');
+  assert.strictEqual(webResources[0].external, true, 'an overlapping bare+path WR is external (teardown must not delete a shared nav icon)');
+});
+
+test('parseDownloadedPages reads the page tree a download writes (<pageId>/page.tsx + config + prompt) into pages[]', () => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-'));
+  const pagesRoot = path.join(out, 'pages');
+  const pid = '6e0c28a2-cdbf-41ec-9186-d10fd5de6e35';
+  fs.mkdirSync(path.join(pagesRoot, pid), { recursive: true });
+  fs.writeFileSync(path.join(pagesRoot, pid, 'page.tsx'), 'x');
+  fs.writeFileSync(path.join(pagesRoot, pid, 'config.json'), JSON.stringify({ dataSources: ['new_order'], model: '' }));
+  fs.writeFileSync(path.join(pagesRoot, pid, 'prompt.txt'), 'kpis');
+  const pages = parseDownloadedPages(pagesRoot, out, new Map([[pid, 'Overview']]));
+  assert.strictEqual(pages.length, 1);
+  assert.strictEqual(pages[0].name, 'Overview');
+  assert.deepStrictEqual(pages[0].dataSources, ['new_order']);
+  assert.strictEqual(pages[0].prompt, 'kpis');
+  assert.strictEqual(pages[0].codeFile, `pages/${pid}/page.tsx`);
+  fs.rmSync(out, { recursive: true, force: true });
+});
+
+test('entityFromMetadata builds a minimal (reuse-friendly) entity spec', () => {
+  const e = entityFromMetadata({ schemaName: 'new_order', displayName: 'Order', primaryNameAttribute: 'new_name' }, 'new_order');
+  assert.strictEqual(e.schemaName, 'new_order');
+  assert.strictEqual(e.primaryAttribute.schemaName, 'new_name');
+  assert.deepStrictEqual(e.columns, []);
+  // A downloaded table is flagged existing:true so a teardown of THIS downloaded spec never deletes a
+  // table (+ its data) we cannot prove this build created — download can't distinguish app-created from
+  // merely-referenced tables, and deleting customer data is unrecoverable.
+  assert.strictEqual(e.existing, true, 'downloaded tables must be flagged existing:true (teardown data-loss guard)');
+});
+
+test('entityFromMetadata carries table and column descriptions, unwrapping Dataverse Labels', () => {
+  const e = entityFromMetadata({
+    schemaName: 'new_order',
+    displayName: 'Order',
+    primaryNameAttribute: 'new_name',
+    Description: {
+      UserLocalizedLabel: { Label: 'Tracks orders through fulfillment.', LanguageCode: 1033 },
+      LocalizedLabels: [{ Label: 'fallback table text', LanguageCode: 1033 }],
+    },
+    attributes: [
+      {
+        LogicalName: 'new_status',
+        Description: {
+          LocalizedLabels: [{ Label: 'Current fulfillment state.', LanguageCode: 1033 }],
+        },
+      },
+      { LogicalName: 'new_internal', Description: null },
+    ],
+  }, 'new_order');
+
+  assert.strictEqual(e.description, 'Tracks orders through fulfillment.');
+  assert.strictEqual(e.columns[0].schemaName, 'new_status');
+  assert.strictEqual(e.columns[0].description, 'Current fulfillment state.');
+  assert.strictEqual('description' in e.columns[1], false, 'null Label descriptions must be omitted, not emitted as ""');
+  assert.strictEqual(validateAppSpec({
+    solution: { uniqueName: 'S', publisherPrefix: 'new' },
+    app: { name: 'A' },
+    entities: [e],
+    appShell: { areas: [] },
+  }).ok, true);
+});
+
+test('readEntityWithDescriptions reads descriptions through the RAW dataverse client, not queryRecords', async () => {
+  // `sdk.queryRecords` cannot serve a metadata path: it first resolves its argument to an entity SET
+  // name via `EntityDefinitions(LogicalName='<arg>')?$select=EntitySetName`, so a metadata path
+  // becomes a nested nonsense URL that 404s. This mock FAILS any queryRecords attempt so the test
+  // proves the raw client is used, rather than passing against a mock that models the wrong contract.
+  const gets = [];
+  const sdk = {
+    fetchEntityMetadata: async (logical) => ({
+      logicalName: logical,
+      schemaName: 'new_order',
+      displayName: 'Order',
+      primaryNameAttribute: 'new_name',
+      // The SDK supplies these; the description merge must PRESERVE them.
+      attributes: [
+        { logicalName: 'new_status', displayName: 'Status', attributeType: 'Picklist' },
+        { logicalName: 'new_owner', displayName: 'Owner', attributeType: 'Lookup', targets: ['systemuser'] },
+      ],
+    }),
+    queryRecords: async (set) => { throw new Error(`queryRecords must not be used for metadata paths (got '${set}')`); },
+    dataverse: {
+      get: async (url) => {
+        gets.push(url);
+        if (/\/Attributes\?/.test(url)) {
+          return { status: 200, headers: {}, body: { value: [
+            { LogicalName: 'new_status', Description: { LocalizedLabels: [{ Label: 'State shown to dispatchers.', LanguageCode: 1033 }] } },
+          ] } };
+        }
+        return { status: 200, headers: {}, body: { Description: { UserLocalizedLabel: { Label: 'Order table purpose.', LanguageCode: 1033 }, LocalizedLabels: [] } } };
+      },
+    },
+  };
+
+  const meta = await readEntityWithDescriptions(sdk, 'new_order');
+  const e = entityFromMetadata(meta, 'new_order');
+
+  // The $select also carries the DISPLAY labels now, so a table/column labelled in more than one
+  // language round-trips (AB#6686428). The SDK's flattened `displayName` keeps only one.
+  assert.ok(gets.some((u) => u === "/EntityDefinitions(LogicalName='new_order')?$select=LogicalName,Description,DisplayName,DisplayCollectionName,IconVectorName&$expand=Keys($select=SchemaName,DisplayName,KeyAttributes,IsManaged)"), `table read URL wrong: ${gets.join(' | ')}`);
+  assert.ok(gets.some((u) => /^\/EntityDefinitions\(LogicalName='new_order'\)\/Attributes\?\$select=LogicalName,Description,DisplayName,IsLogical,AttributeOf,AttributeTypeName$/.test(u)), `attribute read URL wrong: ${gets.join(' | ')}`);
+  assert.strictEqual(e.description, 'Order table purpose.');
+  const status = e.columns.find((c) => c.schemaName === 'new_status');
+  assert.strictEqual(status.description, 'State shown to dispatchers.');
+  // The merge must not discard SDK-only attribute facts (a replace would drop `targets`, breaking
+  // lookup handling elsewhere) nor drop attributes the description read did not return.
+  const owner = meta.attributes.find((a) => a.logicalName === 'new_owner');
+  assert.ok(owner, 'an attribute with no description was dropped by the merge');
+  assert.deepStrictEqual(owner.targets, ['systemuser'], 'the merge clobbered SDK-only attribute fields');
+});
+
+test('readEntityWithDescriptions treats a non-2xx from the raw client as "no description", not a crash', async () => {
+  // dataverse.get RESOLVES with { status } on a 404 instead of throwing, so a bare try/catch would
+  // let the error body through. The body here deliberately CARRIES a `Description` key: dropping the
+  // status check must not be survivable just because a real 404 body usually lacks one.
+  const sdk = {
+    fetchEntityMetadata: async (logical) => ({ logicalName: logical, schemaName: 'new_order', displayName: 'Order', primaryNameAttribute: 'new_name', attributes: [{ logicalName: 'new_status' }] }),
+    dataverse: {
+      get: async () => ({
+        status: 404,
+        headers: {},
+        body: { error: { code: '0x80060888', message: 'Resource not found' }, Description: { UserLocalizedLabel: { Label: 'GARBAGE FROM AN ERROR BODY', LanguageCode: 1033 } } },
+      }),
+    },
+  };
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'new_order'), 'new_order');
+  assert.ok(!('description' in e), `a 404 body must never supply a description (got ${JSON.stringify(e.description)})`);
+  assert.ok(!('description' in e.columns[0]));
+});
+
+test('readEntityWithDescriptions survives a raw client that throws', async () => {
+  const sdk = {
+    fetchEntityMetadata: async (logical) => ({ logicalName: logical, schemaName: 'new_order', displayName: 'Order', primaryNameAttribute: 'new_name', attributes: [] }),
+    dataverse: { get: async () => { throw new Error('network down'); } },
+  };
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'new_order'), 'new_order');
+  assert.strictEqual(e.schemaName, 'new_order', 'a description read failure must not sink the download');
+  assert.ok(!('description' in e));
+});
+
+test('entityFromMetadata emits ONLY custom columns — a downloaded spec must not rewrite the org default views', async () => {
+  // `fetchEntityMetadata` returns the FULL attribute list. Emitting system attributes as spec
+  // columns is not merely noisy: `columns[]` feeds `defaultViewColumns`, and `enrichDefaultViews`
+  // REPLACES the Active/Inactive views' column set — so a `download -> rebuild` round trip would
+  // rewrite a customer's default views to Created On / Import Sequence Number, undoing fix #7.
+  const meta = {
+    logicalName: 'new_ticket', schemaName: 'new_ticket', displayName: 'Ticket', primaryNameAttribute: 'new_name',
+    attributes: [
+      { logicalName: 'new_name', displayName: 'Name', attributeType: 'String', isCustomAttribute: true },
+      { logicalName: 'new_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true },
+      { logicalName: 'new_notes', displayName: 'Notes', attributeType: 'Memo', isCustomAttribute: true },
+      { logicalName: 'new_owner', displayName: 'Owner', attributeType: 'Lookup', isCustomAttribute: true, targets: ['systemuser'] },
+      { logicalName: 'createdon', displayName: 'Created On', attributeType: 'DateTime', isCustomAttribute: false },
+      { logicalName: 'versionnumber', displayName: 'Version Number', attributeType: 'BigInt', isCustomAttribute: false },
+      { logicalName: 'importsequencenumber', displayName: 'Import Sequence Number', attributeType: 'Integer', isCustomAttribute: false },
+      { logicalName: 'owningbusinessunit', displayName: 'Owning Business Unit', attributeType: 'Lookup', isCustomAttribute: false },
+    ],
+  };
+  const e = entityFromMetadata(meta, 'new_ticket');
+  const names = e.columns.map((c) => c.schemaName);
+  for (const sys of ['createdon', 'versionnumber', 'importsequencenumber', 'owningbusinessunit']) {
+    assert.ok(!names.includes(sys), `system attribute '${sys}' leaked into columns[]: ${names.join(', ')}`);
+  }
+  // The primary name column is declared as `primaryAttribute`; it must not ALSO be a column.
+  assert.ok(!names.includes('new_name'), 'the primary column must not be duplicated into columns[]');
+  // A custom Lookup comes from relationships[], not columns[] — it has no App Spec column type.
+  assert.ok(!names.includes('new_owner'), 'a Lookup is not an authorable spec column');
+  assert.deepStrictEqual(names, ['new_status', 'new_notes']);
+  // The SDK projects `attributeType`, not `type`. Reading the wrong key made every column type-less,
+  // which silently disabled DEFAULT_VIEW_SKIP_TYPES and the auto-form-layout type filter.
+  assert.strictEqual(e.columns.find((c) => c.schemaName === 'new_notes').type, 'Memo');
+  // A Choice column is emitted WITHOUT a type: declaring `type: "Choice"` obliges the spec to carry
+  // `options[]` or a `globalChoice`, which this hydrator cannot read, and the resulting spec fails
+  // its own validation. Live-caught — the download errored with
+  // "column contoso_status: Choice needs options[] or a globalChoice reference".
+  assert.ok(!('type' in e.columns.find((c) => c.schemaName === 'new_status')),
+    'a Choice column must not claim a type it cannot substantiate');
+});
+
+test('a hydrated entity always survives validateAppSpec — a downloaded spec that cannot be validated is useless', () => {
+  const meta = {
+    logicalName: 'new_ticket', schemaName: 'new_ticket', displayName: 'Ticket', primaryNameAttribute: 'new_name',
+    attributes: [
+      { logicalName: 'new_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true },
+      { logicalName: 'new_choices', displayName: 'Choices', attributeType: 'MultiSelectPicklist', isCustomAttribute: true },
+      { logicalName: 'new_notes', displayName: 'Notes', attributeType: 'Memo', isCustomAttribute: true },
+      { logicalName: 'new_big', displayName: 'Big', attributeType: 'BigInt', isCustomAttribute: true },
+    ],
+  };
+  const res = validateAppSpec({
+    solution: { uniqueName: 'S', publisherPrefix: 'new' },
+    app: { name: 'A' },
+    entities: [entityFromMetadata(meta, 'new_ticket')],
+    appShell: { areas: [] },
+  }, { profile: 'deploy' });
+  assert.deepStrictEqual(res.errors, [], res.errors.join(' | '));
+});
+
+test('enrichesDefaultViews is FALSE for an existing:true table (download flags every recovered table that way)', () => {
+  const spec = {
+    entities: [{
+      schemaName: 'new_ticket', primaryAttribute: { schemaName: 'new_name' }, existing: true,
+      columns: [{ schemaName: 'new_status', type: 'Choice' }, { schemaName: 'new_tier', type: 'Choice' }],
+    }],
+    relationships: [],
+  };
+  // Enrichment REPLACES a view's column set, and `existing` means this build cannot prove it owns
+  // the table — the same reasoning that stops teardown from deleting it.
+  assert.strictEqual(enrichesDefaultViews(spec, spec.entities[0]), false);
+  const owned = { ...spec.entities[0], existing: false };
+  assert.strictEqual(enrichesDefaultViews({ ...spec, entities: [owned] }, owned), true, 'a table this build owns still enriches');
+  // The opt-in must remain reachable: judging "this reused table really is mine" is exactly the call
+  // an author can make and this code cannot, and the gate ran BEFORE the flag check at first.
+  const optedIn = { ...spec.entities[0], enrichDefaultViews: true };
+  assert.strictEqual(enrichesDefaultViews({ ...spec, entities: [optedIn] }, optedIn), true,
+    'an explicit enrichDefaultViews:true must override the existing:true skip');
+  const optedOut = { ...spec.entities[0], existing: false, enrichDefaultViews: false };
+  assert.strictEqual(enrichesDefaultViews({ ...spec, entities: [optedOut] }, optedOut), false, 'the opt-out still works');
+});
+
+test('untypedColumnNames names every column whose type could not be substantiated', () => {
+  // These are the columns a rebuild into a FRESH org would create as Text, because the data-model
+  // phase falls back to `SDK_COLUMN_TYPE[c.type || 'Text']`. Rebuilding into an org that already has
+  // the table reuses them and this is inert — which is why the loss has to be announced by name
+  // rather than left for someone to discover after a cross-environment rebuild.
+  assert.deepStrictEqual(untypedColumnNames([
+    { schemaName: 'new_ticket', columns: [
+      { schemaName: 'new_status' },                 // Choice — options not read, so no type
+      { schemaName: 'new_notes', type: 'Memo' },
+      { schemaName: 'new_choices' },                // MultiChoice
+    ] },
+    { schemaName: 'new_order', columns: [{ schemaName: 'new_total', type: 'Money' }] },
+  ]), ['new_ticket.new_status', 'new_ticket.new_choices']);
+  assert.deepStrictEqual(untypedColumnNames([]), []);
+  assert.deepStrictEqual(untypedColumnNames(undefined), []);
+});
+
+test('a downloaded Choice column is reported as untyped, so the Text downgrade is never silent', () => {
+  const meta = {
+    logicalName: 'new_ticket', schemaName: 'new_ticket', displayName: 'Ticket', primaryNameAttribute: 'new_name',
+    attributes: [
+      { logicalName: 'new_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true },
+      { logicalName: 'new_notes', displayName: 'Notes', attributeType: 'Memo', isCustomAttribute: true },
+    ],
+  };
+  assert.deepStrictEqual(untypedColumnNames([entityFromMetadata(meta, 'new_ticket')]), ['new_ticket.new_status']);
+});
+
+// ---------------------------------------------------------------------------
+// #564 — Choice / MultiChoice column TYPES survive a download.
+// ---------------------------------------------------------------------------
+
+// A picklist attribute row exactly as Dataverse returns it through the cast + $expand. LIVE-MEASURED
+// against a stock org on `account.accountcategorycode`:
+//   { "LogicalName": "accountcategorycode",
+//     "OptionSet": { "Name": "account_accountcategorycode", "IsGlobal": false,
+//                    "Options": [ { "Value": 1, "Label": { "LocalizedLabels": [ { Label, LanguageCode } ],
+//                                                          "UserLocalizedLabel": { "Label": "Preferred Customer" } } } ] },
+//     "GlobalOptionSet": { "Name": "account_accountcategorycode", "MetadataId": "..." } }
+// Note GlobalOptionSet is populated even though IsGlobal is FALSE — the trap pinned below.
+function picklistRow(logicalName, { name, isGlobal, options, globalEcho = true }) {
+  const label = (l) => (typeof l === 'string'
+    ? { LocalizedLabels: [{ Label: l, LanguageCode: 1033 }], UserLocalizedLabel: { Label: l, LanguageCode: 1033 } }
+    : { LocalizedLabels: Object.entries(l).map(([lcid, text]) => ({ Label: text, LanguageCode: Number(lcid) })), UserLocalizedLabel: { Label: l['1033'], LanguageCode: 1033 } });
+  return {
+    LogicalName: logicalName,
+    OptionSet: { Name: name, IsGlobal: isGlobal, Options: options.map(([value, l]) => ({ Value: value, Label: label(l) })) },
+    ...(globalEcho ? { GlobalOptionSet: { Name: name, MetadataId: 'aaaaaaaa-0000-0000-0000-000000000001' } } : {}),
+  };
+}
+
+// An sdk whose RAW client answers the description reads AND the two picklist cast reads.
+function sdkWithOptionSets({ attributes, picklist = [], multiSelect = [], optionSetStatus = 200, urls = [], throwOnOptionSets = false }) {
+  return {
+    fetchEntityMetadata: async (logical) => ({ logicalName: logical, schemaName: 'new_ticket', displayName: 'Ticket', primaryNameAttribute: 'new_name', attributes }),
+    queryRecords: async (set) => { throw new Error("queryRecords must not be used for metadata paths (got '" + set + "')"); },
+    dataverse: {
+      get: async (url) => {
+        urls.push(url);
+        if (/AttributeMetadata/.test(url)) {
+          if (throwOnOptionSets) throw new Error('metadata read blew up');
+          const rows = /MultiSelectPicklistAttributeMetadata/.test(url) ? multiSelect : picklist;
+          return { status: optionSetStatus, headers: {}, body: { value: rows } };
+        }
+        if (/\/Attributes\?/.test(url)) return { status: 200, headers: {}, body: { value: [] } };
+        return { status: 200, headers: {}, body: {} };
+      },
+    },
+  };
+}
+
+const CHOICE_ATTRS = [
+  { logicalName: 'new_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true },
+  { logicalName: 'new_notes', displayName: 'Notes', attributeType: 'Memo', isCustomAttribute: true },
+];
+
+test('#564 a LOCAL option set downloads as a real Choice with inline options[], not an untyped column', async () => {
+  const urls = [];
+  const sdk = sdkWithOptionSets({
+    attributes: CHOICE_ATTRS,
+    picklist: [picklistRow('new_status', { name: 'new_ticket_new_status', isGlobal: false, options: [[100000000, 'Open'], [100000001, 'Closed']] })],
+    urls,
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'new_ticket'), 'new_ticket');
+  const status = e.columns.find((c) => c.schemaName === 'new_status');
+  assert.strictEqual(status.type, 'Choice');
+  // Plain label strings, in the order Dataverse returned them — the App Spec assigns
+  // value = 100000000 + index, so the ARRAY ORDER is semantics, not presentation.
+  assert.deepStrictEqual(status.options, ['Open', 'Closed']);
+  assert.strictEqual(status.globalChoice, undefined, 'a local set must not emit a globalChoice reference');
+  // The column is no longer reported as untyped — that warning exists for columns we cannot type.
+  assert.deepStrictEqual(untypedColumnNames([e]), []);
+  // The cast segment is required: Attributes is a heterogeneous collection, so OptionSet can only be
+  // expanded through it. Pin the exact URL so a silent shape change is caught here, not live.
+  assert.ok(
+    urls.some((u) => u === "/EntityDefinitions(LogicalName='new_ticket')/Attributes/Microsoft.Dynamics.CRM.PicklistAttributeMetadata?$select=LogicalName&$expand=OptionSet($select=Name,DisplayName,IsGlobal,Options)"),
+    'picklist read URL wrong: ' + urls.join(' | ')
+  );
+});
+
+test('#564 GlobalOptionSet being present does NOT make a local set global (live-measured trap)', async () => {
+  // Measured on a live org: a LOCAL set (IsGlobal:false) still returns a populated GlobalOptionSet
+  // echoing its own name. Keying off GlobalOptionSet would emit a globalChoice reference to a shared
+  // set that does not exist, and the rebuild would bind the column to nothing.
+  const sdk = sdkWithOptionSets({
+    attributes: CHOICE_ATTRS,
+    picklist: [picklistRow('new_status', { name: 'new_ticket_new_status', isGlobal: false, options: [[100000000, 'Open']], globalEcho: true })],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'new_ticket'), 'new_ticket');
+  const status = e.columns.find((c) => c.schemaName === 'new_status');
+  assert.strictEqual(status.globalChoice, undefined);
+  assert.deepStrictEqual(status.options, ['Open']);
+});
+
+test('#564 a GLOBAL-bound picklist emits a globalChoice reference instead of inline options', async () => {
+  const sdk = sdkWithOptionSets({
+    attributes: CHOICE_ATTRS,
+    picklist: [picklistRow('new_status', { name: 'shared_stage', isGlobal: true, options: [[1, 'Draft'], [2, 'Final']] })],
+  });
+  const meta = await readEntityWithDescriptions(sdk, 'new_ticket');
+  const e = entityFromMetadata(meta, 'new_ticket');
+  const status = e.columns.find((c) => c.schemaName === 'new_status');
+  assert.strictEqual(status.type, 'Choice');
+  assert.strictEqual(status.globalChoice, 'shared_stage');
+  assert.strictEqual(status.options, undefined, 'a global-bound column must not ALSO carry inline options');
+  // The shared set itself has to be declared, or a fresh-environment rebuild has nothing to bind to —
+  // and declared `existing: true`, so a teardown does not delete an org-wide set it cannot prove this
+  // app created (#587 item 6).
+  const decls = new Map();
+  collectGlobalChoices(meta, decls);
+  // Numbered 1 and 2, not 100000000 + index: the declaration keeps the numbers, so a rebuild into a fresh environment numbers them alike.
+  assert.deepStrictEqual([...decls.values()], [{ name: 'shared_stage', options: [{ value: 1, label: 'Draft' }, { value: 2, label: 'Final' }], existing: true }]);
+});
+
+test('#564 a MultiSelect picklist downloads as MultiChoice', async () => {
+  const sdk = sdkWithOptionSets({
+    attributes: [{ logicalName: 'new_tags', displayName: 'Tags', attributeType: 'MultiSelectPicklist', isCustomAttribute: true }],
+    multiSelect: [picklistRow('new_tags', { name: 'new_ticket_new_tags', isGlobal: false, options: [[100000000, 'Urgent'], [100000001, 'Billable']] })],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'new_ticket'), 'new_ticket');
+  const tags = e.columns.find((c) => c.schemaName === 'new_tags');
+  assert.strictEqual(tags.type, 'MultiChoice');
+  assert.deepStrictEqual(tags.options, ['Urgent', 'Billable']);
+});
+
+test('#564 inline options keep their localizations, but a global declaration is flattened', async () => {
+  // Inline columns[].options[] localizes correctly; globalChoices[] options are REJECTED by
+  // validateAppSpec when localized, because Dataverse stores only the base language for a shared set.
+  // So the same Label object must be emitted two different ways depending on where it lands.
+  const localized = { 1033: 'Open', 3082: 'Abierto' };
+  const sdk = sdkWithOptionSets({
+    attributes: [
+      { logicalName: 'new_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true },
+      { logicalName: 'new_stage', displayName: 'Stage', attributeType: 'Picklist', isCustomAttribute: true },
+    ],
+    picklist: [
+      picklistRow('new_status', { name: 'new_ticket_new_status', isGlobal: false, options: [[100000000, localized]] }),
+      picklistRow('new_stage', { name: 'shared_stage', isGlobal: true, options: [[100000000, localized]] }),
+    ],
+  });
+  const meta = await readEntityWithDescriptions(sdk, 'new_ticket');
+  const e = entityFromMetadata(meta, 'new_ticket');
+  assert.deepStrictEqual(e.columns.find((c) => c.schemaName === 'new_status').options, [{ 1033: 'Open', 3082: 'Abierto' }]);
+  const decls = new Map();
+  collectGlobalChoices(meta, decls);
+  assert.deepStrictEqual([...decls.values()], [{ name: 'shared_stage', options: ['Open'], existing: true }]);
+});
+
+test('#564 one global set bound by two columns is declared exactly once', async () => {
+  const sdk = sdkWithOptionSets({
+    attributes: [
+      { logicalName: 'new_a', displayName: 'A', attributeType: 'Picklist', isCustomAttribute: true },
+      { logicalName: 'new_b', displayName: 'B', attributeType: 'Picklist', isCustomAttribute: true },
+    ],
+    picklist: [
+      picklistRow('new_a', { name: 'shared_stage', isGlobal: true, options: [[1, 'Draft']] }),
+      picklistRow('new_b', { name: 'shared_stage', isGlobal: true, options: [[1, 'Draft']] }),
+    ],
+  });
+  const decls = new Map();
+  collectGlobalChoices(await readEntityWithDescriptions(sdk, 'new_ticket'), decls);
+  assert.strictEqual(decls.size, 1);
+});
+
+test('#564 a FAILED option-set read leaves the column untyped rather than guessing a type', async () => {
+  // Fail-safe, and the reason the untyped warning survives this change: emitting type "Choice" with
+  // no options[] produces a spec that fails its OWN validation, and guessing options invents data.
+  // A non-2xx and a throw must land on the same untyped outcome.
+  for (const variant of [{ optionSetStatus: 403 }, { throwOnOptionSets: true }]) {
+    const sdk = sdkWithOptionSets({ attributes: CHOICE_ATTRS, ...variant });
+    const meta = await readEntityWithDescriptions(sdk, 'new_ticket');
+    const e = entityFromMetadata(meta, 'new_ticket');
+    assert.strictEqual(e.columns.find((c) => c.schemaName === 'new_status').type, undefined, JSON.stringify(variant));
+    assert.deepStrictEqual(untypedColumnNames([e]), ['new_ticket.new_status'], JSON.stringify(variant));
+    // The failure is RECORDED, not swallowed — a silent degrade here is the bug being fixed.
+    assert.ok(meta.optionSetReadFailed, 'the read failure was not recorded for ' + JSON.stringify(variant));
+  }
+});
+
+test('#564 a picklist the option-set read did not cover stays untyped', async () => {
+  // A 200 that simply omits the attribute is NOT evidence of "no options" — it is evidence we did
+  // not see them. Typing it anyway would emit an invalid spec.
+  const sdk = sdkWithOptionSets({ attributes: CHOICE_ATTRS, picklist: [] });
+  const meta = await readEntityWithDescriptions(sdk, 'new_ticket');
+  const e = entityFromMetadata(meta, 'new_ticket');
+  assert.strictEqual(e.columns.find((c) => c.schemaName === 'new_status').type, undefined);
+  assert.deepStrictEqual(untypedColumnNames([e]), ['new_ticket.new_status']);
+});
+
+test('#564 an option set with no usable labels is not emitted as an empty Choice', async () => {
+  // An option whose Label carries no usable text would emit options: [undefined], which fails
+  // validateAppSpec ("options[0] must be a non-empty string"). Refuse to type it instead.
+  const sdk = sdkWithOptionSets({
+    attributes: CHOICE_ATTRS,
+    picklist: [{ LogicalName: 'new_status', OptionSet: { Name: 'new_ticket_new_status', IsGlobal: false, Options: [{ Value: 1, Label: { LocalizedLabels: [], UserLocalizedLabel: null } }] } }],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'new_ticket'), 'new_ticket');
+  assert.strictEqual(e.columns.find((c) => c.schemaName === 'new_status').type, undefined);
+});
+test('iconWebResources looks up web resources by NAME (not id) and maps type from webresourcetype', async () => {
+  const calls = [];
+  const sdk = {
+    queryRecords: async (logical, opts) => {
+      calls.push({ logical, filter: opts.filter });
+      // svg web resource (webresourcetype 11) with base64 content
+      if (/new_rgicon\.svg/.test(opts.filter)) return [{ name: 'new_rgicon.svg', webresourcetype: 11, content: 'BASE64SVG' }];
+      return []; // an icon with no matching web resource
+    },
+  };
+  const { webResources: out } = await iconWebResources(sdk, ['new_rgicon.svg', 'missing.png']);
+  assert.strictEqual(calls[0].logical, 'webresource', 'queries the webresource logical name');
+  assert.match(calls[0].filter, /name eq 'new_rgicon\.svg'/, 'filters by name, not id');
+  assert.deepStrictEqual(out, [{ name: 'new_rgicon.svg', type: 'svg', contentBase64: 'BASE64SVG' }]);
+});
+
+test('iconWebResources skips a web resource it cannot read (no throw)', async () => {
+  const sdk = { queryRecords: async () => { throw new Error('boom'); } };
+  const { webResources } = await iconWebResources(sdk, ['x.png']);
+  assert.deepStrictEqual(webResources, []);
+});
+
+test('droppedSubareaCount counts subareas the spec could not round-trip (e.g. dashboards)', () => {
+  const app = { siteMap: { areas: [{ groups: [{ subAreas: [{}, {}, {}, {}] }] }] } }; // 4 deployed
+  const spec = { appShell: { areas: [{ groups: [{ subAreas: [{}, {}, {}] }] }] } };    // 3 hydrated
+  assert.strictEqual(droppedSubareaCount(app, spec), 1);
+  const same = { appShell: { areas: [{ groups: [{ subAreas: [{}, {}, {}, {}] }] }] } };
+  assert.strictEqual(droppedSubareaCount(app, same), 0);
+});
+
+test('readDashboards reconstructs supported tile shapes and skips unreadable dashboards', async () => {
+  const DASH = '{AAAAAAAA-0000-4000-8000-000000000001}';
+  const SKIP = '{BBBBBBBB-0000-4000-8000-000000000002}';
+  const app = { siteMap: { areas: [{ groups: [{ subAreas: [
+    { type: 'DashBoard', dashboardId: DASH, title: 'Sitemap title' },
+    { type: 'DashBoard', dashboardId: SKIP, title: 'Broken dashboard' },
+  ] }] }] } };
+  const sdk = {
+    fetchArtifact: async (type, id) => {
+      if (String(id).toLowerCase() === SKIP.toLowerCase()) throw new Error('dashboard deleted while downloading');
+      return {
+        components: [
+          { type: 'chart', name: 'Revenue', parameters: { TargetEntityType: 'account', ViewId: '{11111111-0000-4000-8000-000000000001}', VisualizationId: '{22222222-0000-4000-8000-000000000002}' } },
+          { type: 'list', name: 'Open Accounts', parameters: { TargetEntityType: 'account', ViewId: '{33333333-0000-4000-8000-000000000003}' } },
+          { type: 'iframe', name: 'Portal', parameters: { Url: 'https://contoso.example' } },
+          { type: 'webresource', name: 'Help', parameters: { WebResourceName: 'new_help.htm' } },
+          { type: 'chart', name: 'Incomplete chart', parameters: { TargetEntityType: 'account' } },
+        ],
+      };
+    },
+    queryRecords: async () => [{ name: 'Executive Dashboard', description: 'Leader view of revenue and work.' }],
+  };
+
+  const dashboards = await readDashboards(sdk, app);
+
+  assert.strictEqual(dashboards.length, 1);
+  assert.strictEqual(dashboards[0].name, 'Executive Dashboard');
+  assert.strictEqual(dashboards[0].description, 'Leader view of revenue and work.');
+  assert.deepStrictEqual(dashboards[0].tiles, [
+    { type: 'chart', name: 'Revenue', entity: 'account', viewId: '11111111-0000-4000-8000-000000000001', visualizationId: '22222222-0000-4000-8000-000000000002' },
+    { type: 'list', name: 'Open Accounts', entity: 'account', viewId: '33333333-0000-4000-8000-000000000003' },
+    { type: 'iframe', name: 'Portal', url: 'https://contoso.example' },
+    { type: 'webresource', name: 'Help', webResource: 'new_help.htm' },
+  ]);
+});
+
+// #586 item 4: an App Spec refers to a dashboard by NAME (the sitemap subarea, and the build's lookup
+// of an existing one), so two different dashboards whose names Dataverse compares equal collapse into
+// one on rebuild and the other silently leaves the nav. They are withheld — which drops their
+// subareas and trips the lossy-download gate — and the reason names both.
+test('readDashboards withholds dashboards whose names Dataverse treats as one, and says why', async () => {
+  const A = '{AAAAAAAA-0000-4000-8000-00000000000A}';
+  const B = '{BBBBBBBB-0000-4000-8000-00000000000B}';
+  const C = '{CCCCCCCC-0000-4000-8000-00000000000C}';
+  const bare = (g) => String(g).replace(/[{}]/g, '').toLowerCase();
+  // The REAL names come from systemform; the subarea titles differ on purpose, so this proves the
+  // clash is judged on the dashboard's own name and not on whatever the nav entry happens to say.
+  // Case, an accent and a trailing space all compare equal on the server — a leading space would not.
+  const names = { [bare(A)]: 'Overview', [bare(B)]: 'OVERVIÉW ', [bare(C)]: 'Pipeline' };
+  // C sits behind TWO subareas (its id in two cases): one dashboard, which must not clash with itself.
+  const subAreas = [[A, 'Nav A'], [B, 'Nav B'], [C, 'Nav C'], [C.toLowerCase(), 'Nav C again']]
+    .map(([id, title]) => ({ type: 'DashBoard', dashboardId: id, title }));
+  const app = { siteMap: { areas: [{ groups: [{ subAreas }] }] } };
+  const sdk = {
+    fetchArtifact: async () => ({ components: [{ type: 'iframe', name: 'Portal', parameters: { Url: 'https://contoso.example' } }] }),
+    queryRecords: async (_set, q) => {
+      const hit = Object.keys(names).find((k) => bare(q.filter).includes(k));
+      assert.ok(hit, `name query must target a known dashboard: ${q.filter}`);
+      return [{ name: names[hit] }];
+    },
+  };
+  const warnings = [];
+  const dashboards = await readDashboards(sdk, app, (m) => warnings.push(m));
+  assert.deepStrictEqual(dashboards.map((d) => d.name), ['Pipeline'], 'only the uniquely named dashboard round-trips');
+  const clash = warnings.filter((w) => /share the name/.test(w));
+  assert.strictEqual(clash.length, 1, JSON.stringify(warnings));
+  assert.ok(bare(clash[0]).includes(bare(A)) && bare(clash[0]).includes(bare(B)), clash[0]);
+  assert.ok(clash[0].includes("('Overview')") && clash[0].includes("('OVERVIÉW ')") && /rename one in Maker/.test(clash[0]), clash[0]);
+  // And their subareas are then reported as dropped rather than silently re-pointed.
+  const spec = await hydrateSpec({
+    app: async () => ({ name: 'A', description: '', uniquename: 'p_a', siteMap: app.siteMap }),
+    pages: async () => [], entities: async () => [], webResources: async () => [],
+    solution: async () => ({ uniqueName: 'S', publisherPrefix: 'p' }),
+    dashboards: async () => dashboards,
+  });
+  assert.strictEqual(spec.droppedSubareas, 2, 'both ambiguous subareas are counted as not round-tripped');
+  assert.deepStrictEqual(spec.appShell.areas[0].groups[0].subAreas.map((s) => s.dashboard), ['Pipeline', 'Pipeline']);
+});
+
+// A chart tile renders a visualization OVER a view. A deployed component that carries a ViewId but no
+// VisualizationId therefore has nothing to plot, and emitting it anyway hands back a spec that fails
+// its own lint ("id-based chart tile with viewId also needs visualizationId") — the exact #572 defect
+// class this download path exists to prevent.
+test('readDashboards omits a chart tile with no VisualizationId (and says so) rather than emitting a half-tile', async () => {
+  const warnings = [];
+  const sdk = {
+    fetchArtifact: async () => ({ components: [
+      { type: 'chart', name: 'Plotless', parameters: { TargetEntityType: 'account', ViewId: '{11111111-0000-4000-8000-000000000001}' } },
+      { type: 'list', name: 'Open', parameters: { TargetEntityType: 'account', ViewId: '{33333333-0000-4000-8000-000000000003}' } },
+    ] }),
+    queryRecords: async () => [{ name: 'Operations', description: null }],
+  };
+  const dashboards = await readDashboards(sdk, {
+    siteMap: { areas: [{ groups: [{ subAreas: [{ type: 'DashBoard', dashboardId: 'dash-1', title: 'Operations' }] }] }] },
+  }, (m) => warnings.push(m));
+
+  assert.deepStrictEqual(dashboards[0].tiles, [
+    { type: 'list', name: 'Open', entity: 'account', viewId: '33333333-0000-4000-8000-000000000003' },
+  ], 'the plotless chart tile must not be emitted');
+  assert.ok(warnings.some((w) => /VisualizationId/.test(w)), `the omission must be reported; got ${JSON.stringify(warnings)}`);
+});
+
+// `entity` is required by BOTH spec gates for any id-passthrough tile, so a component with no
+// TargetEntityType produces `entity: undefined` — which JSON drops — and the downloaded spec then
+// fails its own lint. Same class as the missing-VisualizationId case above.
+test('readDashboards omits an id-passthrough tile with no TargetEntityType (and says so)', async () => {
+  const warnings = [];
+  const sdk = {
+    fetchArtifact: async () => ({ components: [
+      { type: 'chart', name: 'NoEntity', parameters: { ViewId: '{11111111-0000-4000-8000-000000000001}', VisualizationId: '{22222222-0000-4000-8000-000000000002}' } },
+      { type: 'list', name: 'AlsoNoEntity', parameters: { ViewId: '{33333333-0000-4000-8000-000000000003}' } },
+      { type: 'list', name: 'Good', parameters: { TargetEntityType: 'account', ViewId: '{44444444-0000-4000-8000-000000000004}' } },
+    ] }),
+    queryRecords: async () => [{ name: 'Operations', description: null }],
+  };
+  const dashboards = await readDashboards(sdk, {
+    siteMap: { areas: [{ groups: [{ subAreas: [{ type: 'DashBoard', dashboardId: 'dash-1', title: 'Operations' }] }] }] },
+  }, (m) => warnings.push(m));
+
+  assert.deepStrictEqual(dashboards[0].tiles, [
+    { type: 'list', name: 'Good', entity: 'account', viewId: '44444444-0000-4000-8000-000000000004' },
+  ], 'only the tile carrying an entity may be emitted');
+  assert.strictEqual(warnings.filter((w) => /TargetEntityType/.test(w)).length, 2, `both omissions must be reported; got ${JSON.stringify(warnings)}`);
+});
+
+// The silent-drop hole the two tests above did NOT cover. `chart`/`list` used to be matched with an
+// `&& viewId` guard, so a component of a supported type carrying no ViewId matched no branch at all
+// and vanished with nothing said — and the dashboard-level "no recognizable tiles" warning cannot
+// catch it, because that only fires when EVERY tile fails. Same untraceability as #572, reached from
+// the one direction the omission warnings missed.
+test('readDashboards reports a supported tile dropped for a missing ViewId instead of dropping it silently', async () => {
+  const warnings = [];
+  const sdk = {
+    fetchArtifact: async () => ({ components: [
+      { type: 'chart', name: 'NoView', parameters: { TargetEntityType: 'account', VisualizationId: '{22222222-0000-4000-8000-000000000002}' } },
+      { type: 'list', name: 'AlsoNoView', parameters: { TargetEntityType: 'account' } },
+      { type: 'list', name: 'Good', parameters: { TargetEntityType: 'account', ViewId: '{44444444-0000-4000-8000-000000000004}' } },
+    ] }),
+    queryRecords: async () => [{ name: 'Operations', description: null }],
+  };
+  const dashboards = await readDashboards(sdk, {
+    siteMap: { areas: [{ groups: [{ subAreas: [{ type: 'DashBoard', dashboardId: 'dash-1', title: 'Operations' }] }] }] },
+  }, (m) => warnings.push(m));
+
+  assert.deepStrictEqual(dashboards[0].tiles, [
+    { type: 'list', name: 'Good', entity: 'account', viewId: '44444444-0000-4000-8000-000000000004' },
+  ], 'only the tile carrying a ViewId may be emitted');
+  assert.ok(/NoView/.test(warnings.join('\n')) && /AlsoNoView/.test(warnings.join('\n')),
+    `both ViewId-less tiles must be named; got ${JSON.stringify(warnings)}`);
+  assert.strictEqual(warnings.filter((w) => /ViewId/.test(w)).length, 2, `both omissions must cite ViewId; got ${JSON.stringify(warnings)}`);
+});
+
+// A component missing SEVERAL required parameters must say so once, naming each — reporting only the
+// first would send a maker back for a second round trip to discover the rest.
+test('readDashboards names every missing parameter on one tile in a single warning', async () => {
+  const warnings = [];
+  const sdk = {
+    fetchArtifact: async () => ({ components: [{ type: 'chart', name: 'Empty', parameters: {} }] }),
+    queryRecords: async () => [{ name: 'Operations', description: null }],
+  };
+  await readDashboards(sdk, {
+    siteMap: { areas: [{ groups: [{ subAreas: [{ type: 'DashBoard', dashboardId: 'dash-1', title: 'Operations' }] }] }] },
+  }, (m) => warnings.push(m));
+
+  const tileWarning = warnings.find((w) => /Empty/.test(w));
+  assert.ok(tileWarning, `the tile omission must be reported; got ${JSON.stringify(warnings)}`);
+  for (const param of ['TargetEntityType', 'ViewId', 'VisualizationId']) {
+    assert.ok(tileWarning.includes(param), `'${param}' must be named in "${tileWarning}"`);
+  }
+});
+
+// An unsupported component type is a silent drop too, for the same reason: a dashboard with one good
+// tile never reaches the dashboard-level catch-all.
+test('readDashboards reports a tile type the App Spec cannot express', async () => {
+  const warnings = [];
+  const sdk = {
+    fetchArtifact: async () => ({ components: [
+      { type: 'organizationinsights', name: 'Insights', parameters: {} },
+      { type: 'iframe', name: 'NoUrl', parameters: {} },
+      { type: 'list', name: 'Good', parameters: { TargetEntityType: 'account', ViewId: '{44444444-0000-4000-8000-000000000004}' } },
+    ] }),
+    queryRecords: async () => [{ name: 'Operations', description: null }],
+  };
+  const dashboards = await readDashboards(sdk, {
+    siteMap: { areas: [{ groups: [{ subAreas: [{ type: 'DashBoard', dashboardId: 'dash-1', title: 'Operations' }] }] }] },
+  }, (m) => warnings.push(m));
+
+  assert.strictEqual(dashboards[0].tiles.length, 1, 'only the rebuildable tile may be emitted');
+  assert.ok(warnings.some((w) => /Insights/.test(w) && /organizationinsights/.test(w)),
+    `the unsupported type must be named; got ${JSON.stringify(warnings)}`);
+  assert.ok(warnings.some((w) => /NoUrl/.test(w) && /Url/.test(w)),
+    `the iframe missing its Url must be reported; got ${JSON.stringify(warnings)}`);
+});
+
+test('readDashboards omits a null dashboard description instead of emitting a blank string', async () => {  const sdk = {
+    fetchArtifact: async () => ({ components: [{ type: 'iframe', name: 'Portal', parameters: { Url: 'https://contoso.example' } }] }),
+    queryRecords: async (_set, opts) => {
+      assert.ok(opts.select.includes('description'), 'dashboard name lookup also requests description');
+      return [{ name: 'Operations', description: null }];
+    },
+  };
+  const dashboards = await readDashboards(sdk, {
+    siteMap: { areas: [{ groups: [{ subAreas: [{ type: 'DashBoard', dashboardId: 'dash-1', title: 'Operations' }] }] }] },
+  });
+  assert.strictEqual('description' in dashboards[0], false, 'null descriptions are absent, not empty strings');
+});
+
+test('readDescriptionInventory captures view, chart, form, business-rule, and global-choice descriptions', async () => {
+  const APP_UNIQ_VALUE = '5111e0f2-0000-4000-8000-000000000001';
+  const VIEW_ID = '5111e0f2-0000-4000-8000-000000000002';
+  const CHART_ID = '5111e0f2-0000-4000-8000-000000000003';
+  const FORM_ID = '5111e0f2-0000-4000-8000-000000000004';
+  const RULE_ID = '5111e0f2-0000-4000-8000-000000000005';
+  const SOL_ID = '5111e0f2-0000-4000-8000-000000000006';
+  const FORM_ID_RESTRICTED = '5111e0f2-0000-4000-8000-000000000007';
+  const RULE_COPY_ID = '5111e0f2-0000-4000-8000-000000000008';
+  const CLASSIC_ID = '5111e0f2-0000-4000-8000-000000000009';
+  const OPTIONSET_ID = '5111e0f2-0000-4000-8000-00000000000a';
+  const calls = [];
+  const sdk = {
+    // A real table logical name is the ONLY thing queryRecords can take: it resolves its argument
+    // via `EntityDefinitions(LogicalName='<arg>')?$select=EntitySetName`. Anything else 404s. Fail
+    // loudly on a metadata collection so this mock cannot certify a call the real SDK rejects —
+    // which is exactly how the `GlobalOptionSetDefinitions` read passed review while always
+    // returning empty in production.
+    queryRecords: async (set, opts) => {
+      if (!/^[a-z_][a-z0-9_]*$/.test(String(set))) {
+        throw new Error(`queryRecords resolves an entity SET name and cannot take the metadata path '${set}' — use sdk.dataverse.get`);
+      }
+      calls.push({ set, opts });
+      const filter = (opts && opts.filter) || '';
+      if (set === 'appmodule') return [{ appmoduleidunique: APP_UNIQ_VALUE }];
+      if (set === 'appmodulecomponent' && /componenttype eq 26/.test(filter)) return [{ objectid: VIEW_ID }];
+      if (set === 'appmodulecomponent' && /componenttype eq 59/.test(filter)) return [{ objectid: CHART_ID }];
+      if (set === 'appmodulecomponent' && /componenttype eq 60/.test(filter)) return [{ objectid: FORM_ID }, { objectid: FORM_ID_RESTRICTED }];
+      if (set === 'savedquery') return [{ savedqueryid: VIEW_ID, name: 'Active Orders', returnedtypecode: 'new_order', description: 'Work queue.' }];
+      if (set === 'savedqueryvisualization') return [{ savedqueryvisualizationid: CHART_ID, name: 'Orders by Status', primaryentitytypecode: 'new_order', description: null }];
+      if (set === 'systemform') {
+        return [
+          { formid: FORM_ID, name: 'Main', objecttypecode: 'new_order', description: 'Primary form.' },
+          // A form RESTRICTED to a security role. `formxml` is pulled purely to detect this, and the
+          // detection is what feeds the download's access-widening warning.
+          { formid: FORM_ID_RESTRICTED, name: 'Dispatcher', objecttypecode: 'new_order', description: 'Restricted.',
+            formxml: '<form><tabs /><DisplayConditions Order="2" FallbackForm="false"><Role Id="{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}" /></DisplayConditions></form>' },
+        ];
+      }
+      if (set === 'solution') return [{ solutionid: SOL_ID }];
+      // Component type 9 is OptionSet, whose objectid is the set's MetadataId (#586 item 5).
+      if (set === 'solutioncomponent' && /componenttype eq 9\b/.test(filter)) return [{ objectid: `{${OPTIONSET_ID.toUpperCase()}}` }];
+      if (set === 'solutioncomponent') return [{ objectid: RULE_ID, componenttype: 29 }];
+      if (set === 'workflow') {
+        return [
+          // A real business rule: category 2 (Business Rule), type 1 (the definition).
+          { workflowid: RULE_ID, name: 'Lock Closed', primaryentity: 'new_order', description: 'Closed rows are read-only.', category: 2, type: 1 },
+          // The platform's activated COPY of that same rule. Counting it would list every active
+          // rule twice.
+          { workflowid: RULE_COPY_ID, name: 'Lock Closed', primaryentity: 'new_order', description: 'Closed rows are read-only.', category: 2, type: 2 },
+          // A CLASSIC WORKFLOW. Solution component type 29 is every process kind, so without the
+          // category filter this would be mislabelled as a business rule in the inventory.
+          { workflowid: CLASSIC_ID, name: 'Nightly Recalc', primaryentity: 'new_order', description: 'A classic workflow.', category: 0, type: 1 },
+        ];
+      }
+      return [];
+    },
+    dataverse: {
+      get: async (url) => {
+        calls.push({ get: url });
+        if (/^\/GlobalOptionSetDefinitions\?/.test(url)) {
+          return { status: 200, headers: {}, body: { value: [
+            { Name: 'new_priority', MetadataId: OPTIONSET_ID, Description: { LocalizedLabels: [{ Label: 'Shared priority choices.', LanguageCode: 1033 }] } },
+            // Unmanaged, but neither in the app's solution nor bound by anything it emits: org-wide
+            // metadata the app has nothing to do with, which must not be reported as the app's.
+            { Name: 'contoso_unrelated', MetadataId: '5111e0f2-0000-4000-8000-00000000000b', IsManaged: false },
+          ] } };
+        }
+        return { status: 404, headers: {}, body: {} };
+      },
+    },
+  };
+
+  const inv = await readDescriptionInventory(currentReadSdk(sdk, {
+    appId: COMPONENT_APP_ID, layerId: APP_UNIQ_VALUE,
+  }), COMPONENT_APP_ID, 'ContosoSolution');
+
+  assert.deepStrictEqual(inv.views[0], { id: VIEW_ID, name: 'Active Orders', entity: 'new_order', description: 'Work queue.' });
+  assert.strictEqual('description' in inv.charts[0], false, 'null chart descriptions are omitted');
+  // By table, then name, then id — not the order Dataverse answered in (the Main form came first there).
+  assert.deepStrictEqual(inv.forms.map((f) => f.name), ['Dispatcher', 'Main']);
+  assert.deepStrictEqual(inv.forms.find((f) => f.id === FORM_ID), { id: FORM_ID, name: 'Main', entity: 'new_order', description: 'Primary form.' });
+  // The role-restriction flag must NOT ride on the form entries: sanitizeDescriptionInventory spreads
+  // those into `app-spec.json`, and a diagnostic has no business in the user-facing spec.
+  assert.ok(inv.forms.every((f) => !('roleRestricted' in f)),
+    'the flag belongs on the sibling key, not on each form entry');
+  // BEHAVIOURAL: only the restricted form is recorded, and it is recorded by (entity, name) so the
+  // warning can name it. A source regex could not catch dropping `formxml` from the $select —
+  // isRoleRestrictedFormXml(undefined) is false, so the list would be silently empty forever.
+  assert.deepStrictEqual(inv.roleRestrictedForms, [{ name: 'Dispatcher', entity: 'new_order' }],
+    'exactly the role-restricted form, and not the unrestricted one');
+  assert.ok(calls.some((c) => c.set === 'systemform' && c.opts.select.includes('formxml')),
+    'the form read must select formxml — without it the restriction can never be detected');
+  assert.deepStrictEqual(inv.businessRules[0], { id: RULE_ID, name: 'Lock Closed', entity: 'new_order', description: 'Closed rows are read-only.' });
+  // Solution component type 29 is EVERY process kind, so the rows must be narrowed after the fetch.
+  // A classic workflow listed as a business rule is misleading to any tool that reads the inventory,
+  // and the activated type-2 copy would list every active rule twice.
+  assert.strictEqual(inv.businessRules.length, 1,
+    `only the type-1 category-2 definition may be listed; got ${JSON.stringify(inv.businessRules.map((r) => r.name))}`);
+  assert.ok(calls.some((c) => c.set === 'workflow' && c.opts.select.includes('category') && c.opts.select.includes('type')),
+    'category and type must be REQUESTED, or the filter decides on undefined');
+  assert.deepStrictEqual(inv.globalChoices, [{ name: 'new_priority', description: 'Shared priority choices.' }],
+    'only the set the app\'s solution owns — matched on its MetadataId despite the braces and casing');
+  assert.ok(calls.some((c) => c.get === '/GlobalOptionSetDefinitions?$select=Name,Description,IsManaged,MetadataId'),
+    `global choices must be read through the RAW client (queryRecords cannot take a metadata path), selecting IsManaged so managed sets can be excluded and MetadataId so they can be joined to the solution; calls: ${JSON.stringify(calls.map((c) => c.get || c.set))}`);
+  assert.ok(calls.some((c) => c.set === 'savedquery' && c.opts.select.includes('description')), 'view read selects description');
+  assert.ok(calls.some((c) => c.set === 'savedqueryvisualization' && c.opts.select.includes('description')), 'chart read selects description');
+  assert.ok(calls.some((c) => c.set === 'systemform' && c.opts.select.includes('description')), 'form read selects description');
+  assert.ok(calls.some((c) => c.set === 'workflow' && c.opts.select.includes('description')), 'business-rule read selects description');
+});
+
+test('the global-choice inventory excludes MANAGED option sets but keeps an unknown flag', async () => {
+  // A managed global choice ships with its solution and exists in any environment that has that
+  // solution, so naming it as "not round-tripped" is false — there is nothing for a rebuild to
+  // recreate. Measured live on a stock environment: 149 option sets, exactly 1 unmanaged, so
+  // reporting all of them buried the real findings under 148 unactionable lines.
+  //
+  // `$filter` cannot do this server-side: GlobalOptionSetDefinitions answers HTTP 405
+  // (0x80060888) for `?$filter=IsManaged eq false`, which is why the filter is client-side.
+  // All three sets are OWNED by the app's solution, so the only thing deciding their fate here is the
+  // IsManaged filter under test — not the app scoping (#586 item 5) that runs alongside it.
+  const ids = { new_priority: 'a1a1a1a1-0000-4000-8000-000000000001', msdyn_solutionhealthruleseverity: 'a1a1a1a1-0000-4000-8000-000000000002', legacy_noflag: 'a1a1a1a1-0000-4000-8000-000000000003' };
+  const sdk = {
+    queryRecords: async (set, opts) => {
+      if (set === 'solution') return [{ solutionid: 'b2b2b2b2-0000-4000-8000-000000000001' }];
+      if (set === 'solutioncomponent' && /componenttype eq 9\b/.test((opts && opts.filter) || '')) return Object.values(ids).map((objectid) => ({ objectid }));
+      return [];
+    },
+    dataverse: {
+      get: async (url) => {
+        if (/^\/GlobalOptionSetDefinitions\?/.test(url)) {
+          return {
+            status: 200,
+            headers: {},
+            body: {
+              value: [
+                { Name: 'new_priority', MetadataId: ids.new_priority, IsManaged: false },
+                { Name: 'msdyn_solutionhealthruleseverity', MetadataId: ids.msdyn_solutionhealthruleseverity, IsManaged: true },
+                { Name: 'legacy_noflag', MetadataId: ids.legacy_noflag }, // IsManaged absent — must be KEPT, not silently dropped
+              ],
+            },
+          };
+        }
+        return { status: 404, headers: {}, body: {} };
+      },
+    },
+  };
+
+  const inv = await readDescriptionInventory(sdk, 'app-1', 'ContosoSolution');
+  const names = (inv.globalChoices || []).map((c) => c.name);
+  assert.ok(names.includes('new_priority'), 'an unmanaged choice is genuinely not round-tripped');
+  assert.ok(!names.includes('msdyn_solutionhealthruleseverity'), 'a managed choice must not be reported');
+  assert.ok(
+    names.includes('legacy_noflag'),
+    'an ABSENT IsManaged must keep the row — this inventory must not assert an absence it cannot substantiate'
+  );
+});
+
+// #586 item 5: the option-set collection is ORG-wide, so an unscoped read reported an isolated app as
+// leaving behind global choices it never had. Scoped to the app: its solution's sets (component type
+// 9) plus the ones its emitted columns bind.
+test('the global-choice inventory is scoped to the app: its solution\'s sets and the ones its columns bind', async () => {
+  const OWNED = 'c3c3c3c3-0000-4000-8000-000000000001';
+  const sdkFor = ({ owned = [OWNED], throwOnSolution = false, gets = [] } = {}) => ({
+    queryRecords: async (set, opts) => {
+      if (set === 'solution') {
+        if (throwOnSolution) throw new Error('HTTP 403 on solution');
+        return [{ solutionid: 'd4d4d4d4-0000-4000-8000-000000000001' }];
+      }
+      if (set === 'solutioncomponent' && /componenttype eq 9\b/.test((opts && opts.filter) || '')) return owned.map((objectid) => ({ objectid }));
+      return [];
+    },
+    dataverse: {
+      get: async (url) => {
+        gets.push(url);
+        return { status: 200, headers: {}, body: { value: [
+          { Name: 'contoso_owned', MetadataId: OWNED, IsManaged: false },
+          { Name: 'contoso_bound', MetadataId: 'c3c3c3c3-0000-4000-8000-000000000002', IsManaged: false },
+          { Name: 'contoso_unrelated', MetadataId: 'c3c3c3c3-0000-4000-8000-000000000003', IsManaged: false },
+        ] } };
+      },
+    },
+  });
+  const names = (inv) => (inv.globalChoices || []).map((g) => g.name).sort();
+  const unknown = (inv) => (inv.incomplete || []).filter((i) => i.kind === 'globalChoices');
+
+  assert.deepStrictEqual(names(await readDescriptionInventory(sdkFor(), 'app-1', 'ContosoSolution', new Set(['Contoso_Bound']))),
+    ['contoso_bound', 'contoso_owned'], 'owned by the solution, or bound by an emitted column — never the unrelated one');
+
+  // Nothing in scope — no solution that could own a set, and nothing bound — is nothing of THIS app's
+  // to find: not an unknown, and not worth an org-wide read.
+  for (const [what, sln] of [['no solution', null], ['a built-in container', 'Default']]) {
+    const gets = [];
+    const inv = await readDescriptionInventory(sdkFor({ gets }), 'app-1', sln, new Set());
+    assert.deepStrictEqual(names(inv), [], what);
+    assert.deepStrictEqual(unknown(inv), [], what);
+    assert.deepStrictEqual(gets.filter((u) => /GlobalOptionSetDefinitions/.test(u)), [], `${what}: the org-wide read is skipped`);
+  }
+  const ownsNone = await readDescriptionInventory(sdkFor({ owned: [] }), 'app-1', 'ContosoSolution', new Set());
+  assert.deepStrictEqual([names(ownsNone), unknown(ownsNone)], [[], []], 'a solution that owns no set is a real "none"');
+
+  // A FAILED solution lookup is an unknown for every class it scopes — never an empty one.
+  const failed = await readDescriptionInventory(sdkFor({ throwOnSolution: true }), 'app-1', 'ContosoSolution', new Set(['contoso_bound']));
+  assert.deepStrictEqual((failed.incomplete || []).filter((i) => /403/.test(i.reason)).map((i) => i.kind).sort(), ['businessRules', 'globalChoices']);
+
+  // The solution-component read is paginated, not capped, so a large solution-owned option-set
+  // list is read completely instead of being reported as an unknowable full page.
+  const seen = [];
+  const paged = await readDescriptionInventory(sdkFor({ gets: seen }), 'app-1', 'ContosoSolution', new Set());
+  assert.deepStrictEqual(unknown(paged), [], 'a paginated read should not report a truncation warning');
+});
+
+// An app in several solutions (#587 item 9) is inventoried across EVERY candidate — each contains the
+// app — and a built-in container among them scopes nothing and is dropped. An Error scope means the
+// membership could not be read: unknown, never empty.
+test('the global-choice inventory unions the owned sets of every candidate solution', async () => {
+  const OWN = { SolA: 'f6f6f6f6-0000-4000-8000-00000000000a', SolB: 'f6f6f6f6-0000-4000-8000-00000000000b' };
+  const looked = [];
+  const sdk = {
+    queryRecords: async (set, opts) => {
+      const filter = (opts && opts.filter) || '';
+      if (set === 'solution') {
+        const m = filter.match(/uniquename eq '([^']+)'/);
+        looked.push(m && m[1]);
+        return m && OWN[m[1]] ? [{ solutionid: `sol-${m[1]}` }] : [];
+      }
+      const own = filter.match(/_solutionid_value eq sol-(\w+) and componenttype eq 9/);
+      if (set === 'solutioncomponent' && own) return [{ objectid: OWN[own[1]] }];
+      return [];
+    },
+    dataverse: { get: async () => ({ status: 200, headers: {}, body: { value: [
+      { Name: 'set_a', MetadataId: OWN.SolA, IsManaged: false },
+      { Name: 'set_b', MetadataId: OWN.SolB, IsManaged: false },
+      { Name: 'set_elsewhere', MetadataId: 'f6f6f6f6-0000-4000-8000-00000000000c', IsManaged: false },
+    ] } }) },
+  };
+  const inv = await readDescriptionInventory(sdk, 'app-1', ['SolA', 'Default', 'SolB'], new Set());
+  assert.deepStrictEqual((inv.globalChoices || []).map((g) => g.name).sort(), ['set_a', 'set_b']);
+  assert.deepStrictEqual(looked, ['SolA', 'SolB'], 'the built-in Default container is never looked up');
+  const unread = await readDescriptionInventory(sdk, 'app-1', new Error('membership unreadable'), new Set(['set_a']));
+  assert.deepStrictEqual((unread.incomplete || []).map((i) => i.kind).filter((k) => k !== 'views' && k !== 'charts' && k !== 'forms').sort(), ['businessRules', 'fieldSecurityProfiles', 'globalChoices'],
+    'every class scoped by the solution is unknown, field security profiles included');
+  assert.strictEqual(unread.globalChoices, undefined, 'nothing is claimed about a scope that could not be read');
+});
+
+// An App Spec refers to a dashboard by name, and the sitemap title is only its label. Standing in for a name that
+// could not be read, it made a rebuild create or bind to another dashboard, and hid a real name clash. Such a
+// dashboard is withheld, and said to be — its subarea dropped, which the lossy-download gate reports.
+test('readDashboards withholds a dashboard whose name cannot be read, instead of naming it after the sitemap title', async () => {
+  const app = { siteMap: { areas: [{ groups: [{ subAreas: [{ type: 'DashBoard', dashboardId: 'dash-1', title: 'Operations' }] }] }] } };
+  const fetchArtifact = async () => ({ components: [{ type: 'iframe', name: 'Portal', parameters: { Url: 'https://contoso.example' } }] });
+  for (const [what, queryRecords, why] of [
+    ['a failed read', async () => { throw new Error('systemform read throttled'); }, /systemform read throttled/],
+    ['no row', async () => [], /no row for it/],
+  ]) {
+    const warnings = [];
+    const dashboards = await readDashboards({ fetchArtifact, queryRecords }, app, (m) => warnings.push(m));
+    assert.deepStrictEqual(dashboards, [], what);
+    assert.ok(warnings.some((w) => /dashboard 'Operations' \(dash-1\): its name could not be read/.test(w) && why.test(w) && /subarea will be dropped/.test(w)), `${what}: ${JSON.stringify(warnings)}`);
+  }
+  // CONTROL: a name that reads is the one emitted, whatever the title says.
+  const named = await readDashboards({ fetchArtifact, queryRecords: async () => [{ name: 'Ops Board' }] }, app);
+  assert.deepStrictEqual(named.map((d) => d.name), ['Ops Board']);
+});
+
+// ── assignPageKeys + missingDownloads + full round-trip ──────────────
+const { assignPageKeys, missingDownloads, runDownload, recoverAppSolution, appComponentEntities } = require('../download-model-app.js');
+const { reconcilePageIds, buildManifest } = require('../lib/page-manifest.js');
+const { hydrateSpec } = require('../lib/hydrate-spec.js');
+const { validateAppSpec } = require('../lib/app-spec.js');
+// `enrichesDefaultViews` gates the destructive default-view rewrite; a DOWNLOADED table is flagged
+// `existing: true` because ownership is unprovable, so it must never trigger that rewrite.
+const { enrichesDefaultViews } = require('../lib/sdk-build.js');
+const { appUniqueName } = require('../lib/sdk-build.js');
+const { resolvePageRefs, reverseResolveNavIds } = require('../lib/pageref-resolver.js');
+const { OBJECT_DIVISION_PAGE, LONG_KEY, lookBehindPage } = require('./helpers/misread-page.js');
+// What a guess costs a page where the TypeScript parser does not settle it (lib/typescript-views.js): these tests read the page with the lexer alone.
+// parser-check.test.js holds what the parser settles.
+const { setParserCheck } = require('../lib/typescript-views.js');
+const lexerAlone = (t) => { setParserCheck(false); t.after(() => setParserCheck(true)); };
+
+test('runDownload translates a fail-closed app read into a graceful error, not a raw SDK throw', async () => {
+  // An unresolved or shared sitemap is not a partial download: none of its navigation can be trusted
+  // as this app's membership. Preserve that refusal as a logical error before reading or writing pages.
+  for (const code of ['APP_SITEMAP_UNRESOLVED', 'APP_SITEMAP_SHARED', 'APP_UPDATE_NO_ETAG']) {
+    const err = new Error('app sitemap could not be resolved');
+    err.code = code;
+    const sdk = { fetchArtifact: async () => { throw err; } };
+    const genpage = fakeGenpage();
+    const res = await runDownload({ sdk, genpage, outDir: __dirname, appId: 'app-1', appUnique: 'new_app' });
+    assert.strictEqual(res.ok, false, `${code} must return ok:false`);
+    assert.match(res.error, /cannot read app app-1/, `${code} error names the app`);
+    assert.match(res.error, /sitemap could not be resolved/, `${code} keeps the underlying reason`);
+  }
+});
+
+test('runDownload still propagates a genuinely unexpected error (no blanket swallow)', async () => {
+  // Only the fail-closed read codes are translated. An unexpected I/O error must keep propagating
+  // to main().catch, or a real defect would be reported as an ordinary "download failed".
+  const err = new Error('EACCES: permission denied');
+  err.code = 'EACCES';
+  const sdk = { fetchArtifact: async () => { throw err; } };
+  const genpage = fakeGenpage();
+  await assert.rejects(
+    runDownload({ sdk, genpage, outDir: __dirname, appId: 'app-1', appUnique: 'new_app' }),
+    (caught) => caught && caught.code === 'EACCES'
+  );
+});
+
+test('assignPageKeys: reuses the manifest key + v2 semantics for a reconcile-bound page, mints fresh keys otherwise (§7.3)', () => {
+  const GP_O = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const GP_X = '9f2b1a3c-77de-4a10-8b6e-2c4d5e6f7a8b';
+  const manifest = { schemaVersion: 1, pages: [{ key: 'overview', name: 'Overview', pageId: GP_O, purpose: 'Home', navigatesTo: [{ targetKey: 'detail' }], pageInput: { data: {} } }] };
+  const downloaded = [
+    { pageId: GP_O, name: 'Overview', dataSources: [], codeFile: `p/${GP_O}/page.tsx` },
+    { pageId: GP_X, name: 'Some Legacy Page', dataSources: [], codeFile: `p/${GP_X}/page.tsx` },
+  ];
+  // 4-arg reconcilePageIds: both existence and sitemap are the downloaded page ids (download path)
+  const { keyToId } = reconcilePageIds(manifest.pages, manifest, [GP_O, GP_X], [GP_O, GP_X]);
+  const idToKey = assignPageKeys(downloaded, manifest, keyToId);
+  assert.strictEqual(downloaded[0].key, 'overview');
+  assert.deepStrictEqual(downloaded[0].navigatesTo, [{ targetKey: 'detail' }]);
+  assert.strictEqual(downloaded[0].purpose, 'Home');
+  assert.strictEqual(downloaded[1].key, 'some-legacy-page', 'a page with no manifest binding gets a fresh slug key, not the old name');
+  assert.strictEqual(idToKey.get(GP_O), 'overview');
+  assert.strictEqual(idToKey.get(GP_X), 'some-legacy-page');
+});
+
+test('assignPageKeys: mints unique keys (no manifest) with -N de-dup on slug collision', () => {
+  const downloaded = [{ pageId: 'a', name: 'Work Order', dataSources: [], codeFile: 'a' }, { pageId: 'b', name: 'Work Order', dataSources: [], codeFile: 'b' }];
+  assignPageKeys(downloaded, null, new Map());
+  assert.deepStrictEqual(downloaded.map((p) => p.key), ['work-order', 'work-order-2']);
+});
+
+test('missingDownloads flags a gap in EITHER direction (exact enumerated<->downloaded equality)', () => {
+  const enumPages = [{ pageId: 'gp-o', name: 'Overview' }, { pageId: 'gp-d', name: 'Detail' }];
+  const downloaded = [{ pageId: 'gp-o', name: 'Overview' }];
+  assert.deepStrictEqual(missingDownloads(enumPages, downloaded).map((p) => p.pageId), ['gp-d'], 'enumerated-but-not-downloaded');
+  assert.deepStrictEqual(missingDownloads(downloaded, enumPages), [], 'downloaded-and-enumerated → no extra');
+  assert.deepStrictEqual(missingDownloads(enumPages, enumPages), []);
+});
+
+test('ROUND-TRIP: manifest → download → reverse → hydrate → validate → resolve reproduces the deployed ids', async () => {
+  const GP_O = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const GP_D = '5c0a4889-45fd-46ea-91a8-ff876914d644';
+  const manifest = buildManifest({ pages: [{ key: 'overview', name: 'Overview', navigatesTo: [{ targetKey: 'detail' }] }, { key: 'detail', name: 'Detail' }] }, new Map([['overview', GP_O], ['detail', GP_D]]));
+  const deployedOverview = `Xrm.Navigation.navigateTo({ pageType: "generative", pageId: "${GP_D}", data: {} });`;
+  const downloaded = [
+    { pageId: GP_O, name: 'Overview', dataSources: [], codeFile: 'overview.tsx', _code: deployedOverview },
+    { pageId: GP_D, name: 'Detail', dataSources: [], codeFile: 'detail.tsx', _code: 'export default function D(){ return null; }' },
+  ];
+  // 4-arg reconcilePageIds: sitemap ids are both existence and membership for the download path
+  const { keyToId, conflicts } = reconcilePageIds(manifest.pages, manifest, [GP_O, GP_D], [GP_O, GP_D]);
+  assert.deepStrictEqual(conflicts, []);
+  const idToKey = assignPageKeys(downloaded, manifest, keyToId);
+  for (const p of downloaded) p._reversed = reverseResolveNavIds(p._code, idToKey);
+  assert.ok(downloaded[0]._reversed.includes('"PAGEREF_detail"'), 'overview nav reversed back to the symbolic key');
+  const spec = await hydrateSpec({
+    app: async () => ({ name: 'A', description: '', siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'GenPage', genPageId: GP_O, title: 'Overview' }, { type: 'GenPage', genPageId: GP_D, title: 'Detail' }] }] }] } }),
+    pages: async () => downloaded,
+    entities: async () => [{ schemaName: 'contoso_item', primaryAttribute: { schemaName: 'contoso_name' }, columns: [] }],
+    webResources: async () => [], solution: async () => ({ uniqueName: 'S', publisherPrefix: 'new' }),
+    design: async () => manifest.design,
+  });
+  const v = validateAppSpec(spec, { profile: 'plan' });
+  assert.ok(v.ok, v.errors.join('; '));
+  assert.strictEqual(spec.pages.find((p) => p.key === 'overview').navigatesTo[0].targetKey, 'detail');
+  assert.strictEqual(spec.appShell.areas[0].groups[0].subAreas[0].page, 'overview', 'GenPage subarea resolved by KEY');
+  const resolved = resolvePageRefs(new Map([['overview', { code: downloaded[0]._reversed }]]), keyToId).deployment.get('overview');
+  assert.ok(resolved.includes(`pageId: "${GP_D}"`) && !/PAGEREF_/.test(resolved), 'reverse∘resolve returns the deployed id — the loop is closed');
+});
+
+// ── sitemap-membership + download-by-id + keep pageId + env-wide names + injectable seam ─
+
+test('lexical navigation variants survive deploy-download-rebuild', async () => {
+  const overviewId = 'aaaaaaaa-0000-4000-8000-000000000001';
+  const detailId = 'bbbbbbbb-0000-4000-8000-000000000002';
+  const appId = 'cccccccc-0000-4000-8000-000000000003';
+  const appUniqueId = 'cccccccc-0000-4000-8000-000000000004';
+  const sitemapId = 'cccccccc-0000-4000-8000-000000000005';
+  const appUnique = 'contoso_lexical';
+  const manifest = buildManifest({ pages: [
+    { key: 'overview', name: 'Overview', navigatesTo: [{ targetKey: 'detail' }] },
+    { key: 'detail', name: 'Detail' },
+  ] }, new Map([['overview', overviewId], ['detail', detailId]]));
+  const manifestB64 = Buffer.from(JSON.stringify(manifest), 'utf8').toString('base64');
+  // Only the target arguments depend on this parameter; comments, escapes and Unicode are the oracle. A Unicode escape in a quoted KEY is inside
+  // a string and stays certain; one in an identifier in code (`navigate\u0054o`) is a trust frontier, so the callees are spelled plainly.
+  const overviewCode = (target) => [
+    'export default function Overview() {',
+    `  const idText = "${detailId}"; const token = "PAGEREF_detail";`,
+    '  const text = "left\u2028middle\u2029right";',
+    `  // navigateTo({pageType:"generative",pageId:"${detailId}"})\u2028  Xrm.Navigation.navigateTo?.(/* pageType and pageId */{pageType:"generative",pageId:"${target}"});`,
+    `  // another inert pageId\u2029  Xrm.Navigation.navigateTo?.({pageType:"generative",pageId:"${target}"});`,
+    String.raw`  Xrm?.Navigation?.navigateTo({"page\u0054ype":"generative","page\u{49}d":"` + target + '"});',
+    `  Xrm.Navigation.navigateTo({pageType:"generative",pageId:"${target}",// keep pageId\u2029data:{}});`,
+    String.raw`  Xrm.Navigation.navigateTo?.({"pageType":"generative",'page\x49d':"` + target + '"});',
+    `  Xrm.Navigation.navigateTo({pageType:"entityrecord",entityName:"contoso_item",entityId:"${detailId}"});`,
+    '  return null;',
+    '}',
+    '',
+  ].join('\r\n');
+  const deployed = overviewCode(detailId);
+  const canonical = overviewCode('PAGEREF_detail');
+  const detailCode = 'export default function Detail() { const text = "left\u2028right\u2029"; return null; }\r\n';
+  const xml = `<SiteMap><Area><Group><SubArea GenPageId="${overviewId}" Title="Navigation A"/><SubArea GenPageId="${detailId}" Title="Navigation B"/><SubArea Entity="contoso_item"/></Group></Area></SiteMap>`;
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'download-lexical-'));
+  try {
+    const sdk = {
+      fetchArtifact: async () => ({
+        name: 'Lexical App', description: '',
+        siteMap: { areas: [{ title: 'Main', groups: [{ title: 'Pages', subAreas: [
+          { type: 'GenPage', genPageId: overviewId, title: 'Navigation A' },
+          { type: 'GenPage', genPageId: detailId, title: 'Navigation B' },
+          { type: 'Entity', entity: 'contoso_item' },
+        ] }] }] },
+      }),
+      queryRecords: async (logical, opts = {}) => {
+        if (logical === 'appmodule') return [{ appmoduleid: appId, appmoduleidunique: appUniqueId, uniquename: appUnique }];
+        if (logical === 'appmodulecomponent') return [{ objectid: sitemapId, componenttype: 62 }];
+        if (logical === 'sitemap') return [{ sitemapxml: xml }];
+        if (logical === 'webresource') return /_pagemanifest'/.test(opts.filter || '') ? [{ content: manifestB64 }] : [];
+        return [];
+      },
+      fetchEntityMetadata: async (logical) => ({ schemaName: logical, displayName: 'Item', primaryNameAttribute: 'contoso_name', attributes: [], relationships: [] }),
+      dataverse: { get: async () => ({ status: 200, body: { value: [] } }) },
+    };
+    const genpage = fakeGenpage({ pages: [
+      { pageId: overviewId, name: 'Overview', source: deployed, dataSources: ['contoso_item'] },
+      { pageId: detailId, name: 'Detail', source: detailCode, dataSources: ['contoso_item'] },
+    ] });
+    const downloaded = await runDownload({
+      sdk: currentReadSdk(sdk, { appId, layerId: appUniqueId, sitemapXml: xml }),
+      genpage, outDir: out, appId, appUnique,
+    });
+    assert.deepStrictEqual(genpage.of('read').map((c) => c.args[0]).sort(), [overviewId, detailId].sort(), 'exactly the sitemap\'s pages are read, each by id');
+    assert.ok(downloaded.ok, JSON.stringify(downloaded));
+    const validation = validateAppSpec(downloaded.spec);
+    assert.ok(validation.ok, validation.errors.join('; '));
+    const overview = downloaded.spec.pages.find((p) => p.key === 'overview');
+    const detail = downloaded.spec.pages.find((p) => p.key === 'detail');
+    const downloadedOverview = fs.readFileSync(path.join(out, overview.source.codeFile));
+    assert.deepStrictEqual(downloadedOverview, Buffer.from(canonical, 'utf8'), 'reverse normalization changes only effective target literals');
+    assert.deepStrictEqual(fs.readFileSync(path.join(out, detail.source.codeFile)), Buffer.from(detailCode, 'utf8'), 'a page without navigation is byte-identical');
+    assert.deepStrictEqual(overview.navigatesTo, [{ targetKey: 'detail' }]);
+    assert.deepStrictEqual(overview.dataSources, ['contoso_item']);
+    const { deployment, unresolved } = resolvePageRefs(new Map([['overview', { code: downloadedOverview.toString('utf8') }]]),
+      new Map(downloaded.spec.pages.map((p) => [p.key, p.pageId])));
+    assert.deepStrictEqual(unresolved, []);
+    assert.strictEqual(deployment.get('overview'), deployed, 're-resolution reproduces every deployed byte, including inert IDs and LS/PS');
+  } finally { fs.rmSync(out, { recursive: true, force: true }); }
+});
+
+// What a download turns back into a "PAGEREF_<key>" is only what it is sure of: a DOUBLE-quoted id literal (the one a build writes), and only
+// before any place the lexer reads by guess. An id it leaves is left as the id, reported on stderr and on the result, so the author is told
+// what a rebuild will refuse (a hardcoded page id) instead of finding it there. The detail page's key is the one the manifest names; a long one
+// makes the token longer than the id, which is what moves the code after it.
+async function downloadOverview(deployedOverview, detailKey = 'detail') {
+  const overviewId = 'aaaaaaaa-0000-4000-8000-000000000001';
+  const detailId = 'bbbbbbbb-0000-4000-8000-000000000002';
+  const appId = 'cccccccc-0000-4000-8000-000000000003';
+  const appUniqueId = 'cccccccc-0000-4000-8000-000000000004';
+  const sitemapId = 'cccccccc-0000-4000-8000-000000000005';
+  const appUnique = 'contoso_navids';
+  const manifest = buildManifest({ pages: [
+    { key: 'overview', name: 'Overview', navigatesTo: [{ targetKey: detailKey }] },
+    { key: detailKey, name: 'Detail' },
+  ] }, new Map([['overview', overviewId], [detailKey, detailId]]));
+  const manifestB64 = Buffer.from(JSON.stringify(manifest), 'utf8').toString('base64');
+  const xml = `<SiteMap><Area><Group><SubArea GenPageId="${overviewId}" Title="Navigation A"/><SubArea GenPageId="${detailId}" Title="Navigation B"/><SubArea Entity="contoso_item"/></Group></Area></SiteMap>`;
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'download-navids-'));
+  const sdk = {
+    fetchArtifact: async () => ({
+      name: 'Nav Ids App', description: '',
+      siteMap: { areas: [{ title: 'Main', groups: [{ title: 'Pages', subAreas: [
+        { type: 'GenPage', genPageId: overviewId, title: 'Navigation A' },
+        { type: 'GenPage', genPageId: detailId, title: 'Navigation B' },
+        { type: 'Entity', entity: 'contoso_item' },
+      ] }] }] },
+    }),
+    queryRecords: async (logical, opts = {}) => {
+      if (logical === 'appmodule') return [{ appmoduleid: appId, appmoduleidunique: appUniqueId, uniquename: appUnique }];
+      if (logical === 'appmodulecomponent') return [{ objectid: sitemapId, componenttype: 62 }];
+      if (logical === 'sitemap') return [{ sitemapxml: xml }];
+      if (logical === 'webresource') return /_pagemanifest'/.test(opts.filter || '') ? [{ content: manifestB64 }] : [];
+      return [];
+    },
+    fetchEntityMetadata: async (logical) => ({ schemaName: logical, displayName: 'Item', primaryNameAttribute: 'contoso_name', attributes: [], relationships: [] }),
+    dataverse: { get: async () => ({ status: 200, body: { value: [] } }) },
+  };
+  const genpage = fakeGenpage({ pages: [
+    { pageId: overviewId, name: 'Overview', source: deployedOverview(detailId), dataSources: [] },
+    { pageId: detailId, name: 'Detail', source: 'export default function Detail() { return null; }\n', dataSources: [] },
+  ] });
+  const warned = [];
+  const realWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk) => { warned.push(String(chunk)); return true; };
+  let downloaded;
+  try {
+    downloaded = await runDownload({ sdk: currentReadSdk(sdk, { appId, layerId: appUniqueId, sitemapXml: xml }), genpage, outDir: out, appId, appUnique });
+  } finally { process.stderr.write = realWrite; }
+  const overview = downloaded.ok && downloaded.spec.pages.find((p) => p.key === 'overview');
+  return {
+    downloaded,
+    detailId,
+    warned: warned.join(''),
+    code: overview ? fs.readFileSync(path.join(out, overview.source.codeFile), 'utf8') : '',
+    cleanup: () => fs.rmSync(out, { recursive: true, force: true }),
+  };
+}
+
+test('download turns back a double-quoted id only, leaves any other as the id, and reports each one it leaves', async () => {
+  const deployed = (id) => [
+    'export default function Overview() {',
+    `  navigateTo({pageType:"generative",pageId:"${id}"});`,
+    `  navigateTo({pageType:"generative",pageId:'${id}'});`,
+    `  navigateTo({pageType:"generative",pageId:\`${id}\`});`,
+    '  return null;',
+    '}',
+    '',
+  ].join('\n');
+  const run = await downloadOverview(deployed);
+  try {
+    assert.ok(run.downloaded.ok, JSON.stringify(run.downloaded));
+    const lines = deployed(run.detailId).split('\n');
+    assert.strictEqual(run.code, [lines[0], lines[1].replace(`"${run.detailId}"`, '"PAGEREF_detail"'), lines[2], lines[3], lines[4], lines[5], ''].join('\n'),
+      'the double-quoted id is a token again; the single-quoted and back-ticked ids are as deployed, quotes and all');
+    assert.deepStrictEqual(run.downloaded.navIdsLeft, [
+      { page: 'Overview', key: 'detail', id: run.detailId, line: 3, column: lines[2].indexOf(run.detailId) + 1, why: 'quote' },
+      { page: 'Overview', key: 'detail', id: run.detailId, line: 4, column: lines[3].indexOf(run.detailId) + 1, why: 'quote' },
+    ]);
+    assert.match(run.warned, /WARNING: 2 page id\(s\) of this app remain in the downloaded page source instead of PAGEREF_ tokens \(page "Overview" line 3, column \d+: not a double-quoted literal; page "Overview" line 4, column \d+: not a double-quoted literal\)/);
+    assert.match(run.warned, /a navigation call that keeps one is a hardcoded page id, which a rebuild refuses: write it as a double-quoted "PAGEREF_<key>" literal in a navigateTo call whose options object is written inline/);
+    assert.match(run.warned, /An id that is data — a record id, text, a comment — can stay\./);
+  } finally { run.cleanup(); }
+});
+
+// The id of a call the lexer reads by guess is left alone, whatever its quotes: the corruption was a single-quoted id inside a
+// double-quoted string, which the lexer read as code after a misread, and which was rewritten to "PAGEREF_detail" — quotes ending the string.
+// The call after it is hidden by the same misread, and its id stays too: each is reported.
+test('download leaves an id after a place the lexer reads by guess, and says where that is', async (t) => {
+  lexerAlone(t);
+  const deployed = (id) => [
+    'export default function Overview() {',
+    `  navigateTo({pageType:"generative",pageId:"${id}"});`,
+    '  const of = 12;',
+    '  for (const x of of/2 + "") {} const re = /\\/*$/;',
+    `  const note = "*/ navigateTo({pageType:'generative', pageId:'${id}'}) /*";`,
+    `  navigateTo({pageType:"generative",pageId:"${id}"});`,
+    '  return null;',
+    '}',
+    '',
+  ].join('\n');
+  const run = await downloadOverview(deployed);
+  try {
+    assert.ok(run.downloaded.ok, JSON.stringify(run.downloaded));
+    const lines = deployed(run.detailId).split('\n');
+    assert.strictEqual(run.code, [lines[0], lines[1].replace(`"${run.detailId}"`, '"PAGEREF_detail"'), ...lines.slice(2)].join('\n'),
+      'the call before the guess is a token again; the text after it, the string included, is exactly as deployed');
+    assert.deepStrictEqual(run.downloaded.navIdsLeft.map((l) => [l.page, l.id, l.line, l.why, l.frontier.kind, l.frontier.line]), [
+      ['Overview', run.detailId, 5, 'frontier', 'keyword', 4],
+      ['Overview', run.detailId, 6, 'frontier', 'keyword', 4],
+    ]);
+    assert.match(run.warned, /WARNING: 2 page id\(s\) of this app remain in the downloaded page source instead of PAGEREF_ tokens \(page "Overview" line 5, column \d+: after the "keyword" ambiguity at line 4, column \d+; page "Overview" line 6, column \d+: after the "keyword" ambiguity at line 4, column \d+\)/);
+  } finally { run.cleanup(); }
+});
+
+// A call the lexer hid keeps its id, and no call it recognised holds it. The ids a download leaves are found by reading the result as text,
+// so the call is reported, and the warning fires: before, `left` was empty and nothing was said.
+test('download reports the id in a call the lexer hid, though no call it recognised holds it', async (t) => {
+  lexerAlone(t);
+  const run = await downloadOverview((id) => OBJECT_DIVISION_PAGE.replaceAll('"PAGEREF_detail"', `"${id}"`));
+  try {
+    assert.ok(run.downloaded.ok, JSON.stringify(run.downloaded));
+    assert.strictEqual(run.code.split('PAGEREF_detail').length - 1, 1, 'the call before the guess is a token again');
+    assert.strictEqual(run.code.split(run.detailId).length - 1, 1, 'the hidden call keeps its id');
+    assert.deepStrictEqual(run.downloaded.navIdsLeft.map((l) => [l.page, l.id, l.line, l.why, l.frontier.kind, l.frontier.line]), [['Overview', run.detailId, 5, 'frontier', 'brace', 4]]);
+    assert.match(run.warned, /WARNING: 1 page id\(s\) of this app remain in the downloaded page source instead of PAGEREF_ tokens \(page "Overview" line 5, column \d+: after the "brace" ambiguity at line 4, column \d+\)/);
+  } finally { run.cleanup(); }
+});
+
+// The same pages, read as the TypeScript parser reads them where the lexer guessed (lib/typescript-views.js): every call is seen, so every id in one is a token
+// again, and the page of twenty calls in an `if` head — whose tokens the lexer alone would read past its look-behind — is written with its tokens, and nothing is left.
+test('download turns the ids of a page the lexer misreads back into tokens, read as TypeScript parses it', async () => {
+  const run = await downloadOverview((id) => OBJECT_DIVISION_PAGE.replaceAll('"PAGEREF_detail"', `"${id}"`));
+  try {
+    assert.ok(run.downloaded.ok, JSON.stringify(run.downloaded));
+    assert.strictEqual(run.code, OBJECT_DIVISION_PAGE);
+    assert.ok(!('navIdsLeft' in run.downloaded), 'nothing left, nothing to report');
+  } finally { run.cleanup(); }
+  const deployed = (id) => `${lookBehindPage(id, 20)}export default function Overview() { return null; }\n`;
+  const long = await downloadOverview(deployed, LONG_KEY);
+  try {
+    assert.ok(long.downloaded.ok, JSON.stringify(long.downloaded));
+    assert.strictEqual(long.code, deployed(long.detailId).replaceAll(long.detailId, `PAGEREF_${LONG_KEY}`));
+    assert.ok(!('navIdsLeft' in long.downloaded), 'nothing left, nothing to report');
+  } finally { long.cleanup(); }
+});
+
+test('download reports an id that stays as data, with its place in the page it is written to, and says it can stay', async () => {
+  const deployed = (id) => `export default function Overview() {\n  navigateTo({pageType:"generative",pageId:"${id}",data:{recordId:"${id}"}});\n  return null;\n}\n`;
+  const run = await downloadOverview(deployed);
+  try {
+    assert.ok(run.downloaded.ok, JSON.stringify(run.downloaded));
+    assert.ok(run.code.includes('pageId:"PAGEREF_detail"'), 'the navigation id is a token again');
+    const column = run.code.split('\n')[1].indexOf(run.detailId) + 1;
+    assert.deepStrictEqual(run.downloaded.navIdsLeft, [{ page: 'Overview', key: 'detail', id: run.detailId, line: 2, column, why: 'text' }]);
+    assert.match(run.warned, new RegExp(`WARNING: 1 page id\\(s\\) of this app remain in the downloaded page source instead of PAGEREF_ tokens \\(page "Overview" line 2, column ${column}: not a navigation pageId literal \\(data, text or a comment\\)\\)`));
+    assert.match(run.warned, /An id that is data — a record id, text, a comment — can stay\./);
+  } finally { run.cleanup(); }
+});
+
+// A token is longer than the id it replaces when the key is long, and the code after it moves. This page's `if` head holds twenty calls: inside
+// the lexer's 2,000-character look-behind with ids, outside it with tokens. Written as tokens the page would have a `paren` ambiguity before the
+// call after the statement, and the build would refuse it, with nothing said at the download. So the download writes none: the page is as it was
+// deployed, every id is reported with the reason and the ambiguity, and the warning fires.
+test('download keeps every id of a page whose tokens the build would refuse, and says why', async (t) => {
+  lexerAlone(t);
+  const deployed = (id) => `${lookBehindPage(id, 20)}export default function Overview() { return null; }\n`;
+  const run = await downloadOverview(deployed, LONG_KEY);
+  try {
+    assert.ok(run.downloaded.ok, JSON.stringify(run.downloaded));
+    assert.strictEqual(run.code, deployed(run.detailId), 'the page is written exactly as it was deployed: no token');
+    const left = run.downloaded.navIdsLeft;
+    assert.strictEqual(left.length, 21, 'every id of the page is reported: twenty in the head and the one after the statement');
+    assert.ok(left.every((l) => l.page === 'Overview' && l.key === LONG_KEY && l.id === run.detailId && l.why === 'would-not-rebuild'));
+    const slash = run.code.split('\n')[1].indexOf(') /abc/') + 3;
+    assert.deepStrictEqual([...new Set(left.map((l) => JSON.stringify(l.frontier)))], [JSON.stringify({ kind: 'paren', line: 2, column: slash })], 'the ambiguity is told in the columns of the page as written');
+    assert.match(run.warned, /WARNING: 21 page id\(s\) of this app remain in the downloaded page source instead of PAGEREF_ tokens \(page "Overview" line 2, column \d+: kept as the id: written as tokens the page would not rebuild — it would have a "paren" ambiguity at line 2, column \d+, where the build stops trusting what it reads; /);
+    assert.match(run.warned, /a navigation call that keeps one is a hardcoded page id, which a rebuild refuses/);
+  } finally { run.cleanup(); }
+});
+
+// The same page with a short key: the tokens are shorter than the ids, the head only gets shorter, and the forward path takes the page. It is
+// the length of the token, not the construct, that decides.
+test('download writes the tokens of that page when they are shorter than the ids', async () => {
+  const deployed = (id) => `${lookBehindPage(id, 20)}export default function Overview() { return null; }\n`;
+  const run = await downloadOverview(deployed);
+  try {
+    assert.ok(run.downloaded.ok, JSON.stringify(run.downloaded));
+    assert.strictEqual(run.code, deployed(run.detailId).replaceAll(run.detailId, 'PAGEREF_detail'));
+    assert.ok(!('navIdsLeft' in run.downloaded), 'nothing left, nothing to report');
+  } finally { run.cleanup(); }
+});
+
+test('download is silent about page ids when every one is turned back into a token', async () => {
+  const run = await downloadOverview((id) => `export default function Overview() {\n  navigateTo({pageType:"generative",pageId:"${id}"});\n  return null;\n}\n`);
+  try {
+    assert.ok(run.downloaded.ok, JSON.stringify(run.downloaded));
+    assert.ok(run.code.includes('pageId:"PAGEREF_detail"'));
+    assert.ok(!('navIdsLeft' in run.downloaded), 'no field when there is nothing to report');
+    assert.ok(!/navigation page id/.test(run.warned), run.warned);
+  } finally { run.cleanup(); }
+});
+
+test('Maker-added page (sitemap, not in manifest) gets a minted key, keeps pageId', () => {
+  const GP_O = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const GP_MAKER = '9f2b1a3c-77de-4a10-8b6e-2c4d5e6f7a8b';
+  // manifest knows only GP_O; GP_MAKER was added in Maker and is only in the sitemap
+  const manifest = { schemaVersion: 1, pages: [{ key: 'overview', name: 'Overview', pageId: GP_O }] };
+  const pages = [
+    { pageId: GP_O,    name: 'Overview',   dataSources: [], codeFile: `pages/${GP_O}/page.tsx` },
+    { pageId: GP_MAKER, name: 'Maker Page', dataSources: [], codeFile: `pages/${GP_MAKER}/page.tsx` },
+  ];
+  const sitemapIds = [GP_O, GP_MAKER];
+  const { keyToId, conflicts } = reconcilePageIds(manifest.pages, manifest, sitemapIds, sitemapIds);
+  assert.deepStrictEqual(conflicts, []);
+  const idToKey = assignPageKeys(pages, manifest, keyToId);
+  // Manifest-bound page reuses its key
+  assert.strictEqual(pages[0].key, 'overview', 'manifest-bound page reuses its key');
+  assert.strictEqual(pages[0].pageId, GP_O, 'pageId preserved');
+  // Maker-added page gets a fresh key and keeps its pageId
+  assert.ok(pages[1].key, 'Maker-added page has a minted key');
+  assert.strictEqual(pages[1].pageId, GP_MAKER, 'Maker-added page pageId preserved for edit-snapshot adoption');
+  // Both ids are in idToKey so nav reverse-resolve covers all pages
+  assert.strictEqual(idToKey.get(GP_O), 'overview');
+  assert.ok(idToKey.has(GP_MAKER), 'Maker-added page id is in idToKey (nav reverse-resolve works)');
+});
+
+test('sitemap id not downloaded → missingDownloads catches it → download aborts', () => {
+  const GP_A = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const GP_B = '5c0a4889-45fd-46ea-91a8-ff876914d644';
+  // Both GP_A and GP_B are in the sitemap, but only GP_A was downloaded
+  const smPages = [{ pageId: GP_A, title: 'Overview' }, { pageId: GP_B, title: 'Detail' }];
+  const downloaded = [{ pageId: GP_A, name: 'Overview' }];
+  const missing = missingDownloads(smPages, downloaded);
+  assert.strictEqual(missing.length, 1, 'one page flagged as missing (sitemap id not downloaded)');
+  assert.strictEqual(missing[0].pageId, GP_B, 'GP_B is the missing page');
+  // Reverse: no extra (downloaded is a strict subset of sitemap)
+  assert.deepStrictEqual(missingDownloads(downloaded, smPages), []);
+});
+
+test('env-wide id→name used as the page name; sitemap title is fallback only', () => {
+  const GP = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-nm-'));
+  try {
+    fs.mkdirSync(path.join(out, 'pages', GP), { recursive: true });
+    fs.writeFileSync(path.join(out, 'pages', GP, 'page.tsx'), '');
+    // sitemap title is 'Sitemap Overview'; env-wide name is 'Order Overview' (different)
+    // Simulate the nameById built in runDownload: env-wide primary, sitemap title fallback
+    const envNameById = new Map([[GP.toLowerCase(), 'Order Overview']]);
+    const sitemapTitle = 'Sitemap Overview';
+    const nameById = new Map([[GP.toLowerCase(), envNameById.get(GP.toLowerCase()) || sitemapTitle]]);
+    const pages = parseDownloadedPages(path.join(out, 'pages'), out, nameById);
+    assert.strictEqual(pages[0].name, 'Order Overview', 'env-wide name takes precedence over sitemap title');
+    assert.strictEqual(pages[0].pageId, GP, 'pageId preserved');
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// ── the page folders a download writes from what the SDK read ─────────────────────────────────────────────────────────────────────
+
+const { pagesApp } = require('./helpers/page-swap.js');
+
+test('runDownload writes pages/<id>/{page.tsx,config.json,prompt.txt} from the page the SDK read — the source exactly as stored, no BOM and no CRLF added', async () => {
+  const GP_A = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const GP_B = '5c0a4889-45fd-46ea-91a8-ff876914d644';
+  const SOURCE_A = 'export default function A() {\n  return null;\n}';
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-tree-'));
+  try {
+    const app = pagesApp([GP_A, GP_B]);
+    const genpage = fakeGenpage({ pages: [
+      { pageId: GP_A, name: 'Alpha', source: SOURCE_A, dataSources: ['contoso_item'], model: 'gpt-4.1', actionBindings: [{ action: 'x' }],
+        conversation: [{ sender: 'user', message: 'Show items' }, { sender: 'agent', message: 'Shown' }, { sender: 'user', message: 'Add a chart' }] },
+      { pageId: GP_B, name: 'Beta', source: 'export default () => null;\r\n', prompt: 'Only prompt' },
+    ] });
+    const result = await runDownload({ ...app, genpage, outDir: out });
+    assert.ok(result.ok, JSON.stringify(result));
+    const bytes = (id, name) => fs.readFileSync(path.join(out, 'pages', id, name));
+
+    assert.deepStrictEqual(bytes(GP_A, 'page.tsx'), Buffer.from(SOURCE_A, 'utf8'), 'the stored source, byte for byte: no BOM, nothing appended');
+    assert.deepStrictEqual(bytes(GP_B, 'page.tsx'), Buffer.from('export default () => null;\r\n', 'utf8'), 'a source that ends in CRLF keeps it — it is the page\'s own');
+    assert.deepStrictEqual(JSON.parse(bytes(GP_A, 'config.json').toString('utf8')), { dataSources: ['contoso_item'], model: 'gpt-4.1', actionBindings: [{ action: 'x' }] });
+    assert.strictEqual(bytes(GP_A, 'prompt.txt').toString('utf8'), 'Conversation with 2 prompts:\r\n1. Show items\r\n2. Add a chart', 'several prompts: the transcript an earlier release wrote');
+    assert.strictEqual(bytes(GP_B, 'prompt.txt').toString('utf8'), 'Only prompt', 'one prompt: the bare text');
+    assert.ok(![...bytes(GP_A, 'page.tsx').slice(0, 3)].every((b, i) => b === [0xef, 0xbb, 0xbf][i]), 'no BOM');
+
+    // What a rebuild reads back is what the page holds.
+    const alpha = result.spec.pages.find((p) => p.pageId === GP_A);
+    assert.strictEqual(alpha.name, 'Alpha');
+    assert.deepStrictEqual(alpha.dataSources, ['contoso_item']);
+    assert.strictEqual(alpha.model, 'gpt-4.1');
+    assert.strictEqual(alpha.prompt, 'Conversation with 2 prompts:\r\n1. Show items\r\n2. Add a chart');
+    assert.deepStrictEqual(genpage.of('read').map((c) => c.args[0]).sort(), [GP_A, GP_B].sort(), 'each sitemap page is read once, by id');
+    assert.strictEqual(genpage.of('enumerateEnv').length, 1);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('runDownload: a page the SDK cannot read — missing, unreadable, or held as raw files — FAILS the download with its id and reason, and writes no page folder', async () => {
+  const GP_A = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const GP_RAW = '5c0a4889-45fd-46ea-91a8-ff876914d644';
+  const GP_GONE = '9f2b1a3c-77de-4a10-8b6e-2c4d5e6f7a8b';
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-unreadable-'));
+  try {
+    const app = pagesApp([GP_A, GP_RAW, GP_GONE]);
+    const genpage = fakeGenpage({ pages: [{ pageId: GP_A, name: 'Fine' }, { pageId: GP_RAW, name: 'Hand made', raw: true }] });
+    const result = await runDownload({ ...app, genpage, outDir: out });
+    assert.strictEqual(result.ok, false);
+    assert.match(result.error, /^page download failed: /);
+    assert.match(result.error, new RegExp(`${GP_RAW}: .*no source this tool can read`), 'a raw-file page is reported, never written as an empty page');
+    assert.match(result.error, new RegExp(`${GP_GONE}: .*does not exist`), 'every page that could not be read is named, in the sitemap\'s order');
+    assert.ok(!result.error.includes(`${GP_A}:`), 'the page that could be read is not blamed');
+    assert.strictEqual(result.spec, undefined, 'no spec is emitted that would drop them');
+    assert.ok(!fs.existsSync(path.join(out, 'pages')), 'nothing was written: a partial page set is never left behind');
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('runDownload: a failed listing of the environment\'s pages fails the download before any page is read', async () => {
+  const GP_A = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-listing-'));
+  try {
+    const genpage = fakeGenpage({ pages: [{ pageId: GP_A, name: 'Fine' }], enumerateError: 'could not list the environment\'s generative pages: HTTP 503' });
+    const result = await runDownload({ ...pagesApp([GP_A]), genpage, outDir: out });
+    assert.strictEqual(result.ok, false);
+    assert.match(result.error, /page enumeration failed during download: .*HTTP 503/);
+    assert.deepStrictEqual(genpage.of('read'), []);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('runDownload replaces the pages tree as a whole — a page deleted since the last download does not linger — and an app with no page leaves an existing tree alone', async () => {
+  const GP_A = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const STALE = '77777777-7777-4777-8777-777777777777';
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-replace-'));
+  try {
+    fs.mkdirSync(path.join(out, 'pages', STALE), { recursive: true });
+    fs.writeFileSync(path.join(out, 'pages', STALE, 'page.tsx'), 'export default () => null;');
+    const result = await runDownload({ ...pagesApp([GP_A]), genpage: fakeGenpage({ pages: [{ pageId: GP_A, name: 'Alpha' }] }), outDir: out });
+    assert.ok(result.ok, JSON.stringify(result));
+    assert.deepStrictEqual(fs.readdirSync(path.join(out, 'pages')), [GP_A], 'only the pages the app has now');
+    assert.strictEqual(result.pages.length, 1);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// ── a new page tree is swapped in whole, never written over the old one (#814) ───────────────────────────────────────────────────────
+// pages/ can hold a maker's page edits that were never uploaded. A download used to remove it and then write the new tree file by file, so
+// any failure part-way lost them. These tests fail an fs call at each step of the swap, through both callers, and check what is on disk;
+// stop a child process dead at each step and check what the next download does with what it left; and plant links where the swap's own
+// folders were made, to check nothing is written or removed through them.
+
+const { spawnSync } = require('node:child_process');
+const { writePageTree, generatedFolders, GUARDED_FS_METHODS } = require('../download-model-app.js');
+const { freshRenameWaitTotal } = require('./helpers/short-rename-wait.js');
+const { SWAP_A, SWAP_B, DOWNLOADED_A, seedEditedPages, treeBytes, swapGenpage, swapDownload } = require('./helpers/page-swap.js');
+
+const CRASH_CHILD = path.join(__dirname, 'helpers', 'page-swap-crash-child.js');
+
+// The hidden folders a download makes in <out>: the swap folder, and the managed download's staging folder.
+const leftovers = (out) => fs.readdirSync(out).filter((n) => n.startsWith('.pages-replace.') || n.startsWith('.download-pages.'));
+// A path under the managed download's staging folder: its tree is written by the same swap, and the faults below are for pages/ only.
+const staged = (p) => String(p).split(/[\\/]/).some((seg) => seg.startsWith('.download-pages.'));
+// The folder `<out>/<prefix>*` that `p` is, or is in, when there is one (null otherwise): `p` may name <out> by its real path.
+function topFolder(out, p, prefix) {
+  for (const base of new Set([out, fs.realpathSync.native(out)])) {
+    const rel = path.relative(base, String(p));
+    const first = rel.split(path.sep)[0];
+    if (!rel.startsWith('..') && !path.isAbsolute(rel) && first.startsWith(prefix)) return path.join(base, first);
+  }
+  return null;
+}
+
+// Makes fs[method] throw `code` for the calls `when` picks (all others go through), and answers the list of the calls it failed.
+function failFs(t, method, when, code) {
+  const real = fs[method];
+  const failed = [];
+  t.mock.method(fs, method, function (...args) {
+    if (when(...args)) {
+      failed.push(args);
+      throw Object.assign(new Error(`${code}: injected, ${method} '${args[0]}'`), { code, syscall: method, path: String(args[0]) });
+    }
+    return real.apply(this, args);
+  });
+  return failed;
+}
+
+// What the download writes to stderr, as a list of lines.
+function stderrLines(t) {
+  const lines = [];
+  t.mock.method(process.stderr, 'write', (line) => { lines.push(String(line)); return true; });
+  return lines;
+}
+
+// A folder outside <out> with a tree in it (`new/keep.txt` sits where the swap's `new` would be, if a link led a download there).
+function outsideTree() {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-outside-'));
+  fs.mkdirSync(path.join(outside, 'new'));
+  fs.writeFileSync(path.join(outside, 'new', 'keep.txt'), 'not the download\'s');
+  fs.writeFileSync(path.join(outside, 'keep.txt'), 'not the download\'s either');
+  return outside;
+}
+
+// Runs one call that stands for another process moving, removing or replacing a folder the download (or its guard) has just made or
+// written. On Windows an antivirus or indexer handle on such a folder refuses that call for a moment (EPERM, EACCES or EBUSY; seen in
+// these tests on a loaded machine), and that other process would simply try again, so the test does too (up to about 2 s). Above all, a
+// refusal must not escape a hook that runs inside one of the download's own fs calls: the download would take it for a refusal of its
+// own call and try that call again after it had in fact happened (seen: a page's rename retried after it was done, ENOENT, IO_ERROR
+// instead of the refusal under test). Any other error, and every error on another platform, is thrown at once.
+const HOOK_LOCK_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+function hookRetry(call) {
+  for (let i = 0; ; i += 1) {
+    try {
+      return call();
+    } catch (e) {
+      if (process.platform !== 'win32' || !HOOK_LOCK_CODES.has(e && e.code) || i >= 80) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+}
+
+// Makes the folder `<out>/<prefix>*` the download makes a junction to `outside` the moment it is made (on POSIX, 'junction' makes a plain
+// folder symlink): what another process that can write <out> could do between the mkdir and the first use. Answers the folders replaced.
+function plantAtMkdir(t, out, prefix, outside) {
+  const real = fs.mkdirSync;
+  const planted = [];
+  t.mock.method(fs, 'mkdirSync', function (p, ...rest) {
+    const result = real.call(this, p, ...rest);
+    if (!planted.length && topFolder(out, p, prefix) === path.resolve(String(p))) {
+      hookRetry(() => fs.rmdirSync(p));
+      hookRetry(() => fs.symlinkSync(outside, p, 'junction'));
+      planted.push(String(p));
+    }
+    return result;
+  });
+  return planted;
+}
+
+// A warning about a folder of the swap or of the staging (the stand-in app's own warnings, about its tables, are not about pages).
+const swapWarning = (line) => line.includes('.pages-replace.') || line.includes('.download-pages.');
+
+// The downloaded tree in pages/: the app's two pages, the first as the stand-in genpage serves it, nothing of the maker's.
+function assertDownloadedTree(out, label) {
+  assert.deepStrictEqual(fs.readdirSync(path.join(out, 'pages')).sort(), [SWAP_A, SWAP_B].sort(), label);
+  assert.strictEqual(fs.readFileSync(path.join(out, 'pages', SWAP_A, 'page.tsx'), 'utf8'), DOWNLOADED_A, label);
+}
+
+// Both callers of the swap: a direct download writes pages/ itself; the managed download stages the tree and publishes it after.
+const SWAP_CALLERS = [
+  ['a direct download', (out) => swapDownload(out, false), 'direct'],
+  ['the managed download\'s publish', (out) => swapDownload(out, true), 'managed'],
+];
+
+for (const [caller, download, mode] of SWAP_CALLERS) {
+  test(`${caller}: a page that fails to write part-way leaves the maker's pages/ byte for byte as it was, and no swap folder (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-write-'));
+    try {
+      seedEditedPages(out);
+      const before = treeBytes(path.join(out, 'pages'));
+      // The second page's first file: the first page is whole on disk by then.
+      const failed = failFs(t, 'openSync', (p) => !staged(p) && path.basename(path.dirname(String(p))) === SWAP_B, 'ENOSPC');
+      await assert.rejects(download(out), /ENOSPC/);
+      t.mock.restoreAll();
+      assert.strictEqual(failed.length, 1, 'the write of the second page failed');
+      assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before, 'the edited page and the maker\'s own page are as they were');
+      assert.deepStrictEqual(leftovers(out), [], 'the part-written tree is removed');
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: pages/ that cannot be moved aside is left as it was, and the download fails saying so (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-aside-'));
+    try {
+      seedEditedPages(out);
+      const before = treeBytes(path.join(out, 'pages'));
+      const failed = failFs(t, 'renameSync', (from, to) => !staged(to) && path.basename(String(to)) === 'previous', 'EIO');
+      await assert.rejects(download(out), (e) => e.code === 'EIO' && /could not replace the page folder .*could not be moved aside \(EIO\)\. It is as it was/.test(e.message));
+      t.mock.restoreAll();
+      assert.strictEqual(failed.length, 1);
+      assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before);
+      assert.deepStrictEqual(leftovers(out), []);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a new tree that cannot be moved into pages/ puts the previous pages back as they were (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-into-'));
+    try {
+      seedEditedPages(out);
+      const before = treeBytes(path.join(out, 'pages'));
+      const failed = failFs(t, 'renameSync', (from, to) => !staged(to) && path.basename(String(from)) === 'new' && path.basename(String(to)) === 'pages', 'EIO');
+      await assert.rejects(download(out), (e) => e.code === 'EIO' && /could not be moved into it \(EIO\)\. The previous pages were put back as they were$/.test(e.message));
+      t.mock.restoreAll();
+      assert.strictEqual(failed.length, 1);
+      assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before);
+      assert.deepStrictEqual(leftovers(out), []);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a new tree that cannot be moved in, nor the previous pages back, deletes nothing and names both folders (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-back-'));
+    try {
+      seedEditedPages(out);
+      const before = treeBytes(path.join(out, 'pages'));
+      const failed = failFs(t, 'renameSync', (from, to) => !staged(to) && path.basename(String(to)) === 'pages', 'EIO');
+      let error;
+      await assert.rejects(download(out), (e) => { error = e; return true; });
+      t.mock.restoreAll();
+      assert.strictEqual(failed.length, 2, 'the move in, then the move back');
+      const swaps = leftovers(out);
+      assert.strictEqual(swaps.length, 1);
+      const swap = path.join(out, swaps[0]);
+      assert.strictEqual(error.code, 'EIO');
+      assert.ok(error.message.includes(`the previous pages are in ${path.join(swap, 'previous')} and the downloaded pages in ${path.join(swap, 'new')}`), error.message);
+      assert.ok(!fs.existsSync(path.join(out, 'pages')));
+      assert.deepStrictEqual(treeBytes(path.join(swap, 'previous')), before, 'the maker\'s pages, whole');
+      assert.strictEqual(fs.readFileSync(path.join(swap, 'new', SWAP_A, 'page.tsx'), 'utf8'), DOWNLOADED_A, 'the downloaded pages, whole');
+      assert.ok(fs.existsSync(path.join(swap, 'new', SWAP_B, 'page.tsx')));
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a swap folder that cannot be removed at the end leaves the download a success, and a warning names the folder to delete (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-left-'));
+    try {
+      seedEditedPages(out);
+      const failed = failFs(t, 'rmSync', (p) => !staged(p) && path.basename(String(p)).startsWith('.pages-replace.'), 'EIO');
+      const lines = stderrLines(t);
+      await download(out);
+      t.mock.restoreAll();
+      assert.strictEqual(failed.length, 1);
+      assertDownloadedTree(out, 'the new tree is in place');
+      const swaps = leftovers(out);
+      assert.strictEqual(swaps.length, 1);
+      const warnings = lines.filter((l) => l.includes(swaps[0]));
+      assert.strictEqual(warnings.length, 1, lines.join(''));
+      assert.match(warnings[0], /^WARNING: the page folder .* was replaced, but the folder .* that holds the previous pages could not be removed \(EIO\): delete it\.\n$/);
+      assert.ok(warnings[0].includes(path.join(out, swaps[0])));
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a swap folder replaced by a junction the moment it is made is refused before anything is written, and what it points to is untouched (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-plant-'));
+    const outside = outsideTree();
+    try {
+      seedEditedPages(out);
+      const before = treeBytes(path.join(out, 'pages'));
+      const outsideBefore = treeBytes(outside);
+      const planted = plantAtMkdir(t, out, '.pages-replace.', outside);
+      // Were the pages written through the junction, this failure would send the clean-up after them, into `outside`.
+      failFs(t, 'openSync', (p) => !staged(p) && path.basename(path.dirname(String(p))) === SWAP_B, 'ENOSPC');
+      await assert.rejects(download(out), (e) => e.code === 'UNSAFE_OUTPUT' && e.message.includes(path.basename(planted[0])));
+      t.mock.restoreAll();
+      assert.strictEqual(planted.length, 1, 'the swap folder was replaced');
+      assert.deepStrictEqual(treeBytes(outside), outsideBefore, 'nothing written to, or removed from, where the junction points');
+      assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before);
+      assert.deepStrictEqual(leftovers(out), [path.basename(planted[0])], 'the junction is left where it was put');
+      assert.ok(fs.lstatSync(planted[0]).isSymbolicLink());
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a swap folder replaced by a junction while the pages are written is not cleaned up through it: what it points to is untouched, and a warning names it (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-late-'));
+    const outside = outsideTree();
+    try {
+      seedEditedPages(out);
+      const before = treeBytes(path.join(out, 'pages'));
+      const outsideBefore = treeBytes(outside);
+      const realOpen = fs.openSync;
+      let swap = null;
+      t.mock.method(fs, 'openSync', function (p, ...rest) {
+        const top = staged(p) ? null : topFolder(out, p, '.pages-replace.');
+        if (top && !swap && path.basename(path.dirname(String(p))) === SWAP_B) {
+          // The first page is written; the swap folder is moved away and a junction put at its name, then the write fails.
+          swap = top;
+          hookRetry(() => fs.renameSync(top, path.join(path.dirname(top), 'moved-away')));
+          hookRetry(() => fs.symlinkSync(outside, top, 'junction'));
+          throw Object.assign(new Error('ENOSPC: injected'), { code: 'ENOSPC', syscall: 'open', path: String(p) });
+        }
+        return realOpen.call(this, p, ...rest);
+      });
+      const lines = stderrLines(t);
+      await assert.rejects(download(out), /ENOSPC/);
+      t.mock.restoreAll();
+      assert.ok(swap, 'the swap folder was replaced');
+      assert.deepStrictEqual(treeBytes(outside), outsideBefore, 'the clean-up did not descend through the junction');
+      assert.ok(fs.lstatSync(swap).isSymbolicLink(), 'the junction is left where it was put');
+      assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before);
+      const warnings = lines.filter((l) => l.includes(path.basename(swap)));
+      assert.strictEqual(warnings.length, 1, lines.join(''));
+      assert.match(warnings[0], /^WARNING: the folder .* the downloaded pages were written to was not removed: it, or a folder in it, is no longer the folder this download made there .*Look into it before you delete anything in it\.\n$/);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a swap folder replaced by a junction between two file writes is refused at the next write: nothing is written where it points, and a warning names it (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-between-'));
+    const outside = outsideTree();
+    try {
+      seedEditedPages(out);
+      // A file of the first page where the next write would land, through the junction.
+      fs.mkdirSync(path.join(outside, 'new', SWAP_A));
+      fs.writeFileSync(path.join(outside, 'new', SWAP_A, 'config.json'), 'not the download\'s config');
+      const before = treeBytes(path.join(out, 'pages'));
+      const outsideBefore = treeBytes(outside);
+      const realRename = fs.renameSync;
+      let swap = null;
+      t.mock.method(fs, 'renameSync', function (from, to) {
+        const result = realRename.call(this, from, to);
+        const top = staged(to) ? null : topFolder(out, to, '.pages-replace.');
+        if (top && !swap && path.basename(String(to)) === 'page.tsx' && path.basename(path.dirname(String(to))) === SWAP_A) {
+          // The first page's page.tsx is written whole; then the swap folder is moved away and a junction put at its name.
+          swap = top;
+          hookRetry(() => realRename(top, path.join(out, 'moved-away')));
+          hookRetry(() => fs.symlinkSync(outside, top, 'junction'));
+        }
+        return result;
+      });
+      const lines = stderrLines(t);
+      let error;
+      await assert.rejects(download(out), (e) => { error = e; return true; });
+      t.mock.restoreAll();
+      assert.ok(swap, 'the swap folder was replaced');
+      assert.strictEqual(error.code, 'UNSAFE_OUTPUT', error.stack);
+      assert.ok(error.message.includes(path.basename(swap)), error.message);
+      assert.deepStrictEqual(treeBytes(outside), outsideBefore, 'nothing written to, or removed from, where the junction points');
+      assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before, 'the maker\'s pages/ as it was');
+      assert.ok(fs.lstatSync(swap).isSymbolicLink(), 'the junction is left where it was put');
+      assert.ok(fs.existsSync(path.join(out, 'moved-away', 'new', SWAP_A, 'page.tsx')), 'the swap folder moved away is left as it is');
+      const warnings = lines.filter((l) => l.includes(path.basename(swap)));
+      assert.strictEqual(warnings.length, 1, lines.join(''));
+      assert.match(warnings[0], /^WARNING: the folder .* the downloaded pages were written to was not removed: it, or a folder in it, is no longer the folder this download made there .*Look into it before you delete anything in it\.\n$/);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a page folder of the new tree replaced by a junction once its files are written is refused before the maker's pages/ is moved: nothing published from where it points (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-pagedir-'));
+    const outside = outsideTree();
+    try {
+      seedEditedPages(out);
+      const before = treeBytes(path.join(out, 'pages'));
+      const outsideBefore = treeBytes(outside);
+      const realMkdir = fs.mkdirSync;
+      let swap = null;
+      let pageDir = null;
+      t.mock.method(fs, 'mkdirSync', function (p, ...rest) {
+        const top = staged(p) ? null : topFolder(out, p, '.pages-replace.');
+        if (top && !pageDir && path.basename(String(p)) === SWAP_B && path.basename(path.dirname(String(p))) === 'new') {
+          // The first page is written whole; its folder in `new` is moved away and a junction put at its name, before the second page.
+          swap = top;
+          pageDir = path.join(path.dirname(String(p)), SWAP_A);
+          hookRetry(() => fs.renameSync(pageDir, path.join(out, 'moved-away')));
+          hookRetry(() => fs.symlinkSync(outside, pageDir, 'junction'));
+        }
+        return realMkdir.call(this, p, ...rest);
+      });
+      const lines = stderrLines(t);
+      let error;
+      await assert.rejects(download(out), (e) => { error = e; return true; });
+      t.mock.restoreAll();
+      assert.ok(pageDir, 'the page folder was replaced');
+      assert.strictEqual(error.code, 'UNSAFE_OUTPUT', error.stack);
+      assert.ok(error.message.includes(path.join(path.basename(swap), 'new', SWAP_A)), error.message);
+      assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before, 'the maker\'s pages/ as it was, not moved aside');
+      assert.deepStrictEqual(treeBytes(outside), outsideBefore, 'nothing written to, moved from or removed from where the junction points');
+      assert.ok(fs.lstatSync(pageDir).isSymbolicLink(), 'the junction is left where it was put');
+      const warnings = lines.filter((l) => l.includes(path.basename(swap)));
+      assert.strictEqual(warnings.length, 1, lines.join(''));
+      assert.match(warnings[0], /^WARNING: the folder .* the downloaded pages were written to was not removed: it, or a folder in it, is no longer the folder this download made there .*Look into it before you delete anything in it\.\n$/);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a swap folder replaced by a junction while the move into pages/ is refused for a moment moves no tree from where it points, and the error says where the previous pages were moved (#814)`, async (t) => {
+    freshRenameWaitTotal(t);
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-retry-'));
+    const outside = outsideTree();
+    try {
+      seedEditedPages(out);
+      fs.mkdirSync(path.join(outside, 'new', SWAP_A));
+      fs.writeFileSync(path.join(outside, 'new', SWAP_A, 'page.tsx'), 'not the download\'s page');
+      const before = treeBytes(path.join(out, 'pages'));
+      const outsideBefore = treeBytes(outside);
+      const realRename = fs.renameSync;
+      let swap = null;
+      let attempts = 0;
+      t.mock.method(fs, 'renameSync', function (from, to) {
+        const top = staged(from) || staged(to) ? null : topFolder(out, from, '.pages-replace.');
+        if (top && path.basename(String(from)) === 'new' && path.basename(String(to)) === 'pages') {
+          attempts += 1;
+          if (!swap) {
+            // A lock refuses the first move in (Windows waits and tries again); meanwhile the swap folder is moved away and a junction
+            // put at its name.
+            swap = top;
+            hookRetry(() => realRename(top, path.join(out, 'moved-away')));
+            hookRetry(() => fs.symlinkSync(outside, top, 'junction'));
+            throw Object.assign(new Error('EBUSY: injected, rename'), { code: 'EBUSY', syscall: 'rename' });
+          }
+        }
+        return realRename.call(this, from, to);
+      });
+      const lines = stderrLines(t);
+      let error;
+      await assert.rejects(download(out), (e) => { error = e; return true; });
+      t.mock.restoreAll();
+      assert.ok(swap, 'the swap folder was replaced');
+      assert.strictEqual(attempts, 1, 'no later attempt reached the rename');
+      assert.strictEqual(error.code, 'UNSAFE_OUTPUT', error.stack);
+      assert.ok(error.message.includes(path.join(path.basename(swap), 'previous')) && /so they were not moved back/.test(error.message), error.message);
+      assert.deepStrictEqual(treeBytes(outside), outsideBefore, 'nothing moved from, written to or removed from where the junction points');
+      assert.deepStrictEqual(treeBytes(path.join(out, 'moved-away', 'previous')), before, 'the maker\'s pages, whole, where the swap folder was moved');
+      assert.ok(!fs.existsSync(path.join(out, 'pages')), 'no pages/ published');
+      assert.ok(fs.lstatSync(swap).isSymbolicLink(), 'the junction is left where it was put');
+      assert.deepStrictEqual(lines.filter(swapWarning), [], 'nothing was cleaned up, so nothing to warn of');
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: with no pages/ yet, the download writes it, warns nothing and leaves no swap folder (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-first-'));
+    try {
+      const lines = stderrLines(t);
+      await download(out);
+      t.mock.restoreAll();
+      assertDownloadedTree(out, 'pages/ is written');
+      assert.deepStrictEqual(lines.filter(swapWarning), []);
+      assert.deepStrictEqual(leftovers(out), []);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a swap folder name that is already taken is left as it is, and another name is made (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-taken-'));
+    try {
+      seedEditedPages(out);
+      const real = fs.mkdirSync;
+      const tried = [];
+      t.mock.method(fs, 'mkdirSync', function (p, ...rest) {
+        if (topFolder(out, p, '.pages-replace.') === path.resolve(String(p))) {
+          tried.push(String(p));
+          // The first name tried is taken by the time the download makes it (another run's folder, or the maker's).
+          if (tried.length === 1) {
+            real.call(fs, p);
+            fs.writeFileSync(path.join(String(p), 'keep.txt'), 'someone else\'s');
+          }
+        }
+        return real.call(this, p, ...rest);
+      });
+      const lines = stderrLines(t);
+      await download(out);
+      t.mock.restoreAll();
+      assert.strictEqual(tried.length, 2, 'a second name was made');
+      assert.notStrictEqual(tried[0], tried[1]);
+      assertDownloadedTree(out, 'pages/ is replaced');
+      assert.deepStrictEqual(leftovers(out), [path.basename(tried[0])], 'the taken folder is not removed, and the swap folder made is');
+      assert.deepStrictEqual(treeBytes(tried[0]), { 'keep.txt': Buffer.from('someone else\'s').toString('hex') });
+      assert.deepStrictEqual(lines.filter(swapWarning), [], 'one with no previous pages in it is not named');
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  test(`${caller}: a swap folder an earlier download left with previous pages in it is named in one warning, and not touched (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-stranded-'));
+    const clean = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-clean-'));
+    try {
+      const STRANDED = '.pages-replace.1.deadbeef.tmp';
+      const NEW_ONLY = '.pages-replace.2.cafef00d.tmp';
+      for (const dir of [out, clean]) seedEditedPages(dir);
+      fs.mkdirSync(path.join(out, STRANDED, 'previous'), { recursive: true });
+      fs.cpSync(path.join(out, 'pages'), path.join(out, STRANDED, 'previous'), { recursive: true });
+      fs.mkdirSync(path.join(out, NEW_ONLY, 'new', SWAP_A), { recursive: true });
+      fs.writeFileSync(path.join(out, NEW_ONLY, 'new', SWAP_A, 'page.tsx'), DOWNLOADED_A);
+      const strandedBefore = treeBytes(path.join(out, STRANDED));
+      const newOnlyBefore = treeBytes(path.join(out, NEW_ONLY));
+
+      const lines = stderrLines(t);
+      await download(out);
+      const cleanAt = lines.length;
+      await download(clean);
+      t.mock.restoreAll();
+
+      assertDownloadedTree(out, 'pages/ is replaced all the same');
+      assert.deepStrictEqual(leftovers(out).sort(), [STRANDED, NEW_ONLY].sort(), 'both left where they are');
+      assert.deepStrictEqual(treeBytes(path.join(out, STRANDED)), strandedBefore);
+      assert.deepStrictEqual(treeBytes(path.join(out, NEW_ONLY)), newOnlyBefore);
+      const warning = `WARNING: ${path.join(out, STRANDED, 'previous')} holds the page folder as it was before an earlier download that stopped part-way: if it has page edits you need, copy them back into ${path.join(out, 'pages')}, then delete ${path.join(out, STRANDED)}.\n`;
+      const own = lines.slice(0, cleanAt);
+      assert.deepStrictEqual(own.filter((l) => l.includes('.pages-replace.')), [warning], 'one warning, for the folder with previous pages only');
+      // Apart from that warning, the download says what a download with no folder left says.
+      const shape = (list, dir) => list.filter((l) => l !== warning).map((l) => l.split(dir).join('<out>'));
+      assert.deepStrictEqual(shape(own, out), shape(lines.slice(cleanAt), clean));
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.rmSync(clean, { recursive: true, force: true });
+    }
+  });
+
+  // A child process downloads into <out> and is stopped dead at a boundary of the swap (page-swap-crash-child.js); the disk is checked,
+  // then a download is run again in the same <out>: it replaces pages/, and every folder the stopped one left is left byte for byte.
+  for (const point of ['partial', 'staged', 'aside', 'in', 'removed']) {
+    test(`${caller}: stopped dead at '${point}', the disk holds the maker's pages whole, and the next download replaces pages/ without touching what was left (#814)`, async (t) => {
+      const out = fs.mkdtempSync(path.join(os.tmpdir(), `dl-swap-crash-${point}-`));
+      try {
+        seedEditedPages(out);
+        const before = treeBytes(path.join(out, 'pages'));
+        const child = spawnSync(process.execPath, [CRASH_CHILD, out, mode, point], { encoding: 'utf8', timeout: 120000 });
+        assert.strictEqual(child.status, 86, `the child stopped at '${point}': ${child.stderr}`);
+
+        const swaps = leftovers(out);
+        const swap = swaps.length ? path.join(out, swaps[0]) : null;
+        const has = (rel) => fs.existsSync(path.join(swap, rel));
+        if (point === 'removed') {
+          assert.deepStrictEqual(swaps, []);
+          assertDownloadedTree(out, 'the new tree is in place');
+        } else {
+          assert.strictEqual(swaps.length, 1, swaps.join());
+          assert.ok(swaps[0].startsWith('.pages-replace.'));
+        }
+        if (point === 'partial' || point === 'staged') {
+          assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before, 'pages/ as it was');
+          assert.ok(!has('previous'));
+          assert.strictEqual(fs.readFileSync(path.join(swap, 'new', SWAP_A, 'page.tsx'), 'utf8'), DOWNLOADED_A);
+          assert.strictEqual(has(path.join('new', SWAP_B, 'page.tsx')), point === 'staged', 'the second page is written only once the tree is whole');
+        }
+        if (point === 'aside') {
+          assert.ok(!fs.existsSync(path.join(out, 'pages')), 'no pages/ between the two moves');
+          assert.deepStrictEqual(treeBytes(path.join(swap, 'previous')), before, 'the maker\'s pages, whole');
+          assert.ok(has(path.join('new', SWAP_B, 'page.tsx')), 'the new tree, whole');
+        }
+        if (point === 'in') {
+          assertDownloadedTree(out, 'the new tree is in place');
+          assert.deepStrictEqual(treeBytes(path.join(swap, 'previous')), before, 'the maker\'s pages, whole');
+          assert.ok(!has('new'));
+        }
+
+        const left = Object.fromEntries(swaps.map((n) => [n, treeBytes(path.join(out, n))]));
+        const lines = stderrLines(t);
+        await download(out);
+        t.mock.restoreAll();
+        assertDownloadedTree(out, 'the next download replaces pages/');
+        assert.deepStrictEqual(leftovers(out), swaps, 'it removes its own swap folder, and only that');
+        for (const n of swaps) assert.deepStrictEqual(treeBytes(path.join(out, n)), left[n], `${n} is left byte for byte`);
+        const named = lines.filter((l) => l.includes('.pages-replace.'));
+        if (point === 'aside' || point === 'in') {
+          assert.strictEqual(named.length, 1, lines.join(''));
+          assert.ok(named[0].startsWith(`WARNING: ${path.join(swap, 'previous')} holds the page folder as it was`), named[0]);
+        } else {
+          assert.deepStrictEqual(named, [], 'a folder with no previous pages in it is not named');
+        }
+      } finally {
+        fs.rmSync(out, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+test('the managed download: a staging folder replaced by a junction the moment it is made is refused before anything is written, and what it points to is untouched (#814)', async (t) => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-stage-plant-'));
+  const outside = outsideTree();
+  try {
+    seedEditedPages(out);
+    const before = treeBytes(path.join(out, 'pages'));
+    const outsideBefore = treeBytes(outside);
+    const planted = plantAtMkdir(t, out, '.download-pages.', outside);
+    const lines = stderrLines(t);
+    await assert.rejects(swapDownload(out, true), (e) => e.code === 'UNSAFE_OUTPUT' && e.message.includes(path.basename(planted[0])));
+    t.mock.restoreAll();
+    assert.strictEqual(planted.length, 1, 'the staging folder was replaced');
+    assert.deepStrictEqual(treeBytes(outside), outsideBefore, 'nothing written to, or removed from, where the junction points');
+    assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before);
+    assert.deepStrictEqual(leftovers(out), [path.basename(planted[0])], 'the junction is left where it was put');
+    assert.ok(fs.lstatSync(planted[0]).isSymbolicLink());
+    assert.deepStrictEqual(lines.filter(swapWarning), [], 'no clean-up was tried through it');
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('a download that replaces pages/ writes the same tree as before and leaves no swap folder; a managed download not yet published leaves pages/ untouched', async () => {
+  for (const [caller, download] of SWAP_CALLERS) {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-ok-'));
+    try {
+      seedEditedPages(out);
+      await download(out);
+      assertDownloadedTree(out, `${caller}: the app's pages only, as before`);
+      assert.deepStrictEqual(leftovers(out), [], caller);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  }
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-unpublished-'));
+  try {
+    seedEditedPages(out);
+    const before = treeBytes(path.join(out, 'pages'));
+    const result = await runDownload({ ...pagesApp([SWAP_A, SWAP_B]), genpage: swapGenpage(), outDir: out, stagePages: true });
+    assert.ok(result.ok, JSON.stringify(result));
+    result.stagedPages.check();
+    assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before);
+    assert.deepStrictEqual(leftovers(out), []);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// ── the CLI: every download stages its page tree and publishes it only after everything that can still stop it (#814) ──────────────────
+
+const { main: downloadMain } = require('../download-model-app.js');
+
+// The first page navigates to the second, so the download rewrites its page.tsx (the navigation id becomes a PAGEREF_ token).
+const NAVIGATING_A = `export default function A() {\n  Xrm.Navigation.navigateTo({ pageType: "generative", pageId: "${SWAP_B}", data: {} });\n  return null;\n}\n`;
+const navigatingGenpage = () => fakeGenpage({ pages: [{ pageId: SWAP_A, name: 'Alpha', source: NAVIGATING_A }, { pageId: SWAP_B, name: 'Beta' }] });
+
+// download-model-app.js main over the two-page app, with only its connections replaced: the real runDownload runs, as main asks it to
+// (`asked` keeps what it was asked), and `wrap` may change the result it answers. Answers what main emitted or threw, what it and the
+// download printed, and every SDK and page backend call the download made.
+async function cliDownload(t, out, { argv = [], wrap, validateAppSpec, ask = (args) => args } = {}) {
+  const app = pagesApp([SWAP_A, SWAP_B]);
+  const genpage = navigatingGenpage();
+  const requests = [];
+  let recording = false;
+  const sdk = new Proxy(app.sdk, {
+    get(target, prop) {
+      const value = target[prop];
+      if (typeof value !== 'function') return value;
+      return (...args) => { if (recording) requests.push(`${String(prop)} ${JSON.stringify(args)}`); return value.apply(target, args); };
+    },
+  });
+  const asked = [];
+  const emitted = [];
+  const said = [];
+  const printed = stderrLines(t);
+  let thrown = null;
+  try {
+    await downloadMain({
+      argv: ['--env', 'https://contoso.crm.dynamics.com', '--app', app.appUnique, '--out', out, ...argv],
+      stderr: { write: (text) => { said.push(String(text)); return true; } },
+      exit: () => {},
+      emitResult: (ok, payload) => emitted.push({ ok, payload }),
+      preflightAuth: async () => ({ ok: true }),
+      makeDownloadSdk: async () => ({ sdk, cleanup() {} }),
+      makeGenpageSdk: () => genpage,
+      runDownload: async (args) => {
+        asked.push(args);
+        recording = true;
+        try {
+          const result = await runDownload(ask(args));
+          return wrap ? wrap(result) : result;
+        } finally {
+          recording = false;
+        }
+      },
+      ...(validateAppSpec ? { validateAppSpec } : {}),
+    });
+  } catch (e) {
+    thrown = e;
+  }
+  t.mock.restoreAll();
+  return { asked, emitted, said: said.join(''), printed: printed.join(''), thrown, requests, pageCalls: genpage.calls.map((c) => `${c.method} ${JSON.stringify(c.args)}`) };
+}
+
+const MAKER_SPEC = '{\n  "note": "the maker\'s app-spec.json"\n}\n';
+
+// What a stop leaves to compare: pages/ byte for byte, the spec as it was, and no hidden folder of the download's.
+function assertNothingPublished(out, before, label) {
+  assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before, `${label}: the maker's edited page and their own page are as they were`);
+  assert.deepStrictEqual(leftovers(out), [], `${label}: no staging or swap folder is left`);
+  assert.strictEqual(fs.readFileSync(path.join(out, 'app-spec.json'), 'utf8'), MAKER_SPEC, `${label}: app-spec.json is unchanged`);
+}
+
+const CLI_STOPS = [
+  ['a lossy download without --allow-lossy-download', {
+    wrap: (r) => (r.ok ? { ...r, droppedSubareas: 1, droppedSubareaDetails: [{ type: 'Dashboard', id: 'd1', title: 'Board' }] } : r),
+  }, (res) => {
+    assert.strictEqual(res.emitted.length, 1);
+    assert.strictEqual(res.emitted[0].ok, false);
+    assert.match(res.emitted[0].payload.error, /1 sitemap subarea\(s\) could not be round-tripped/);
+  }],
+  ['a downloaded App Spec that fails validation', {
+    validateAppSpec: () => ({ ok: false, errors: ['injected'], warnings: [] }),
+  }, (res) => {
+    assert.strictEqual(res.emitted.length, 1);
+    assert.strictEqual(res.emitted[0].ok, false);
+    assert.strictEqual(res.emitted[0].payload.error, 'downloaded App Spec failed validation');
+  }],
+  ['a write of the navigation rewrite of a page.tsx that fails', {
+    fault: (t) => {
+      const realOpen = fs.openSync;
+      const failed = [];
+      // writeFileSafe's temporary file for <pages>/<A>/page.tsx, the rewrite's own write: under the staging folder now, under <out>
+      // itself before. writePageTree writes into its swap folder's `new` instead, so it is not hit.
+      t.mock.method(fs, 'openSync', function (p, flags, ...rest) {
+        const dir = path.dirname(String(p));
+        if (flags === 'wx' && path.basename(String(p)).startsWith('.page.tsx.') && path.basename(dir) === SWAP_A && path.basename(path.dirname(dir)) === 'pages') {
+          failed.push(String(p));
+          throw Object.assign(new Error(`ENOSPC: injected, open '${p}'`), { code: 'ENOSPC', syscall: 'open', path: String(p) });
+        }
+        return realOpen.call(this, p, flags, ...rest);
+      });
+      return failed;
+    },
+  }, (res, failed) => {
+    assert.strictEqual(failed.length, 1, 'the rewrite of the navigating page was the write that failed');
+    assert.ok(res.thrown && res.thrown.code === 'IO_ERROR' && /ENOSPC: injected/.test(res.thrown.message), String(res.thrown && res.thrown.stack));
+    assert.deepStrictEqual(res.emitted.filter((e) => e.ok), [], 'no success emitted');
+  }],
+];
+
+for (const [stop, { wrap, validateAppSpec, fault }, assertStopped] of CLI_STOPS) {
+  test(`the CLI without --include-managed: ${stop} stops the download with the maker's pages/ and app-spec.json as they were, and nothing left (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-cli-stop-'));
+    try {
+      seedEditedPages(out);
+      fs.writeFileSync(path.join(out, 'app-spec.json'), MAKER_SPEC);
+      const before = treeBytes(path.join(out, 'pages'));
+      const failed = fault ? fault(t) : null;
+      const res = await cliDownload(t, out, { wrap, validateAppSpec });
+      assert.strictEqual(res.asked.length, 1);
+      assertStopped(res, failed);
+      assertNothingPublished(out, before, stop);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+}
+
+// The staged tree was read back and validated; the tree the swap writes for publication is written again. An entry of that tree that
+// is gone before the swap (a page folder, or one file of it) is not a tree to publish: what the maker had is kept, byte for byte.
+for (const [missing, removed] of [['a page folder', []], ['the page.tsx of a page folder', ['page.tsx']]]) {
+  test(`the CLI without --include-managed: ${missing} of the tree written for publication, removed before the swap, stops the download with every output as it was (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-cli-missing-'));
+    try {
+      seedEditedPages(out);
+      fs.writeFileSync(path.join(out, 'app-spec.json'), MAKER_SPEC);
+      fs.mkdirSync(path.join(out, '.maker-workspace'));
+      fs.writeFileSync(path.join(out, '.maker-workspace', 'last-applied.json'), 'the maker\'s baseline\r\n');
+      fs.writeFileSync(path.join(out, '.maker-workspace', 'managed-fragments-earlier.json'), 'the maker\'s fragments\r\n');
+      const before = treeBytes(out);
+      const mkdir = fs.mkdirSync;
+      let gone = null;
+      // The swap's own `new/<B>` (not the staging folder's): page A of the tree to publish is written in full by then.
+      t.mock.method(fs, 'mkdirSync', function (p, ...args) {
+        if (!gone && !staged(p) && path.basename(String(p)) === SWAP_B && path.basename(path.dirname(String(p))) === 'new') {
+          gone = path.join(path.dirname(String(p)), SWAP_A, ...removed);
+          fs.rmSync(gone, { recursive: true });
+        }
+        return mkdir.call(this, p, ...args);
+      });
+      const res = await cliDownload(t, out);
+      assert.ok(gone, 'page A of the tree to publish was removed before page B was written');
+      assert.deepStrictEqual(res.emitted.filter((e) => e.ok), [], `no success: ${JSON.stringify(res.emitted)}`);
+      assert.ok(res.thrown && res.thrown.code === 'IO_ERROR', String(res.thrown && res.thrown.stack));
+      assert.ok(res.thrown.message.includes(path.join(SWAP_A, ...removed)) && /no longer there \(ENOENT\)/.test(res.thrown.message), res.thrown.message);
+      assert.deepStrictEqual(treeBytes(out), before, 'pages/, the spec, the baseline and the fragments file are as they were');
+      assert.deepStrictEqual(leftovers(out), [], 'no staging or swap folder is left');
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+}
+
+// Only a missing path (ENOENT, ENOTDIR) shows an entry is gone: any other error of the last inspection says so, with its code.
+test('writePageTree: a file of the new tree that cannot be inspected before the swap is named as such, not as gone, and pages/ is as it was (#814)', () => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-inspect-'));
+  try {
+    seedEditedPages(out);
+    const before = treeBytes(out);
+    const suffix = path.join('new', SWAP_A, 'page.tsx');
+    const eio = Object.assign(new Error('EIO: injected, lstat'), { code: 'EIO', syscall: 'lstat' });
+    let written = false;
+    let reads = 0;
+    let stillThere = null;
+    // Once the file is in place (writeFileSafe's rename onto it), the guard's own check reads it first; the second read is the final
+    // check's, and it fails while the file is there.
+    const faulty = { ...fs, renameSync(from, to) {
+      fs.renameSync(from, to);
+      if (String(to).endsWith(suffix)) written = true;
+    }, lstatSync(p, ...args) {
+      if (written && String(p).endsWith(suffix) && ++reads === 2) {
+        stillThere = fs.lstatSync(p).isFile();
+        throw eio;
+      }
+      return fs.lstatSync(p, ...args);
+    } };
+    assert.throws(() => writePageTree(path.join(out, 'pages'), [{ pageId: SWAP_A, files: { 'page.tsx': DOWNLOADED_A } }], { fs: faulty, warn: () => {} }), (e) => {
+      assert.strictEqual(e.code, 'IO_ERROR');
+      assert.strictEqual(e.cause, eio);
+      assert.match(e.message, /the file .*page\.tsx this download wrote could not be inspected \(EIO\)\. The page folder is as it was/);
+      assert.doesNotMatch(e.message, /no longer there/);
+      return true;
+    });
+    assert.strictEqual(stillThere, true, 'the file was there when its inspection failed');
+    assert.deepStrictEqual(treeBytes(out), before, 'pages/ is as it was');
+    assert.deepStrictEqual(leftovers(out), [], 'the swap folder is removed');
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('the CLI without --include-managed: a successful download answers, asks, prints and writes exactly what it did when it wrote pages/ itself (#814)', async (t) => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-cli-same-'));
+  const seed = () => {
+    for (const name of fs.readdirSync(out)) fs.rmSync(path.join(out, name), { recursive: true, force: true });
+    seedEditedPages(out);
+  };
+  try {
+    // As the CLI ran before: the same main, with runDownload asked to write pages/ itself.
+    seed();
+    const direct = await cliDownload(t, out, { ask: ({ stagePages, ...args }) => args });
+    const directTree = treeBytes(out);
+    seed();
+    const now = await cliDownload(t, out);
+    const nowTree = treeBytes(out);
+    assert.strictEqual(now.asked[0].stagePages, true, 'the CLI stages the page tree');
+    assert.strictEqual(direct.thrown, null, String(direct.thrown && direct.thrown.stack));
+    assert.strictEqual(now.thrown, null, String(now.thrown && now.thrown.stack));
+    assert.strictEqual(now.emitted.length, 1);
+    assert.strictEqual(now.emitted[0].ok, true, JSON.stringify(now.emitted));
+    assert.deepStrictEqual(now.emitted, direct.emitted, 'the same result');
+    assert.deepStrictEqual(now.requests, direct.requests, 'the same SDK requests');
+    assert.deepStrictEqual(now.pageCalls, direct.pageCalls, 'the same page backend calls');
+    assert.strictEqual(now.said, direct.said, 'the same lines from main');
+    assert.strictEqual(now.printed, direct.printed, 'the same lines from the download');
+    assert.deepStrictEqual(nowTree, directTree, 'the same spec, baseline and pages/, byte for byte');
+    assert.ok(fs.readFileSync(path.join(out, 'pages', SWAP_A, 'page.tsx'), 'utf8').includes('PAGEREF_'), 'the navigating page was rewritten');
+    assert.ok(fs.existsSync(path.join(out, 'app-spec.json')));
+    assert.deepStrictEqual(leftovers(out), []);
+    assert.deepStrictEqual(fs.readdirSync(out).filter((n) => n.startsWith('.app-spec.json.')), [], 'no temporary file of the spec is left');
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// ── app-spec.json is written after pages/ is published: what would refuse its write is refused before pages/ is touched ──────────────
+
+// A temporary sibling writeFileSafe makes for <out>/app-spec.json (`.app-spec.json.<pid>.<8 hex>.tmp`), under either name of <out>:
+// the pre-check's probe is one, and so is the file whose rename gives <out>/app-spec.json its new content.
+const specTemp = (out) => {
+  const outs = new Set([out, fs.realpathSync.native(out)]);
+  return (p) => path.basename(String(p)).startsWith('.app-spec.json.') && outs.has(path.dirname(String(p)));
+};
+
+for (const [what, plant, refusal] of [
+  ['a hard link', (file, elsewhere) => fs.linkSync(file, path.join(elsewhere, 'twin.json')), (e) => e.code === 'UNSAFE_OUTPUT' && e.reason === 'hard-link'],
+  ['read-only', (file) => fs.chmodSync(file, 0o444), (e) => e.code === 'IO_ERROR' && e.reason === 'read-only'],
+  ['a folder', (file) => { fs.rmSync(file); fs.mkdirSync(file); fs.writeFileSync(path.join(file, 'kept.txt'), 'the maker\'s file'); }, (e) => e.code === 'UNSAFE_OUTPUT' && e.reason === 'not-file'],
+  ['a symbolic link', (file, elsewhere) => {
+    const real = path.join(elsewhere, 'real-spec.json');
+    fs.writeFileSync(real, MAKER_SPEC);
+    fs.rmSync(file);
+    fs.symlinkSync(real, file, 'file');
+  }, (e) => e.code === 'UNSAFE_OUTPUT' && e.reason === 'link'],
+  ['in a folder where no new file can be made', (file, elsewhere, t, out) => failFs(t, 'openSync', (p, flags) => flags === 'wx' && specTemp(out)(p), 'EACCES'), (e) => e.code === 'IO_ERROR' && e.reason === 'folder-not-writable'],
+]) {
+  test(`the CLI without --include-managed: an app-spec.json that is ${what} is refused before pages/ is touched: the maker's pages and spec are as they were, and nothing is left`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-cli-spec-refused-'));
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-cli-spec-elsewhere-'));
+    const specFile = path.join(out, 'app-spec.json');
+    try {
+      seedEditedPages(out);
+      fs.writeFileSync(specFile, MAKER_SPEC);
+      try {
+        plant(specFile, elsewhere, t, out);
+      } catch (e) {
+        if (e && e.code === 'EPERM' && what === 'a symbolic link') { t.skip('this account cannot make a symbolic link'); return; }
+        throw e;
+      }
+      const before = treeBytes(out);
+      const res = await cliDownload(t, out);
+      assert.deepStrictEqual(treeBytes(out), before, 'pages/ and app-spec.json are as they were');
+      assert.deepStrictEqual(leftovers(out), [], 'no staging or swap folder is left');
+      assert.deepStrictEqual(fs.readdirSync(out).filter((n) => n.startsWith('.app-spec.json.')), [], 'no temporary file is left');
+      assert.deepStrictEqual(res.emitted.filter((e) => e.ok), [], 'no success emitted');
+      assert.ok(res.thrown && refusal(res.thrown), String(res.thrown && res.thrown.stack));
+      assert.match(res.thrown.message, /^refusing to write .*app-spec\.json: /);
+      assert.ok(res.thrown.message.endsWith(`. The download stopped before replacing anything: ${path.join(out, 'pages')} and ${specFile} are as they were`), res.thrown.message);
+    } finally {
+      // Only the read-only case changed a mode, and only a file's mode needs restoring. A folder planted at the spec's name keeps
+      // its search bit: on POSIX a chmod to 0o666 would drop it, and the clean-up below could not remove the file inside (EACCES).
+      try { if (fs.lstatSync(specFile).isFile()) fs.chmodSync(specFile, 0o666); } catch { /* removed already */ }
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+}
+
+// The look at the spec makes, then removes, an empty file of its own. When that file cannot be removed the look does not pass: the
+// download stops before it replaces anything, and the error names the file left, so the maker can delete it.
+for (const lateFailure of [false, true]) {
+  test(`the CLI without --include-managed: an empty file the look at app-spec.json made that cannot be removed stops the download before pages/ is touched, and is named${lateFailure ? ' (a write of the spec that would fail later is never reached)' : ''}`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-cli-spec-probe-'));
+    const specFile = path.join(out, 'app-spec.json');
+    // fs.rmSync loads its recursive remover lazily, and that module keeps the unlink it finds then: load it before unlink is mocked,
+    // or a later clean-up runs the mock.
+    const warmup = path.join(out, 'warmup');
+    fs.mkdirSync(warmup);
+    fs.rmSync(warmup, { recursive: true });
+    try {
+      seedEditedPages(out);
+      fs.writeFileSync(specFile, MAKER_SPEC);
+      const before = treeBytes(out);
+      const opened = [];
+      const open = fs.openSync;
+      t.mock.method(fs, 'openSync', function (p, ...args) {
+        if (specTemp(out)(p)) opened.push(String(p));
+        return open.call(this, p, ...args);
+      });
+      const blocked = failFs(t, 'unlinkSync', (p) => String(p) === opened[0], 'EIO');
+      const renamed = lateFailure ? failFs(t, 'renameSync', specTemp(out), 'EIO') : [];
+      const res = await cliDownload(t, out);
+      const probe = opened[0];
+      assert.ok(probe, 'the look made its file');
+      assert.strictEqual(blocked.length, 1, 'its removal was refused');
+      assert.deepStrictEqual(renamed, [], 'no write of the spec was tried');
+      assert.deepStrictEqual(res.emitted.filter((e) => e.ok), [], 'no success emitted');
+      assert.ok(res.thrown && res.thrown.code === 'IO_ERROR' && res.thrown.reason === 'probe-not-removed', String(res.thrown && res.thrown.stack));
+      assert.ok(res.thrown.message.includes(probe), res.thrown.message);
+      assert.match(res.thrown.message, /an empty file this download made .*can be deleted/);
+      assert.ok(res.thrown.message.endsWith(`. The download stopped before replacing anything: ${path.join(out, 'pages')} and ${specFile} are as they were`), res.thrown.message);
+      assert.deepStrictEqual(leftovers(out), [], 'no staging or swap folder is left');
+      fs.unlinkSync(probe);
+      assert.deepStrictEqual(treeBytes(out), before, 'once the named file is deleted, the folder is exactly as it was');
+    } finally {
+      t.mock.restoreAll();
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+}
+
+// What the error of a write of the spec that fails after pages/ is published says: what is known (the page tree was published, the
+// write reported an error) and what is not (whether the spec on disk matches the pages), and what to do. Nothing more is claimed.
+const lateSpecSequel = (out) => `. This download had already published its page tree to ${path.join(out, 'pages')} when the write of ${path.join(out, 'app-spec.json')} reported this error, so whether ${path.join(out, 'app-spec.json')} matches those pages has not been confirmed: resolve the error and run the same download again`;
+
+// A write of the spec that fails for a reason no look beforehand can see (a full disk, a lock, a crash) comes after pages/ is published,
+// as it did: the error says what is known, and the same download run again makes the two match.
+for (const hadSpec of [true, false]) {
+  test(`the CLI without --include-managed: a write of app-spec.json that fails after pages/ is published${hadSpec ? '' : ', where there was no app-spec.json'}, says the page tree was published and the spec is not confirmed to match it, and the same download run again makes them match`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-cli-spec-late-'));
+    const specFile = path.join(out, 'app-spec.json');
+    try {
+      seedEditedPages(out);
+      if (hadSpec) fs.writeFileSync(specFile, MAKER_SPEC);
+      const failed = failFs(t, 'renameSync', specTemp(out), 'EIO');
+      const res = await cliDownload(t, out);
+      assert.strictEqual(failed.length, 1, 'the spec\'s rename into place was refused');
+      assert.deepStrictEqual(fs.readdirSync(path.join(out, 'pages')).sort(), [SWAP_A, SWAP_B].sort(), 'pages/ holds this download\'s pages');
+      assert.ok(fs.readFileSync(path.join(out, 'pages', SWAP_A, 'page.tsx'), 'utf8').includes('PAGEREF_'));
+      if (hadSpec) assert.strictEqual(fs.readFileSync(specFile, 'utf8'), MAKER_SPEC, 'app-spec.json is the previous spec');
+      else assert.ok(!fs.existsSync(specFile), 'there is still no app-spec.json');
+      assert.deepStrictEqual(leftovers(out), [], 'no staging or swap folder is left');
+      assert.deepStrictEqual(res.emitted.filter((e) => e.ok), [], 'no success emitted');
+      assert.ok(res.thrown && res.thrown.code === 'IO_ERROR', String(res.thrown && res.thrown.stack));
+      assert.match(res.thrown.message, /^failed to write .*app-spec\.json: EIO: injected/);
+      assert.ok(res.thrown.message.endsWith(lateSpecSequel(out)), res.thrown.message);
+
+      const again = await cliDownload(t, out);
+      assert.strictEqual(again.thrown, null, String(again.thrown && again.thrown.stack));
+      assert.strictEqual(again.emitted.length, 1);
+      assert.strictEqual(again.emitted[0].ok, true, JSON.stringify(again.emitted));
+      const spec = JSON.parse(fs.readFileSync(specFile, 'utf8'));
+      assert.deepStrictEqual(spec.pages.map((p) => p.pageId).sort(), fs.readdirSync(path.join(out, 'pages')).sort(), 'the spec describes the pages in pages/');
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+}
+
+// The error claims nothing about what is on disk beyond the published tree, because every claim it once made can be untrue: a spec
+// that already matched the pages (an unchanged app downloaded again), a rename that took effect before it reported an error, and a
+// previous tree that the swap kept because its folder could not be removed.
+for (const [what, arrange, check] of [
+  ['the app is unchanged since the last download, so the spec on disk already describes the pages', async (t, out) => {
+    const first = await cliDownload(t, out);
+    assert.strictEqual(first.thrown, null, String(first.thrown && first.thrown.stack));
+    const before = treeBytes(out);
+    failFs(t, 'renameSync', specTemp(out), 'EIO');
+    return before;
+  }, (out, before) => assert.deepStrictEqual(treeBytes(out), before, 'the spec and the pages are still the matching pair of the first download')],
+  ['the rename of the spec took effect and then reported an error', async (t, out) => {
+    seedEditedPages(out);
+    fs.writeFileSync(path.join(out, 'app-spec.json'), MAKER_SPEC);
+    const rename = fs.renameSync;
+    t.mock.method(fs, 'renameSync', function (from, to) {
+      const done = rename.call(this, from, to);
+      if (specTemp(out)(from)) throw Object.assign(new Error('EIO: injected after the rename'), { code: 'EIO' });
+      return done;
+    });
+  }, (out) => assert.ok(JSON.parse(fs.readFileSync(path.join(out, 'app-spec.json'), 'utf8')).pages.length > 0, 'the new spec is on disk')],
+  ['the swap folder that holds the previous pages could not be removed', async (t, out) => {
+    seedEditedPages(out);
+    fs.writeFileSync(path.join(out, 'app-spec.json'), MAKER_SPEC);
+    const before = treeBytes(path.join(out, 'pages'));
+    const rm = fs.rmSync;
+    t.mock.method(fs, 'rmSync', function (p, ...args) {
+      if (topFolder(out, p, '.pages-replace.') === String(p)) throw Object.assign(new Error('EIO: injected, rm'), { code: 'EIO' });
+      return rm.call(this, p, ...args);
+    });
+    failFs(t, 'renameSync', specTemp(out), 'EIO');
+    return before;
+  }, (out, before) => {
+    const swaps = fs.readdirSync(out).filter((n) => n.startsWith('.pages-replace.'));
+    assert.strictEqual(swaps.length, 1);
+    assert.deepStrictEqual(treeBytes(path.join(out, swaps[0], 'previous')), before, 'the previous pages are kept in the swap folder');
+  }],
+]) {
+  test(`the CLI without --include-managed: the error of a write of app-spec.json that fails after pages/ is published claims nothing it cannot know, when ${what}`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-cli-spec-late-'));
+    try {
+      const before = await arrange(t, out);
+      const res = await cliDownload(t, out);
+      check(out, before);
+      assert.deepStrictEqual(res.emitted.filter((e) => e.ok), [], 'no success emitted');
+      assert.ok(res.thrown && res.thrown.code === 'IO_ERROR', String(res.thrown && res.thrown.stack));
+      assert.ok(res.thrown.message.endsWith(lateSpecSequel(out)), res.thrown.message);
+      for (const untrue of ['not kept', 'still the spec', 'does not describe', 'was not written']) assert.ok(!res.thrown.message.includes(untrue), res.thrown.message);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+}
+
+test('writePageTree on Windows: a moment\'s lock on the move into pages/ is waited out, but the move of the maker\'s pages/ aside is one attempt (#814)', (t) => {
+  freshRenameWaitTotal(t);
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-win32-'));
+  try {
+    seedEditedPages(out);
+    const pagesRoot = path.join(out, 'pages');
+    const before = treeBytes(pagesRoot);
+    const tree = [{ pageId: SWAP_A, files: { 'page.tsx': DOWNLOADED_A } }];
+    const win32 = { platform: 'win32', pause: () => {} };
+    // An fs whose folder rename that `match` picks is refused with EBUSY (a scanner holding a file in it) `times` times, then goes through.
+    const locked = (match, times) => {
+      const calls = [];
+      let left = times;
+      const fsImpl = { ...fs, renameSync(from, to) {
+        if (match(from, to)) {
+          calls.push([from, to]);
+          if (left > 0) {
+            left -= 1;
+            throw Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY', syscall: 'rename' });
+          }
+        }
+        return fs.renameSync(from, to);
+      } };
+      return { calls, fsImpl };
+    };
+
+    const aside = locked((from, to) => path.basename(to) === 'previous', 1);
+    assert.throws(() => writePageTree(pagesRoot, tree, { fs: aside.fsImpl, rename: win32, warn: () => {} }), (e) => e.code === 'EBUSY' && /could not be moved aside \(EBUSY\)/.test(e.message));
+    assert.strictEqual(aside.calls.length, 1, 'the maker\'s folder is moved once or not at all: a wait would let the checks made on it go stale');
+    assert.deepStrictEqual(treeBytes(pagesRoot), before);
+    assert.deepStrictEqual(leftovers(out), []);
+
+    const into = locked((from, to) => path.basename(from) === 'new' && path.basename(to) === 'pages', 2);
+    const warned = [];
+    writePageTree(pagesRoot, tree, { fs: into.fsImpl, rename: win32, warn: (line) => warned.push(line) });
+    assert.strictEqual(into.calls.length, 3, 'refused twice, then moved');
+    assert.deepStrictEqual(treeBytes(pagesRoot), { [`${SWAP_A}/page.tsx`]: Buffer.from(DOWNLOADED_A).toString('hex') });
+    assert.deepStrictEqual(leftovers(out), []);
+    assert.deepStrictEqual(warned, []);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('writePageTree, a move into pages/ waited out: each attempt is checked first, so a swap folder replaced by a junction during the wait moves nothing from where it points (#814)', (t) => {
+  freshRenameWaitTotal(t);
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-wait-'));
+  const outside = outsideTree();
+  try {
+    seedEditedPages(out);
+    fs.mkdirSync(path.join(outside, 'new', SWAP_A));
+    fs.writeFileSync(path.join(outside, 'new', SWAP_A, 'page.tsx'), 'not the download\'s page');
+    const pagesRoot = path.join(out, 'pages');
+    const before = treeBytes(pagesRoot);
+    const outsideBefore = treeBytes(outside);
+    const renames = [];
+    const fsImpl = { ...fs, renameSync(from, to) {
+      if (path.basename(from) === 'new' && path.basename(to) === 'pages') {
+        renames.push(from);
+        throw Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY', syscall: 'rename' });
+      }
+      return fs.renameSync(from, to);
+    } };
+    let swap = null;
+    // The wait between two attempts (Windows' lock wait, on every platform here): the swap folder is moved away and a junction put at its name.
+    const pause = () => {
+      if (swap) return;
+      swap = path.dirname(renames[0]);
+      hookRetry(() => fs.renameSync(swap, path.join(out, 'moved-away')));
+      hookRetry(() => fs.symlinkSync(outside, swap, 'junction'));
+    };
+    const warned = [];
+    assert.throws(
+      () => writePageTree(pagesRoot, [{ pageId: SWAP_A, files: { 'page.tsx': DOWNLOADED_A } }], { fs: fsImpl, rename: { platform: 'win32', pause }, warn: (line) => warned.push(line) }),
+      (e) => e.code === 'UNSAFE_OUTPUT' && /so they were not moved back/.test(e.message),
+    );
+    assert.ok(swap, 'the move in was waited out once');
+    assert.strictEqual(renames.length, 1, 'the attempt after the wait was refused before it renamed');
+    assert.deepStrictEqual(treeBytes(outside), outsideBefore);
+    assert.deepStrictEqual(treeBytes(path.join(out, 'moved-away', 'previous')), before);
+    assert.ok(!fs.existsSync(pagesRoot));
+    assert.deepStrictEqual(warned, []);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+// The managed download reads its staged tree back from the staging folder (the page metadata the spec states, each page file whose page
+// ids it rewrites, and every file it then publishes): what it reads is what it publishes. A staging folder replaced by a junction once
+// written, between two of those reads, or after the last of them (found when it is removed) hands on nothing from where the junction
+// points: the download is refused, and pages/ is not written.
+for (const point of ['once written', 'between two reads', 'after the last read']) {
+  test(`the managed download, its staging folder replaced by a junction ${point}: refused, nothing read through it published, pages/ and the junction's target untouched (#814)`, async (t) => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-stage-read-'));
+    const outside = outsideTree();
+    try {
+      seedEditedPages(out);
+      for (const id of [SWAP_A, SWAP_B]) {
+        fs.mkdirSync(path.join(outside, 'pages', id), { recursive: true });
+        fs.writeFileSync(path.join(outside, 'pages', id, 'page.tsx'), `not the download's page ${id}`);
+        fs.writeFileSync(path.join(outside, 'pages', id, 'config.json'), '{"dataSources":[]}');
+      }
+      const before = treeBytes(path.join(out, 'pages'));
+      const outsideBefore = treeBytes(outside);
+      // The download makes its staging folder in <out> named by its real path (assertSafeOutputDir answers realpath.native), which is not
+      // the path os.tmpdir() gave when a folder above it is a link or a short name: /var -> /private/var on macOS, C:\Users\RUNNER~1 on
+      // Windows CI. Match either name, or the hooks below never see the staging folder and nothing is planted.
+      const outNames = new Set([out, fs.realpathSync.native(out)]);
+      const isStage = (p) => outNames.has(path.dirname(p)) && path.basename(p).startsWith('.download-pages.');
+      let planted = null;
+      const plant = (stage) => {
+        planted = stage;
+        hookRetry(() => fs.renameSync(stage, path.join(out, 'moved-away')));
+        hookRetry(() => fs.symlinkSync(outside, stage, 'junction'));
+      };
+      const lines = stderrLines(t);
+      if (point === 'once written') {
+        // The last write in the staging folder: the removal of writePageTree's own swap folder, once the tree is moved into place.
+        const rm = fs.rmSync;
+        t.mock.method(fs, 'rmSync', function (p) {
+          const result = rm.apply(this, arguments);
+          if (!planted && path.basename(String(p)).startsWith('.pages-replace.') && isStage(path.dirname(String(p)))) plant(path.dirname(String(p)));
+          return result;
+        });
+      } else if (point === 'between two reads') {
+        // The second read of the first page's page.tsx (rewritten, then read again for publication): the reads after it are of another folder.
+        const read = fs.readFileSync;
+        let seen = 0;
+        t.mock.method(fs, 'readFileSync', function (p) {
+          const result = read.apply(this, arguments);
+          const file = String(p);
+          if (!planted && path.basename(file) === 'page.tsx' && path.basename(path.dirname(file)) === SWAP_A && isStage(path.dirname(path.dirname(path.dirname(file)))) && ++seen === 2) {
+            plant(path.dirname(path.dirname(path.dirname(file))));
+          }
+          return result;
+        });
+      } else {
+        // The check of the staging folder its own removal makes, after everything was read from it (not the removal of writePageTree's swap folder in it).
+        const lstat = fs.lstatSync;
+        t.mock.method(fs, 'lstatSync', function (p) {
+          if (!planted && isStage(String(p))) {
+            const limit = Error.stackTraceLimit;
+            Error.stackTraceLimit = Infinity;
+            const stack = new Error().stack;
+            Error.stackTraceLimit = limit;
+            if (/\bremoveTreeWithRetry\b/.test(stack) && !/\bwritePageTree\b/.test(stack)) plant(String(p));
+          }
+          return lstat.apply(this, arguments);
+        });
+      }
+      // Found at a read, the read is refused; found only at the removal, after the last read, what was read is refused all the same.
+      const refusal = point === 'after the last read' ? /^refusing to use the pages read back from the download's staging folder .*, and pages\/ was not written$/ : /^refusing to use .* as an output directory: /;
+      await assert.rejects(swapDownload(out, true), (e) => e.code === 'UNSAFE_OUTPUT' && e.message.includes(planted) && refusal.test(e.message));
+      t.mock.restoreAll();
+      assert.ok(planted, 'the staging folder was replaced');
+      assert.deepStrictEqual(treeBytes(outside), outsideBefore, 'nothing written, moved or removed where the junction points');
+      assert.deepStrictEqual(treeBytes(path.join(out, 'pages')), before, 'pages/ is the maker\'s, as it was');
+      // Its removal refused too (nothing is removed through a junction), and the folder named.
+      const named = lines.filter((l) => l.includes('.download-pages.'));
+      assert.strictEqual(named.length, 1, named.join(''));
+      assert.ok(named[0].startsWith(`WARNING: the download's staging folder ${planted} was not removed: it, or a folder in it, is no longer the folder this download made there`), named[0]);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+}
+test('generatedFolders: each guarded fs method is refused on a path in a folder it made once that folder is replaced by a junction, and stays refused (#814)', () => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'dl-guard-')));
+  const outside = outsideTree();
+  try {
+    const guard = generatedFolders(fs, (p) => p);
+    const made = path.join(base, 'made');
+    fs.mkdirSync(made);
+    assert.strictEqual(guard.adopt(made), made);
+    // While it is the folder made, the guarded fs acts as fs does.
+    guard.fs.mkdirSync(path.join(made, 'new'));
+    guard.fs.writeFileSync(path.join(made, 'new', 'a.txt'), 'a');
+    assert.strictEqual(fs.readFileSync(path.join(made, 'new', 'a.txt'), 'utf8'), 'a');
+    const source = path.join(base, 'source.txt');
+    fs.writeFileSync(source, 'source');
+    hookRetry(() => fs.renameSync(made, path.join(base, 'moved-away')));
+    hookRetry(() => fs.symlinkSync(outside, made, 'junction'));
+    const outsideBefore = treeBytes(outside);
+    // `new/keep.txt` is a file where the junction points: an unchecked call would write, move or remove it.
+    const target = path.join(made, 'new', 'keep.txt');
+    const calls = [];
+    for (const [name, at] of Object.entries(GUARDED_FS_METHODS)) {
+      for (const i of at) calls.push([`${name} (argument ${i})`, () => guard.fs[name](...[0, 1].map((n) => (n === i ? target : source)))]);
+    }
+    calls.push(['realpathSync', () => guard.fs.realpathSync(path.join(made, 'new'))]);
+    calls.push(['realpathSync.native', () => guard.fs.realpathSync.native(path.join(made, 'new'))]);
+    calls.push(['verify', () => guard.verify(made)]);
+    for (const [name, call] of calls) assert.throws(call, (e) => e.code === 'UNSAFE_OUTPUT', name);
+    assert.deepStrictEqual(treeBytes(outside), outsideBefore, 'nothing written, moved or removed where the junction points');
+    assert.deepStrictEqual(fs.readFileSync(source, 'utf8'), 'source');
+    // A folder found replaced is not trusted again, even put back as it was.
+    hookRetry(() => fs.rmSync(made));
+    hookRetry(() => fs.renameSync(path.join(base, 'moved-away'), made));
+    assert.throws(() => guard.fs.writeFileSync(path.join(made, 'new', 'b.txt'), 'b'), (e) => e.code === 'UNSAFE_OUTPUT');
+    assert.throws(() => guard.fs.rmSync(base, { recursive: true }), (e) => e.code === 'UNSAFE_OUTPUT', 'nor is a folder that holds it removed');
+    assert.ok(!fs.existsSync(path.join(made, 'new', 'b.txt')));
+    // A path outside the folders made goes through as it is; a folder that is a junction is not adopted.
+    guard.fs.writeFileSync(path.join(base, 'free.txt'), 'free');
+    const planted = path.join(base, 'planted');
+    fs.symlinkSync(outside, planted, 'junction');
+    assert.throws(() => guard.adopt(planted), (e) => e.code === 'UNSAFE_OUTPUT');
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('writePageTree, the staged readback and their helpers make no raw fs read, write, mkdir, rename or removal: each one in a folder they made goes through the one guarded fs (#814)', () => {
+  const read = (file) => fs.readFileSync(path.join(__dirname, '..', file), 'utf8').replace(/\r\n/g, '\n');
+  // A top-level function, from its `function` line to its closing brace (the first line that is just `}`).
+  const body = (text, name) => {
+    const start = text.search(new RegExp(`^(?:async )?function ${name}\\(`, 'm'));
+    assert.ok(start >= 0, `function ${name} found`);
+    return text.slice(start, text.indexOf('\n}\n', start) + 2);
+  };
+  const MUTATING = ['writeFile', 'appendFile', 'mkdir', 'mkdtemp', 'rename', 'rm', 'rmdir', 'unlink', 'open', 'copyFile', 'cp', 'symlink', 'link', 'chmod', 'truncate', 'utimes'];
+  const READING = ['readFile', 'readdir', 'opendir', 'stat', 'lstat', 'exists', 'access', 'readlink', 'realpath'];
+  const raw = (names, methods = MUTATING) => new RegExp(`(?<![\\w.])(?:${names})\\.(?:promises\\b|(?:${methods.join('|')})(?:Sync)?\\b|create(?:Write|Read)Stream\\b)`, 'g');
+  // Each method that is a raw call here is one the guarded fs checks (realpathSync, and its .native, by a method of its own).
+  for (const name of MUTATING.concat(READING.filter((m) => m !== 'realpath')).map((m) => `${m}Sync`).concat(['createWriteStream', 'createReadStream'])) {
+    assert.ok(GUARDED_FS_METHODS[name], `${name} is guarded`);
+  }
+  const source = read('download-model-app.js');
+  for (const name of ['writePageTree', 'warnStrandedPageTrees', 'ownedDir', 'generatedFolders', 'assertPageTreeReplaceable', 'assertNoPlantedPageLinks', 'makeHiddenDir', 'makePageStage', 'runDownload', 'parseDownloadedPages']) {
+    const text = body(source, name);
+    assert.deepStrictEqual(text.match(raw('fs|fsImpl')) || [], [], `${name}: a raw fs call`);
+    // A read goes through the fs the function is given (the guarded one, for a folder the download made), never node's own.
+    assert.deepStrictEqual(text.match(raw('fs', READING)) || [], [], `${name}: a raw fs read`);
+    for (const call of text.match(/\b(?:writeFileSafe|renameWithRetry|removeTreeWithRetry)\([^;]*/g) || []) {
+      assert.match(call, /\b(?:gfs|stage\.fs)\b/, `${name}: ${call}`);
+    }
+    // The only folder made unchecked is the one the maker named (or its parent): what is made in it goes through makeHiddenDir.
+    for (const call of text.match(/\bassertSafeOutputDir\([^)]*create: true/g) || []) assert.match(call, /^assertSafeOutputDir\((?:shownRoot|outDir), /, `${name}: ${call}`);
+  }
+  // The managed download writes its staged tree, reads it back and rewrites its page files through the staging folder's guarded fs:
+  // from the tree's write to the last read of it, no fs call is node's own, and each helper that takes an fs is given that one.
+  const download = body(source, 'downloadApp');
+  assert.match(download, /const pageTreeFs = stage \? stage\.fs : fs;\n {4}writePageTree\(treeRoot, read\.pages, \{ fs: pageTreeFs \}\);/);
+  const from = download.indexOf('const pageTreeFs = stage');
+  const to = download.indexOf('\n    }\n', download.indexOf('stage.pages = read.pages.map('));
+  assert.ok(from > 0 && to > from, 'the staged readback found');
+  const readback = download.slice(from, to);
+  assert.deepStrictEqual(readback.match(/(?<![\w.])fs\.\w+/g) || [], [], 'a raw fs call in the staged readback');
+  const calls = readback.match(/\b(?:writePageTree|parseDownloadedPages|assertPlainFileTarget|writeFileSafe)\([^;]*/g) || [];
+  assert.deepStrictEqual([...new Set(calls.map((c) => c.split('(')[0]))].sort(), ['assertPlainFileTarget', 'parseDownloadedPages', 'writeFileSafe', 'writePageTree']);
+  for (const call of calls) assert.match(call, /\bpageTreeFs\b/, call);
+  const reads = readback.match(/\b[\w.]+\.readFileSync\(/g) || [];
+  assert.ok(reads.length >= 2);
+  for (const call of reads) assert.strictEqual(call, 'pageTreeFs.readFileSync(', call);
+  // The shared helpers act only through the fs they are given: safe-fs.js makes no call of node's own fs at all.
+  const safeFs = read(path.join('lib', 'safe-fs.js'));
+  assert.deepStrictEqual(safeFs.match(/(?<![\w.])fs\.\w+/g) || [], [], 'safe-fs.js');
+  assert.deepStrictEqual(body(read(path.join('lib', 'rename-retry.js')), 'renameWithRetry').match(raw('fs')) || [], [], 'rename-retry.js renameWithRetry');
+});
+
+test('writePageTree refuses a link planted in pages/ before it makes anything: same refusal, no swap folder, the link and its target untouched', () => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-link-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-swap-outside-'));
+  try {
+    fs.writeFileSync(path.join(outside, 'keep.txt'), 'keep');
+    fs.mkdirSync(path.join(out, 'pages'));
+    fs.symlinkSync(outside, path.join(out, 'pages', SWAP_A), 'junction');
+    assert.throws(() => writePageTree(path.join(out, 'pages'), [{ pageId: SWAP_A, files: { 'page.tsx': DOWNLOADED_A } }]), (e) => e.code === 'UNSAFE_OUTPUT');
+    assert.deepStrictEqual(leftovers(out), []);
+    assert.ok(fs.lstatSync(path.join(out, 'pages', SWAP_A)).isSymbolicLink());
+    assert.deepStrictEqual(fs.readdirSync(outside), ['keep.txt']);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('runDownload: the ids are folder names only after the backend has read them — a navigation naming anything but a page id is never read, so it cannot name a path', async () => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-ids-'));
+  try {
+    const hostile = '..\\..\\outside';
+    const app = pagesApp([hostile]);
+    // The sitemap parser takes only GUIDs as GenPageId values (a malformed id makes the whole sitemap unreadable), so the download refuses
+    // before anything is read or written.
+    const genpage = fakeGenpage();
+    const result = await runDownload({ ...app, genpage, outDir: out });
+    assert.strictEqual(result.ok, false);
+    assert.match(result.error, /could not read the app sitemap during download \(malformed\)/);
+    assert.deepStrictEqual(genpage.of('read'), []);
+    assert.ok(!fs.existsSync(path.join(out, 'pages')));
+    assert.ok(!fs.existsSync(path.join(path.dirname(out), 'outside')));
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('full round-trip via runDownload → hydrateSpec → validateAppSpec ok, pages carry pageId (injectable seam)', async () => {
+  const GP_A = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const GP_B = '5c0a4889-45fd-46ea-91a8-ff876914d644';
+  const APP_ID   = 'a1b2c3d4-0000-4000-8000-000000000001';
+  const APP_UNIQ_VALUE = 'c0ffee00-0000-4000-8000-00000000dddd'; // appmoduleidunique lookup GUID
+  const SM_ID    = '5111e0f2-0000-4000-8000-0000000000aa';
+  const APP_UNIQUE = 'test_roundtrip';
+  const SM_XML = `<SiteMap><Area><Group><SubArea GenPageId="${GP_A}" Title="Sitemap A"/><SubArea GenPageId="${GP_B}" Title="Sitemap B"/><SubArea Entity="contoso_item"/></Group></Area></SiteMap>`;
+
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-rt-'));
+  try {
+    const mockSdk = {
+      fetchArtifact: async () => ({
+        name: 'Test App', description: '',
+        siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [
+          { type: 'GenPage', genPageId: GP_A, title: 'Sitemap A' },
+          { type: 'GenPage', genPageId: GP_B, title: 'Sitemap B' },
+          { type: 'Entity', entity: 'contoso_item' },  // at least one entity required by plan profile
+        ] }] }] },
+      }),
+      queryRecords: async (logical, opts) => {
+        const filter = (opts && opts.filter) || '';
+        if (logical === 'appmodule') {
+          // fetchSitemap calls this with uniquename filter; un-filtered call returns all apps
+          const m = filter.match(/uniquename eq '([^']+)'/);
+          if (m) return m[1] === APP_UNIQUE ? [{ appmoduleid: APP_ID, appmoduleidunique: APP_UNIQ_VALUE }] : [];
+          return [{ appmoduleid: APP_ID, appmoduleidunique: APP_UNIQ_VALUE, uniquename: APP_UNIQUE }];
+        }
+        if (logical === 'appmodulecomponent') return [{ objectid: SM_ID, componenttype: 62 }];
+        if (logical === 'sitemap') return [{ sitemapxml: SM_XML }];
+        if (logical === 'webresource') return []; // no manifest → fresh keys
+        // The app belongs to a real unmanaged solution — recoverAppSolution returns its uniquename, but the
+        // publisher PREFIX must still come from the app uniquename ('test'), NOT this solution.
+        if (logical === 'solutioncomponent') return [{ _solutionid_value: 'sol-x' }];
+        if (logical === 'solution') return [{ solutionid: 'sol-x', uniquename: 'ContosoSln', ismanaged: false, description: 'The Contoso field-operations solution.' }];
+        return [];
+      },
+      fetchEntityMetadata: async (logical) => ({
+        schemaName: logical, displayName: 'Item', primaryNameAttribute: `${String(logical).split('_')[0]}_name`,
+      }),
+    };
+    // Env-wide names differ from sitemap titles
+    const mockGenpage = fakeGenpage({ pages: [{ pageId: GP_A, name: 'Env Name A' }, { pageId: GP_B, name: 'Env Name B' }] });
+
+    const result = await runDownload({
+      sdk: currentReadSdk(mockSdk, { appId: APP_ID, layerId: APP_UNIQ_VALUE, sitemapXml: SM_XML }),
+      genpage: mockGenpage, outDir: out, appId: APP_ID, appUnique: APP_UNIQUE,
+    });
+    assert.ok(result.ok, JSON.stringify(result));
+    const { spec } = result;
+    // Full spec validates (profile:'plan' enforces every page is a sitemap subarea)
+    const v = validateAppSpec(spec, { profile: 'plan' });
+    assert.ok(v.ok, v.errors.join('; '));
+    // Every page carries its pageId (an edit snapshot describes itself)
+    assert.ok(spec.pages.every((p) => p.pageId !== undefined), 'every page in the spec carries its pageId');
+    assert.strictEqual(spec.pages.length, 2, 'recovered spec has every sitemap page (no drop)');
+    // Env-wide names used (not sitemap titles)
+    const pageA = spec.pages.find((p) => p.pageId === GP_A);
+    assert.strictEqual(pageA.name, 'Env Name A', 'env-wide name used as page name (not sitemap title "Sitemap A")');
+    // App identity round-trips: the REAL immutable uniquename is captured (so a rebuild resolves the
+    // existing app even after a display-name rename) and the publisher prefix is derived FROM it.
+    assert.strictEqual(spec.app.uniqueName, APP_UNIQUE, 'the app real uniquename round-trips into spec.app.uniqueName');
+    assert.strictEqual(spec.solution.uniqueName, 'ContosoSln', 'the real unmanaged solution uniquename is recovered for teardown');
+    // `solution` is assembled field-by-field in runDownload (not spread from recoverAppSolution, so an
+    // unrecovered solution still gets its required defaults). That makes every field an explicit copy,
+    // and a field that is read but not copied is silently dropped — which is what happened here.
+    assert.strictEqual(spec.solution.description, 'The Contoso field-operations solution.',
+      'the recovered solution description must be carried into the spec, not dropped by the field-by-field copy');
+    assert.strictEqual(spec.solution.publisherPrefix, 'test', 'this mock SDK exposes no getSolution, so the prefix falls back to the app uniquename (test_roundtrip → test); when getSolution IS available the solution publisher wins — see the recoverAppSolution tests');
+    assert.strictEqual(appUniqueName(spec), APP_UNIQUE, 'appUniqueName resolves the REAL uniquename (identity lookup finds the existing app, no duplicate) even though the display name is "Test App"');
+    assert.ok(!('prefixResolved' in spec.solution), 'the transient prefixResolved flag is stripped from the persisted spec');
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// An earlier release's `pac` stored each ASCII `"` in a page name as `\"` — in the row name the env-wide listing shows, and in a
+// navigation title it writes (live-measured). Pages made then exist on every environment that used it. The spec's name is what a
+// rebuild sends back, and the SDK stores a name exactly, so a download must write the name the page was GIVEN: kept as read, every
+// round trip would add a backslash.
+test('download writes page names without an earlier release\'s \\" escaping, from the env-wide listing and from a title fallback', async () => {
+  const GP_A = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const GP_B = '5c0a4889-45fd-46ea-91a8-ff876914d644';
+  const APP_ID = 'a1b2c3d4-0000-4000-8000-000000000001';
+  const SM_XML = `<SiteMap><Area><Group><SubArea GenPageId="${GP_A}" Title="Plain A"/>`
+    + `<SubArea GenPageId="${GP_B}" Title="Title \\&quot;B\\&quot; \\\\path"/><SubArea Entity="contoso_item"/></Group></Area></SiteMap>`;
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-esc-'));
+  try {
+    const sdk = {
+      fetchArtifact: async () => ({
+        name: 'Test App', description: '',
+        siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [
+          { type: 'GenPage', genPageId: GP_A, title: 'Plain A' },
+          { type: 'GenPage', genPageId: GP_B, title: 'Title \\"B\\" \\\\path' },
+          { type: 'Entity', entity: 'contoso_item' },
+        ] }] }] },
+      }),
+      queryRecords: async (logical, opts) => {
+        const filter = (opts && opts.filter) || '';
+        if (logical === 'appmodule') {
+          const m = filter.match(/uniquename eq '([^']+)'/);
+          if (m) return m[1] === 'test_roundtrip' ? [{ appmoduleid: APP_ID, appmoduleidunique: 'c0ffee00-0000-4000-8000-00000000dddd' }] : [];
+          return [{ appmoduleid: APP_ID, appmoduleidunique: 'c0ffee00-0000-4000-8000-00000000dddd', uniquename: 'test_roundtrip' }];
+        }
+        if (logical === 'appmodulecomponent') return [{ objectid: '5111e0f2-0000-4000-8000-0000000000aa', componenttype: 62 }];
+        if (logical === 'sitemap') return [{ sitemapxml: SM_XML }];
+        return [];
+      },
+      fetchEntityMetadata: async (logical) => ({ schemaName: logical, displayName: 'Item', primaryNameAttribute: `${String(logical).split('_')[0]}_name` }),
+    };
+    // A's model is one the spec can hold; B's is not, so it is left out — and said so.
+    const genpage = fakeGenpage({ pages: [
+      { pageId: GP_A, name: 'Say \\"hi\\" now', model: 'gpt-4.1' },
+      { pageId: GP_B, name: 'not the name the spec gets', model: 'has space' },
+    ] });
+    // Page B is missing from the env-wide listing, so its name falls back to the (pac-written) navigation title.
+    genpage.enumerateEnv = async () => ({ ok: true, ids: [GP_A.toLowerCase()], pages: [{ pageId: GP_A, name: 'Say \\"hi\\" now' }] });
+    const warned = [];
+    const write = process.stderr.write;
+    process.stderr.write = (chunk, ...rest) => { warned.push(String(chunk)); return true; };
+    let result;
+    try {
+      result = await runDownload({
+        sdk: currentReadSdk(sdk, { appId: APP_ID, layerId: 'c0ffee00-0000-4000-8000-00000000dddd', sitemapXml: SM_XML }),
+        genpage, outDir: out, appId: APP_ID, appUnique: 'test_roundtrip',
+      });
+    } finally {
+      process.stderr.write = write;
+    }
+    assert.ok(result.ok, JSON.stringify(result));
+    const nameOf = (id) => result.spec.pages.find((p) => p.pageId === id).name;
+    assert.strictEqual(nameOf(GP_A), 'Say "hi" now', 'the env-wide (row) name, unescaped');
+    assert.strictEqual(nameOf(GP_B), 'Title "B" \\\\path', 'the title fallback, unescaped — a backslash pac did not add is kept');
+    const modelOf = (id) => result.spec.pages.find((p) => p.pageId === id).model;
+    assert.deepStrictEqual([modelOf(GP_A), modelOf(GP_B)], ['gpt-4.1', undefined]);
+    assert.ok(warned.some((w) => /WARNING: 1 page model id\(s\) the App Spec cannot hold were left out/.test(w) && w.includes(GP_B) && w.includes('"has space"')), warned.join(''));
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// A download carries each page's model from config.json, so a rebuild sends it back — pac stored "" for an upload
+// without one. An id the App Spec cannot hold would make the downloaded spec fail its own validation, so it is left
+// out and reported; a page with no model gets none.
+test('parseDownloadedPages carries a page model the spec can hold, and reports one it cannot', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-model-'));
+  try {
+    const page = (id, config) => {
+      fs.mkdirSync(path.join(root, id), { recursive: true });
+      fs.writeFileSync(path.join(root, id, 'page.tsx'), 'export default () => null;', 'utf8');
+      fs.writeFileSync(path.join(root, id, 'config.json'), '\uFEFF' + JSON.stringify(config), 'utf8');
+    };
+    const [KEPT, SPACED, NONE, EMPTY] = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222',
+      '33333333-3333-4333-8333-333333333333', '44444444-4444-4444-8444-444444444444'];
+    page(KEPT, { dataSources: [], model: ' claude-3-5-sonnet@20240620 ' });
+    page(SPACED, { dataSources: [], model: 'has space' });
+    page(NONE, { dataSources: [] });
+    page(EMPTY, { dataSources: [], model: '' });
+    const unkept = [];
+    const pages = parseDownloadedPages(root, root, null, [], unkept);
+    const pageOf = (id) => pages.find((p) => p.pageId === id);
+    assert.strictEqual(pageOf(KEPT).model, 'claude-3-5-sonnet@20240620');
+    for (const id of [SPACED, NONE, EMPTY]) assert.ok(!('model' in pageOf(id)), id);
+    assert.deepStrictEqual(unkept, [{ pageId: SPACED, model: 'has space' }], 'only a recorded id the spec cannot hold is reported');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── recoverAppSolution: recover an app's REAL unmanaged solution (fixes the download→teardown
+// round-trip). An app module is a solutioncomponent of EVERY solution it belongs to — the built-in
+// system solutions (Active/Default/Basic) AND the real one it was created in. The old code took
+// top:1 with no ordering and often got 'Default' (also ismanaged=false), so hydrate defaulted the
+// spec's solution to the restricted Default and a downloaded spec could never tear down its own
+// solution (teardown 400s on Default, orphaning the real one). ──────────────────────────────
+test('recoverAppSolution enumerates ALL memberships and returns the real unmanaged solution uniquename (does NOT recover a prefix — that comes from the app uniquename)', async () => {
+  const APP = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  let publisherQueried = false;
+  const sdk = {
+    queryRecords: async (logical, opts) => {
+      if (logical === 'solutioncomponent') {
+        assert.match(opts.filter, new RegExp(`objectid eq ${APP}`), 'filters components by the app id');
+        assert.notStrictEqual(opts.top, 1, 'must NOT cap at top:1 — an app belongs to multiple solutions');
+        return [
+          { _solutionid_value: 'sol-default' },
+          { _solutionid_value: 'sol-active' },
+          { _solutionid_value: 'sol-real' },
+        ];
+      }
+      if (logical === 'solution') {
+        return [
+          { solutionid: 'sol-default', uniquename: 'Default', ismanaged: false },
+          { solutionid: 'sol-active', uniquename: 'Active', ismanaged: false },
+          { solutionid: 'sol-real', uniquename: 'NucleoLive2', ismanaged: false },
+        ];
+      }
+      if (logical === 'publisher') { publisherQueried = true; return [{ customizationprefix: 'crba3' }]; }
+      return [];
+    },
+  };
+  const sol = await recoverAppSolution(sdk, APP);
+  assert.deepStrictEqual(sol, { uniqueName: 'NucleoLive2' }, 'returns ONLY the real solution uniquename');
+  assert.strictEqual(publisherQueried, false, 'no publisher lookup — the prefix is NOT sourced from an arbitrary solution membership');
+});
+
+test('recoverAppSolution ignores managed solutions and returns null when only system/managed remain', async () => {
+  const sdk = {
+    queryRecords: async (logical) => {
+      if (logical === 'solutioncomponent') return [{ _solutionid_value: 'sol-default' }, { _solutionid_value: 'sol-mgd' }];
+      if (logical === 'solution') {
+        return [
+          { solutionid: 'sol-default', uniquename: 'Default', ismanaged: false },
+          { solutionid: 'sol-mgd', uniquename: 'SomeManagedPack', ismanaged: true },
+        ];
+      }
+      return [];
+    },
+  };
+  assert.strictEqual(await recoverAppSolution(sdk, 'app'), null);
+});
+
+test('recoverAppSolution returns null when the app has no solution components (caller keeps its default)', async () => {
+  const sdk = { queryRecords: async () => [] };
+  assert.strictEqual(await recoverAppSolution(sdk, 'app'), null);
+});
+
+// A read failure is not "no solution": the caller has to be able to say it could not look.
+test('recoverAppSolution never throws — a failed membership read is reported as unreadable, not as "no solution"', async () => {
+  const sdk = { queryRecords: async () => { throw new Error('HTTP 403 on solutioncomponent'); } };
+  assert.deepStrictEqual(await recoverAppSolution(sdk, 'app'), { unreadable: 'HTTP 403 on solutioncomponent' });
+});
+
+// #587 item 9: an app in several unmanaged solutions used to resolve to whichever row the server returned
+// first, from a capped first page — so two downloads of one app could name different solutions. That is
+// not cosmetic: a rebuild adds to the spec's solution and teardown deletes it.
+const twoSolutionSdk = (order, prefixOf) => ({
+  queryRecords: async (set, opts) => {
+    if (set === 'solutioncomponent') {
+      assert.strictEqual(opts.paginate, true, 'every membership page must be read');
+      assert.strictEqual(opts.top, undefined, 'a $top is a hard cap with no nextLink, so it cannot be combined with paging');
+      return order.map((id) => ({ _solutionid_value: id }));
+    }
+    if (set === 'solution') return order.map((id) => ({ solutionid: id, uniquename: { a: 'ContosoRelease', b: 'ContosoApp' }[id], ismanaged: false }));
+    return [];
+  },
+  getSolution: async (uniqueName) => {
+    const prefix = prefixOf(uniqueName);
+    if (prefix instanceof Error) throw prefix;
+    return { uniqueName, publisherPrefix: prefix };
+  },
+});
+
+test('recoverAppSolution never picks between several unmanaged solutions, whatever the row order (#587 item 9)', async () => {
+  for (const order of [['a', 'b'], ['b', 'a']]) {
+    // Not even the one whose publisher matches the app name's prefix: that is the unreliable app-name
+    // guess, and teardown deletes whatever solution the spec names.
+    assert.deepStrictEqual(await recoverAppSolution(twoSolutionSdk(order, (u) => (u === 'ContosoApp' ? 'contoso' : 'fabrikam')), 'app-1'),
+      { ambiguous: ['ContosoApp', 'ContosoRelease'] }, `row order ${order.join(',')}: the publishers disagree, so no prefix either`);
+    assert.deepStrictEqual(await recoverAppSolution(twoSolutionSdk(order, () => 'contoso'), 'app-1'),
+      { ambiguous: ['ContosoApp', 'ContosoRelease'], publisherPrefix: 'contoso' }, 'every candidate agrees on its publisher, so that prefix is still authoritative');
+    assert.deepStrictEqual(await recoverAppSolution(twoSolutionSdk(order, (u) => (u === 'ContosoApp' ? new Error('boom') : 'contoso')), 'app-1'),
+      { ambiguous: ['ContosoApp', 'ContosoRelease'], publisherUnreadable: 'boom' }, 'a failed read never counts as agreement, and is named');
+  }
+});
+
+// A mock SDK for runDownload over an app in the two solutions above. Solution `a` (ContosoRelease) holds a
+// business rule; `members` overrides the membership read (e.g. to make it fail); `order: ['b']` puts the app
+// in the one solution ContosoApp.
+function ambiguousAppSdk(APP_ID, APP_UNIQUE, { members, prefixOf = () => 'contoso', manyToMany = [], order = ['a', 'b'] } = {}) {
+  const base = twoSolutionSdk(order, prefixOf);
+  const RULE = '5111e0f2-0000-4000-8000-0000000000d9';
+  return currentReadSdk({
+    fetchArtifact: async () => ({ name: 'Ambig', description: '', siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'Entity', entity: 'contoso_item' }] }] }] } }),
+    queryRecords: async (logical, opts) => {
+      const filter = (opts && opts.filter) || '';
+      if (logical === 'appmodule') {
+        const m = filter.match(/uniquename eq '([^']+)'/);
+        if (m) return m[1] === APP_UNIQUE ? [{ appmoduleid: APP_ID, appmoduleidunique: 'c0ffee00-0000-4000-8000-0000000000d3' }] : [];
+        return [{ appmoduleid: APP_ID, appmoduleidunique: 'c0ffee00-0000-4000-8000-0000000000d3', uniquename: APP_UNIQUE }];
+      }
+      if (logical === 'appmodulecomponent') return [{ objectid: '5111e0f2-0000-4000-8000-0000000000d2', componenttype: 62 }];
+      if (logical === 'sitemap') return [{ sitemapxml: '<SiteMap><Area><Group><SubArea Entity="contoso_item"/></Group></Area></SiteMap>' }];
+      if (logical === 'solutioncomponent' && filter === `objectid eq ${APP_ID}`) return members ? members() : base.queryRecords(logical, opts);
+      if (logical === 'solution' && /solutionid eq/.test(filter)) return base.queryRecords(logical, opts);
+      if (logical === 'solution') {
+        const m = filter.match(/uniquename eq '([^']+)'/);
+        return m ? [{ solutionid: { ContosoRelease: 'a', ContosoApp: 'b' }[m[1]] }].filter((r) => r.solutionid) : [];
+      }
+      if (logical === 'solutioncomponent' && filter === '_solutionid_value eq a and componenttype eq 29') return [{ objectid: RULE, componenttype: 29 }];
+      if (logical === 'workflow') return [{ workflowid: RULE, name: 'Lock Closed', primaryentity: 'contoso_item', category: 2, type: 1 }];
+      return [];
+    },
+    getSolution: base.getSolution,
+    fetchEntityMetadata: async (logical) => ({ schemaName: logical, displayName: 'Item', primaryNameAttribute: 'contoso_name', attributes: [] }),
+    dataverse: { get: async (url) => ({ status: 200, headers: {}, body: { value: /ManyToManyRelationships/.test(url) ? manyToMany : [] } }) },
+  }, { appId: APP_ID, layerId: 'c0ffee00-0000-4000-8000-0000000000d3',
+    sitemapXml: '<SiteMap><Area><Group><SubArea Entity="contoso_item"/></Group></Area></SiteMap>' });
+}
+
+async function runCapturing(sdk, APP_ID, APP_UNIQUE) {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-amb-'));
+  const written = [];
+  const origWrite = process.stderr.write;
+  try {
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    const genpage = fakeGenpage();
+    const res = await runDownload({ sdk, genpage, outDir: out, appId: APP_ID, appUnique: APP_UNIQUE });
+    return { res, written };
+  } finally {
+    process.stderr.write = origWrite;
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+}
+
+test('runDownload does not guess between unmanaged solutions, and still reports what they hold (#587 item 9)', async () => {
+  const APP_ID = 'a1b2c3d4-0000-4000-8000-0000000000d1';
+  // The app name's prefix differs from the publishers' on purpose, so the prefix below provably comes
+  // from the agreeing publishers and not from the app-name guess.
+  const APP_UNIQUE = 'zz_ambig';
+  const { res, written } = await runCapturing(ambiguousAppSdk(APP_ID, APP_UNIQUE), APP_ID, APP_UNIQUE);
+  assert.ok(res.ok, JSON.stringify(res));
+  assert.strictEqual(res.spec.solution.uniqueName, 'Default', 'no guess — and Default is the one solution a teardown never deletes');
+  assert.strictEqual(res.spec.solution.publisherPrefix, 'contoso', 'every candidate shares this publisher, so its prefix survives the ambiguity');
+  assert.deepStrictEqual(res.solutionCandidates, ['ContosoApp', 'ContosoRelease']);
+  assert.ok(written.some((w) => /ContosoApp, ContosoRelease/.test(w) && /solution\.uniqueName/.test(w)), written.join(''));
+  // Scoped by EVERY candidate: the rule in ContosoRelease is still reported. Scoping by the 'Default'
+  // placeholder instead said "no business rules" without having looked.
+  assert.deepStrictEqual(((res.spec.descriptionInventory || {}).businessRules || []).map((r) => r.name), ['Lock Closed']);
+  assert.ok((res.notRoundTripped && res.notRoundTripped.classes || []).some((c) => c.kind === 'businessRules' && c.count === 1), JSON.stringify(res.notRoundTripped));
+});
+
+// With candidate solutions whose publishers disagree, the prefix is unknown. The app-name guess is the
+// heuristic the ambiguity refuses to use, and a wrong prefix renamed every relationship not carrying it — so a
+// same-environment rebuild created each a second time. The prefix stays the unverified default, relationships
+// keep their deployed names, and the maker is told to set it.
+test('runDownload does not guess a publisher prefix when the candidate solutions disagree', async () => {
+  const APP_ID = 'a1b2c3d4-0000-4000-8000-0000000000f1';
+  // The app name carries 'contoso', the prefix of ONE candidate's publisher: exactly the guess refused here.
+  const APP_UNIQUE = 'contoso_disagree';
+  // One with a foreign prefix, and one that still has the name the build generated under its real prefix —
+  // which must be carried too: omitted, a rebuild under the placeholder prefix generated another and created it twice.
+  const { manyToManySchemaName } = require('../lib/app-spec.js');
+  const generated = manyToManySchemaName({ entity1: 'contoso_item', entity2: 'contoso_item' }, 'contoso');
+  const manyToMany = [
+    { SchemaName: 'fabrikam_ItemItemLink', Entity1LogicalName: 'contoso_item', Entity2LogicalName: 'contoso_item', IsCustomRelationship: true },
+    { SchemaName: generated, Entity1LogicalName: 'contoso_item', Entity2LogicalName: 'contoso_item', IsCustomRelationship: true },
+  ];
+  const sdk = ambiguousAppSdk(APP_ID, APP_UNIQUE, { prefixOf: (u) => (u === 'ContosoApp' ? 'contoso' : 'fabrikam'), manyToMany });
+  const { res, written } = await runCapturing(sdk, APP_ID, APP_UNIQUE);
+  assert.ok(res.ok, JSON.stringify(res));
+  assert.deepStrictEqual(res.solutionCandidates, ['ContosoApp', 'ContosoRelease']);
+  assert.strictEqual(res.spec.solution.publisherPrefix, 'new', 'not the app-name guess');
+  assert.ok(written.some((w) => /do not share one customization prefix/.test(w) && /solution\.publisherPrefix/.test(w)), written.join(''));
+  const nn = (res.spec.relationships || []).filter((r) => r.type === 'ManyToMany');
+  assert.deepStrictEqual(nn.map((r) => r.schemaName).sort(), ['fabrikam_ItemItemLink', generated].sort(), `every deployed name is kept; got ${JSON.stringify(res.spec.relationships)}`);
+  // With the membership unread the prefix is unknown too, and the generated name is carried the same way.
+  const unread = await runCapturing(ambiguousAppSdk(APP_ID, APP_UNIQUE, { members: () => { throw new Error('HTTP 503'); }, manyToMany: [manyToMany[1]] }), APP_ID, APP_UNIQUE);
+  assert.deepStrictEqual((unread.res.spec.relationships || []).filter((r) => r.type === 'ManyToMany').map((r) => r.schemaName), [generated]);
+  // CONTROL: publishers that agree still give their prefix, and a relationship with the generated name is
+  // omitted as before, for the build to compose.
+  const agreeing = await runCapturing(ambiguousAppSdk(APP_ID, APP_UNIQUE, { manyToMany: [manyToMany[1]] }), APP_ID, APP_UNIQUE);
+  assert.strictEqual(agreeing.res.spec.solution.publisherPrefix, 'contoso');
+  assert.deepStrictEqual((agreeing.res.spec.relationships || []).filter((r) => r.type === 'ManyToMany').map((r) => r.schemaName), [undefined]);
+  assert.ok(!agreeing.written.some((w) => /do not share one customization prefix/.test(w)));
+});
+
+// One solution, but its publisher could not be read: the prefix is unknown, as with disagreeing candidates.
+// The failed read used to read as "no prefix", so the app-name guess was used — and when the real publisher is
+// another, every relationship under its prefix was renamed to the generated name, and a same-environment
+// rebuild created each a second time.
+test('runDownload does not guess a publisher prefix when the one solution\'s publisher cannot be read', async () => {
+  const APP_ID = 'a1b2c3d4-0000-4000-8000-0000000000f2';
+  // The app name carries 'contoso'; the relationship carries its publisher's real prefix, 'fabrikam'.
+  const APP_UNIQUE = 'contoso_pubread';
+  const manyToMany = [{ SchemaName: 'fabrikam_ItemItemLink', Entity1LogicalName: 'contoso_item', Entity2LogicalName: 'contoso_item', IsCustomRelationship: true }];
+  const nn = (res) => (res.spec.relationships || []).filter((r) => r.type === 'ManyToMany').map((r) => r.schemaName);
+  const unread = await runCapturing(ambiguousAppSdk(APP_ID, APP_UNIQUE, { order: ['b'], prefixOf: () => new Error('HTTP 503 Service Unavailable'), manyToMany }), APP_ID, APP_UNIQUE);
+  assert.ok(unread.res.ok, JSON.stringify(unread.res));
+  assert.strictEqual(unread.res.solutionCandidates, undefined);
+  assert.strictEqual(unread.res.spec.solution.uniqueName, 'ContosoApp', 'the solution itself was read');
+  assert.strictEqual(unread.res.spec.solution.publisherPrefix, 'new', 'not the app-name guess');
+  assert.ok(unread.written.some((w) => /the publisher of solution 'ContosoApp' could not be read \(HTTP 503/.test(w) && /solution\.publisherPrefix/.test(w)), unread.written.join(''));
+  assert.deepStrictEqual(nn(unread.res), ['fabrikam_ItemItemLink'], 'the deployed name is kept, not renamed under the guess');
+  // CONTROL: a publisher that is read gives its prefix, under which the deployed name is kept as well.
+  const read = await runCapturing(ambiguousAppSdk(APP_ID, APP_UNIQUE, { order: ['b'], prefixOf: () => 'fabrikam', manyToMany }), APP_ID, APP_UNIQUE);
+  assert.strictEqual(read.res.spec.solution.uniqueName, 'ContosoApp');
+  assert.strictEqual(read.res.spec.solution.publisherPrefix, 'fabrikam');
+  assert.deepStrictEqual(nn(read.res), ['fabrikam_ItemItemLink']);
+  assert.ok(!read.written.some((w) => /could not be read|solution\.publisherPrefix/.test(w)), read.written.join(''));
+  // With several candidates, one of whose publishers could not be read, the warning says that — not that the
+  // publishers disagree, which nobody knows.
+  const several = await runCapturing(ambiguousAppSdk(APP_ID, APP_UNIQUE, { prefixOf: (u) => (u === 'ContosoApp' ? new Error('HTTP 503') : 'fabrikam'), manyToMany }), APP_ID, APP_UNIQUE);
+  assert.strictEqual(several.res.spec.solution.publisherPrefix, 'new');
+  assert.ok(several.written.some((w) => /the publishers of those solutions could not all be read \(HTTP 503\)/.test(w)), several.written.join(''));
+  assert.ok(!several.written.some((w) => /do not share one customization prefix/.test(w)), several.written.join(''));
+});
+
+test('runDownload reports an unreadable solution membership as unknown, not as "no solution"', async () => {
+  const APP_ID = 'a1b2c3d4-0000-4000-8000-0000000000e1';
+  const APP_UNIQUE = 'contoso_unread';
+  const members = () => { throw new Error('HTTP 503 Service Unavailable'); };
+  const { res, written } = await runCapturing(ambiguousAppSdk(APP_ID, APP_UNIQUE, { members }), APP_ID, APP_UNIQUE);
+  assert.ok(res.ok, JSON.stringify(res));
+  assert.strictEqual(res.spec.solution.uniqueName, 'Default');
+  assert.strictEqual(res.solutionCandidates, undefined);
+  assert.ok(written.some((w) => /could not be read \(HTTP 503/.test(w) && /solution\.uniqueName/.test(w)), written.join(''));
+  // With the solutions unread, the publisher is unknown too: the app-name guess ('contoso') is not used.
+  assert.strictEqual(res.spec.solution.publisherPrefix, 'new');
+  assert.ok(written.some((w) => /the publisher is unknown/.test(w) && /solution\.publisherPrefix/.test(w)), written.join(''));
+  const unknown = ((res.notRoundTripped && res.notRoundTripped.incomplete) || []).map((i) => i.kind).sort();
+  assert.deepStrictEqual(unknown.filter((k) => k === 'businessRules' || k === 'globalChoices'), ['businessRules', 'globalChoices'], JSON.stringify(res.notRoundTripped));
+});
+
+// ── OOB-table round-trip fixes (ADO 6603392 / 6603390 / 6603388) ───────────────────────────────
+// All three surfaced on an app built from STANDARD Dataverse tables. Each was masked on custom
+// tables, which is why they survived earlier testing.
+
+test('entityFromMetadata uses the REAL primary-name attribute for OOB tables (no <entity>_name guess)', () => {
+  // The old fallback produced `account_name` / `contact_name`, neither of which exists. It looked
+  // plausible on a custom table (`co_ticket` -> `co_name`), which is exactly why it went unnoticed.
+  const account = entityFromMetadata({ logicalName: 'account', schemaName: 'Account', displayName: 'Account', primaryNameAttribute: 'name' }, 'account');
+  assert.strictEqual(account.primaryAttribute.schemaName, 'name');
+  const contact = entityFromMetadata({ logicalName: 'contact', schemaName: 'Contact', displayName: 'Contact', primaryNameAttribute: 'fullname' }, 'contact');
+  assert.strictEqual(contact.primaryAttribute.schemaName, 'fullname');
+});
+
+test('entityFromMetadata reports a NULL primaryAttribute rather than synthesizing one', () => {
+  // Emitting a fabricated attribute name yields a spec that references a column Dataverse does not
+  // have. Omitting the field entirely is no better — `primaryAttribute` is REQUIRED by App Spec
+  // validation, so the spec would simply fail to validate later with a confusing error. Signalling
+  // null lets runDownload fail the download loudly, naming the table.
+  const e = entityFromMetadata({ logicalName: 'account', displayName: 'Account' }, 'account');
+  assert.strictEqual(e.primaryAttribute, null, 'must not invent a primary attribute');
+  assert.strictEqual(e.existing, true, 'still flagged pre-existing (teardown protection)');
+});
+
+test('a downloaded entity WITH real metadata validates as an App Spec entity', () => {
+  // Guards the regression the null-signalling above could otherwise introduce: the normal path must
+  // still produce a spec that actually validates and can be rebuilt.
+  const { validateAppSpec } = require('../lib/app-spec.js');
+  const account = entityFromMetadata({ logicalName: 'account', schemaName: 'Account', displayName: 'Account', primaryNameAttribute: 'name' }, 'account');
+  const spec = {
+    solution: { uniqueName: 'S', publisherPrefix: 'co' },
+    app: { name: 'Customer Management', uniqueName: 'contoso_customermanagement' },
+    entities: [account],
+    views: [], charts: [], forms: [], commands: [], dashboards: [], pages: [],
+    webResources: [], appShell: { areas: [] },
+  };
+  const r = validateAppSpec(spec);
+  assert.ok(r.ok, JSON.stringify(r.errors));
+});
+
+test('recoverAppSolution recovers the publisher prefix from the SOLUTION, not the app name', async () => {
+  const sdk = {
+    queryRecords: async (set) => {
+      if (set === 'solutioncomponent') return [{ _solutionid_value: 'sol-1' }];
+      if (set === 'solution') return [{ solutionid: 'sol-1', uniquename: 'ContosoCustomerManagement', ismanaged: false, description: 'Customer management assets.' }];
+      return [];
+    },
+    getSolution: async (uniqueName) => ({ uniqueName, publisherPrefix: 'contoso' }),
+  };
+  assert.deepStrictEqual(await recoverAppSolution(sdk, 'app-1'), { uniqueName: 'ContosoCustomerManagement', description: 'Customer management assets.', publisherPrefix: 'contoso' });
+});
+
+test('recoverAppSolution reports no prefix when none can be used, and names a publisher read that failed', async () => {
+  const base = {
+    queryRecords: async (set) => {
+      if (set === 'solutioncomponent') return [{ _solutionid_value: 'sol-1' }];
+      if (set === 'solution') return [{ solutionid: 'sol-1', uniquename: 'ContosoCustomerManagement', ismanaged: false }];
+      return [];
+    },
+  };
+  // (a) an older vendored bundle with no getSolution at all
+  assert.deepStrictEqual(await recoverAppSolution(base, 'app-1'), { uniqueName: 'ContosoCustomerManagement' });
+  // (b) getSolution throws: that is no answer about the publisher, so it is named — the caller must not guess
+  assert.deepStrictEqual(await recoverAppSolution({ ...base, getSolution: async () => { throw new Error('boom'); } }, 'app-1'), { uniqueName: 'ContosoCustomerManagement', publisherUnreadable: 'boom' });
+  // (c) a first-party publisher with no customization prefix -> not usable, so not reported
+  assert.deepStrictEqual(await recoverAppSolution({ ...base, getSolution: async () => ({ publisherPrefix: '' }) }, 'app-1'), { uniqueName: 'ContosoCustomerManagement' });
+});
+
+// The nine entities from the filed repro: an app on account/contact also carries activity, user and
+// note tables that have no sitemap entry of their own. Their membership is recovered from the app's
+// VIEW/CHART/FORM components in this legacy fixture. Correct type-1 rows are an additional source;
+// a row that resolves to the `entity` metadata table is corruption and is filtered separately.
+const NINE = ['account', 'contact', 'task', 'email', 'appointment', 'phonecall', 'systemuser', 'team', 'annotation'];
+const componentSdk = (opts = {}) => {
+  const entities = opts.entities || NINE;
+  // Give every entity one view, one chart and one form component, with a distinguishable row id.
+  const viewId = (n) => `1000${NINE.indexOf(n)}000-0000-4000-8000-000000000001`;
+  const chartId = (n) => `2000${NINE.indexOf(n)}000-0000-4000-8000-000000000002`;
+  const formId = (n) => `3000${NINE.indexOf(n)}000-0000-4000-8000-000000000003`;
+  const tableId = (n) => `4000${NINE.indexOf(n)}000-0000-4000-8000-000000000004`;
+  return {
+    queryRecords: async (set, o) => {
+      const filter = (o && o.filter) || '';
+      if (set === 'appmodule') return [{ appmoduleidunique: COMPONENT_LAYER_ID }];
+      if (set === 'appmodulecomponent') {
+        assert.ok(filter.startsWith(`_appmoduleidunique_value eq ${COMPONENT_LAYER_ID} and componenttype eq `));
+        if (/componenttype eq 26/.test(filter)) return entities.map((n) => ({ objectid: viewId(n), componenttype: 26 }));
+        if (/componenttype eq 59/.test(filter)) return entities.map((n) => ({ objectid: chartId(n), componenttype: 59 }));
+        if (/componenttype eq 60/.test(filter)) return entities.map((n) => ({ objectid: formId(n), componenttype: 60 }));
+        if (/componenttype eq 1$/.test(filter)) return (opts.type1Entities || []).map((n) => ({ objectid: tableId(n), componenttype: 1 }));
+        assert.fail(`unexpected componenttype filter: ${filter}`);
+      }
+      // Resolve each component id back to its owning entity via that table's own entity field.
+      if (set === 'savedquery') return entities.filter((n) => filter.includes(viewId(n))).map((n) => ({ savedqueryid: viewId(n), returnedtypecode: n }));
+      if (set === 'savedqueryvisualization') return entities.filter((n) => filter.includes(chartId(n))).map((n) => ({ savedqueryvisualizationid: chartId(n), primaryentitytypecode: n }));
+      if (set === 'systemform') return entities.filter((n) => filter.includes(formId(n))).map((n) => ({ formid: formId(n), objecttypecode: n }));
+      return [];
+    },
+    dataverse: { get: async (url) => {
+      if (url.startsWith('/appmodules/Microsoft.Dynamics.CRM.RetrieveUnpublishedMultiple()')) {
+        return { status: 200, body: { value: [{ appmoduleid: COMPONENT_APP_ID, appmoduleidunique: COMPONENT_LAYER_ID, componentstate: 1 }] } };
+      }
+      const name = (opts.type1Entities || []).find((logical) => url.includes(`EntityDefinitions(${tableId(logical)})`));
+      return name ? { status: 200, body: { LogicalName: name, IsCustomEntity: false } } : { status: 404, body: null };
+    } },
+  };
+};
+
+test('appComponentEntities recovers ALL app entity components, not just sitemap-visible ones', async () => {
+  const got = await appComponentEntities(componentSdk(), COMPONENT_APP_ID);
+  assert.deepStrictEqual(got.slice().sort(), NINE.slice().sort());
+});
+
+test('appComponentEntities also recovers hidden tables found only through correct type-1 components', async () => {
+  const got = await appComponentEntities(componentSdk({ entities: [], type1Entities: ['task', 'team'] }), COMPONENT_APP_ID);
+  assert.deepStrictEqual(got.slice().sort(), ['task', 'team']);
+});
+test('appComponentEntities is best-effort — every failure path yields [] so download still works', async () => {
+  assert.deepStrictEqual(await appComponentEntities(componentSdk(), null), []);
+  assert.deepStrictEqual(await appComponentEntities({
+    dataverse: { get: async () => { throw new Error('x'); } },
+    queryRecords: async () => assert.fail('a failed layer lookup must not query component rows'),
+  }, COMPONENT_APP_ID), []);
+  // An app whose components resolve to nothing.
+  assert.deepStrictEqual(await appComponentEntities(componentSdk({ entities: [] }), COMPONENT_APP_ID), []);
+  // An app row without appmoduleidunique (the lookup parent) cannot be queried.
+  assert.deepStrictEqual(await appComponentEntities({
+    dataverse: { get: async () => ({ status: 200, body: { value: [{ appmoduleid: COMPONENT_APP_ID }] } }) },
+    queryRecords: async () => assert.fail('an unresolved layer must not query component rows'),
+  }, COMPONENT_APP_ID), []);
+});
+
+test('runDownload: a sitemap table with no primary name HARD-FAILS naming it; a component-only one is dropped', async () => {
+  // The riskiest new behaviour (hard-failing a previously-working download) had no executable
+  // coverage — the old test only called entityFromMetadata directly, so the branch it named
+  // (`sitemapSet.has(logical) ? noPrimaryName : droppedComponents`) would have passed inverted.
+  const APP_ID = '5111e0f2-0000-4000-8000-00000000000a';
+  const APP_UNIQ_VALUE = '5111e0f2-0000-4000-8000-00000000000b';
+  const APP_UNIQUE = 'test_roundtrip';
+  const VIEW_ID = '5111e0f2-0000-4000-8000-00000000000c';
+  const SM_ID = '5111e0f2-0000-4000-8000-00000000000d';
+  const SM_XML = '<SiteMap><Area><Group><SubArea Entity="account" Title="Accounts"/></Group></Area></SiteMap>';
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-pn-'));
+  // `account` is in the sitemap; `annotation` is reachable ONLY as a view component. Neither has a
+  // primary name, so they must take different branches.
+  const mkSdk = () => currentReadSdk({
+    fetchArtifact: async () => ({
+      name: 'PN App', description: '',
+      siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'Entity', entity: 'account' }] }] }] },
+    }),
+    queryRecords: async (logical, opts) => {
+      const filter = (opts && opts.filter) || '';
+      if (logical === 'appmodule') {
+        const m = filter.match(/uniquename eq '([^']+)'/);
+        if (m) return m[1] === APP_UNIQUE ? [{ appmoduleid: APP_ID, appmoduleidunique: APP_UNIQ_VALUE }] : [];
+        return [{ appmoduleid: APP_ID, appmoduleidunique: APP_UNIQ_VALUE, uniquename: APP_UNIQUE }];
+      }
+      if (logical === 'appmodulecomponent') {
+        if (/componenttype eq 26/.test(filter)) return [{ objectid: VIEW_ID, componenttype: 26 }];
+        if (/componenttype eq 62/.test(filter)) return [{ objectid: SM_ID, componenttype: 62 }];
+        return [{ objectid: SM_ID, componenttype: 62 }];
+      }
+      if (logical === 'sitemap') return [{ sitemapxml: SM_XML }];
+      if (logical === 'savedquery') return [{ savedqueryid: VIEW_ID, returnedtypecode: 'annotation' }];
+      if (logical === 'webresource') return [];
+      return [];
+    },
+    // Both report an EMPTY PrimaryNameAttribute (the shape the SDK really returns).
+    fetchEntityMetadata: async (logical) => ({ logicalName: logical, schemaName: logical, displayName: logical, primaryNameAttribute: '' }),
+  }, { appId: APP_ID, layerId: APP_UNIQ_VALUE, sitemapXml: SM_XML });
+  const genpage = fakeGenpage();
+  try {
+    const failed = await runDownload({ sdk: mkSdk(), genpage, outDir: out, appId: APP_ID, appUnique: APP_UNIQUE });
+    assert.strictEqual(failed.ok, false, 'a sitemap table with no primary name must abort the download');
+    assert.match(failed.error, /account/, 'the failure names the offending sitemap table');
+    assert.ok(!/annotation/.test(failed.error), 'a component-only table must NOT be named as a hard failure');
+    assert.match(failed.error, /--allow-lossy-download/, 'the hard failure advertises its override');
+    // ...and with the override it degrades to a warning instead of producing nothing at all.
+    const lossy = await runDownload({ sdk: mkSdk(), genpage, outDir: out, appId: APP_ID, appUnique: APP_UNIQUE, allowLossy: true });
+    assert.strictEqual(lossy.ok, true, `--allow-lossy-download must let the download complete: ${JSON.stringify(lossy)}`);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('a COMPONENT-only table with no primary name is dropped with a warning, not a hard download failure', async () => {
+  // appComponentEntities is best-effort by contract, so its output must not be able to abort the whole
+  // download. A hidden component table (never in the sitemap, so it did not appear in the spec at all
+  // before this change) that Dataverse reports with no PrimaryNameAttribute would otherwise regress a
+  // previously-working download — and there is no --allow-lossy override for it.
+  const sitemapOnly = new Set(['account']);
+  const metaFor = (logical) => (sitemapOnly.has(logical)
+    ? { logicalName: logical, schemaName: 'Account', displayName: 'Account', primaryNameAttribute: 'name' }
+    // The SDK returns '' (not undefined) when PrimaryNameAttribute is absent.
+    : { logicalName: logical, schemaName: logical, displayName: logical, primaryNameAttribute: '' });
+  const good = entityFromMetadata(metaFor('account'), 'account');
+  const bad = entityFromMetadata(metaFor('annotation'), 'annotation');
+  assert.strictEqual(good.primaryAttribute.schemaName, 'name');
+  assert.strictEqual(bad.primaryAttribute, null, 'an empty PrimaryNameAttribute must not become a guessed name');
+});
+
+test('collectSitemap collects the web resource a URL subarea TARGETS, so its content is fetched (#430)', () => {
+  // The Site Map Designer's "custom page backed by an HTML web resource" writes a token into a URL
+  // subarea. Without collecting it, a rebuild would emit a nav entry pointing at a resource the spec
+  // never recreates -- a dangling link in the target environment.
+  const app = {
+    siteMap: {
+      areas: [{
+        title: 'Main',
+        groups: [{
+          title: 'G',
+          subAreas: [
+            { type: 'URL', url: '$webresource:new_homepage.html', title: 'Home' },
+            { type: 'URL', url: '/WebResources/new_second.html', title: 'Second' },
+            { type: 'URL', url: 'https://contoso.example/help', title: 'Help' },
+          ],
+        }],
+      }],
+    },
+  };
+  const { customRefs, navRefs } = collectSitemap(app);
+  assert.ok(navRefs.includes('new_homepage.html'), '$webresource: token must be collected as a NAV ref');
+  assert.ok(navRefs.includes('new_second.html'), '/WebResources/ form must be collected as a NAV ref');
+  assert.strictEqual(
+    navRefs.some((r) => /contoso\.example|https/.test(r)), false,
+    'a real http(s) link is not a web resource and must NOT be collected',
+  );
+});
+
+test('iconWebResources re-declares a NON-IMAGE web resource a URL subarea targets (#430)', async () => {
+  // The icon path gates on IMAGE_WR_TYPES by design, and a "custom page backed by an HTML web
+  // resource" is html (type 1). Without a separate nav-ref policy the page is never re-declared, so a
+  // rebuild's nav entry points at a resource the spec cannot recreate -- the fix would look complete
+  // and still be broken.
+  const sdk = { queryRecords: async (_set, o) => {
+    const name = (/name eq '([^']+)'/.exec(o.filter) || [])[1];
+    if (name === 'crba3_homepage.html') return [{ name, webresourcetype: 1, content: 'PGh0bWw+', ismanaged: false }];
+    if (name === 'crba3_nav.svg') return [{ name, webresourcetype: 11, content: 'c3Zn', ismanaged: false }];
+    return [];
+  } };
+  const { webResources } = await iconWebResources(sdk, [], ['crba3_nav.svg'], 'crba3', true, ['crba3_homepage.html']);
+  const byName = Object.fromEntries(webResources.map((w) => [w.name, w]));
+  assert.ok(byName['crba3_homepage.html'], 'the html nav page must be re-declared');
+  assert.strictEqual(byName['crba3_homepage.html'].type, 'html');
+  assert.strictEqual(byName['crba3_homepage.html'].external, true, 'external:true so teardown never deletes it');
+  assert.ok(byName['crba3_nav.svg'], 'the icon path must still work');
+});
+
+test('a MANAGED nav web resource is left as a bare reference, not re-declared (#430)', async () => {
+  // It exists in every environment; re-creating it would be wrong, and failing the download over it
+  // is what issue #430 was.
+  const sdk = { queryRecords: async (_set, o) => {
+    const name = (/name eq '([^']+)'/.exec(o.filter) || [])[1];
+    if (name === 'crba3_managed.html') return [{ name, webresourcetype: 1, content: 'eA==', ismanaged: true }];
+    return [];
+  } };
+  const { webResources } = await iconWebResources(sdk, [], [], 'crba3', true, ['crba3_managed.html']);
+  assert.strictEqual(webResources.length, 0, 'a managed nav resource must not be re-declared');
+});
+
+test('a FOREIGN-prefix nav web resource is left as a bare reference, not re-declared (#430)', async () => {
+  // Together with the managed case above, this pins why nav refs go through PASS 1 rather than being
+  // added to `icons`. PASS 2 (the bare-name path) applies NEITHER an `ismanaged` check NOR an
+  // own-prefix check, so routing nav targets there would re-declare a resource owned by another
+  // publisher's managed solution -- and re-creating a foreign prefix on a fresh environment
+  // hard-fails the build. PASS 1 declines both.
+  const sdk = { queryRecords: async (_set, o) => {
+    const name = (/name eq '([^']+)'/.exec(o.filter) || [])[1];
+    if (name === 'isv_page.html') return [{ name, webresourcetype: 1, content: 'PGh0bWw+', ismanaged: false }];
+    return [];
+  } };
+  const { webResources } = await iconWebResources(sdk, [], [], 'crba3', true, ['isv_page.html']);
+  assert.strictEqual(webResources.length, 0, 'a foreign-prefix nav resource must not be re-declared');
+});
+
+// #456: download does NOT read languageCode from Dataverse, and that is deliberate — an LCID copied
+// out of the source org would be re-applied verbatim when the spec is rebuilt elsewhere, which is how
+// a spec starts failing in an org that lacks that language (#447). But dropping a value the AUTHOR
+// wrote is its own bug, and a silent one: the next build resolves the org default, so new columns get
+// one language while the pinned ones keep another. Mixed-language app, no error.
+test('a hand-pinned languageCode survives a download (#456)', () => {
+  const spec = { app: { name: 'A' }, entities: [] };
+  const prior = JSON.stringify({ app: { name: 'A' }, languageCode: 1031 });
+  const deps = { existsSync: () => true, readFileSync: () => prior };
+  preserveAuthoredLanguageCode(spec, 'app-spec.json', deps);
+  assert.strictEqual(spec.languageCode, 1031, 'the author-pinned LCID is restored');
+});
+
+test('the preserved value is CANONICAL, not the author\'s raw formatting', () => {
+  // A downloaded spec is a generated artifact. `"1031"` and `" 1031 "` both validate, but writing
+  // the string form back out makes the file's diff noisy and its type inconsistent with every other
+  // numeric field the download emits.
+  for (const raw of ['1031', ' 1031 ', '01031']) {
+    const spec = { app: { name: 'A' } };
+    preserveAuthoredLanguageCode(spec, 'app-spec.json', {
+      existsSync: () => true,
+      readFileSync: () => JSON.stringify({ languageCode: raw }),
+    });
+    assert.strictEqual(spec.languageCode, 1031, `${JSON.stringify(raw)} must normalize to the number 1031`);
+    assert.strictEqual(typeof spec.languageCode, 'number');
+  }
+});
+
+test('preserving never invents a languageCode where the author had none', () => {
+  const spec = { app: { name: 'A' }, entities: [] };
+  const deps = { existsSync: () => true, readFileSync: () => JSON.stringify({ app: { name: 'A' } }) };
+  preserveAuthoredLanguageCode(spec, 'app-spec.json', deps);
+  assert.strictEqual(spec.languageCode, undefined, 'no previous value means the field stays absent');
+
+  // A first-ever download has no previous spec at all.
+  const fresh = { app: { name: 'A' }, entities: [] };
+  preserveAuthoredLanguageCode(fresh, 'app-spec.json', { existsSync: () => false, readFileSync: () => { throw new Error('nope'); } });
+  assert.strictEqual(fresh.languageCode, undefined);
+});
+
+test('a downloaded languageCode is never overwritten by the previous file', () => {
+  // Defensive: if a future download ever DOES emit one, the live value wins over the stale file.
+  const spec = { app: { name: 'A' }, languageCode: 1036 };
+  const deps = { existsSync: () => true, readFileSync: () => JSON.stringify({ languageCode: 1031 }) };
+  preserveAuthoredLanguageCode(spec, 'app-spec.json', deps);
+  assert.strictEqual(spec.languageCode, 1036);
+});
+
+test('a corrupt or invalid previous spec is ignored rather than failing the download', () => {
+  for (const prior of ['{ not json', JSON.stringify({ languageCode: 'de-DE' }), JSON.stringify({ languageCode: true }), JSON.stringify({ languageCode: 0 }), JSON.stringify({ languageCode: 99999 })]) {
+    const spec = { app: { name: 'A' } };
+    preserveAuthoredLanguageCode(spec, 'app-spec.json', { existsSync: () => true, readFileSync: () => prior });
+    assert.strictEqual(spec.languageCode, undefined, 'must not carry forward ' + prior.slice(0, 30));
+  }
+  // A read that throws must not escape either.
+  const spec = { app: { name: 'A' } };
+  assert.doesNotThrow(() => preserveAuthoredLanguageCode(spec, 'x', { existsSync: () => true, readFileSync: () => { throw new Error('EACCES'); } }));
+  assert.strictEqual(spec.languageCode, undefined);
+});
+
+// --- a form restricted to security roles must not be lost SILENTLY ------------------------------
+//
+// Every other download gap loses a customization. This one WIDENS ACCESS: form security roles live
+// inside formxml as `<DisplayConditions>`, `forms[]` is not reconstructed by this download, and a
+// form with no DisplayConditions is offered to EVERY role. So a restricted form, downloaded and
+// rebuilt into a fresh environment, comes back visible to everyone.
+//
+// The fixtures below are the exact SHAPES measured on a live environment after a build — attribute
+// order, casing and the platform's own default block. The role GUID is synthetic: this repo is
+// public, and the test asserts nothing about the id's value.
+const { isRoleRestrictedFormXml } = require('../download-model-app.js');
+
+const XML_RESTRICTED = '<form><tabs /><DisplayConditions Order="2" FallbackForm="false"><Role Id="{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}" /></DisplayConditions></form>';
+const XML_EVERYONE = '<form><tabs /><DisplayConditions Order="0" FallbackForm="true"><Everyone /></DisplayConditions></form>';
+const XML_NONE = '<form><tabs /></form>';
+
+test('a role-restricted form is detected', () => {
+  assert.strictEqual(isRoleRestrictedFormXml(XML_RESTRICTED), true);
+});
+
+test('the DEFAULT shapes are NOT reported as restricted', () => {
+  // Both of these mean "every role can see it". Warning on them would make the warning noise, and a
+  // warning that fires on every form is a warning nobody reads.
+  assert.strictEqual(isRoleRestrictedFormXml(XML_EVERYONE), false,
+    '<Everyone /> is the unrestricted default, not a restriction');
+  assert.strictEqual(isRoleRestrictedFormXml(XML_NONE), false,
+    'a form with no DisplayConditions at all is visible to every role');
+});
+
+test('detection does not depend on attribute order or element casing', () => {
+  // Platform-authored and SDK-authored formxml differ in both, so matching either exactly would make
+  // this fire on one source and not the other.
+  assert.strictEqual(isRoleRestrictedFormXml('<form><displayconditions fallbackform="false" order="2"><role id="{A}" /></displayconditions></form>'), true);
+  assert.strictEqual(isRoleRestrictedFormXml('<form><DisplayConditions><Role  Id = "{A}" /></DisplayConditions></form>'), true);
+});
+
+test('a <Role> OUTSIDE DisplayConditions does not count', () => {
+  // Scoped to the block deliberately: the word Role appears elsewhere in formxml (control names,
+  // labels), and matching it loosely would report every such form as restricted.
+  assert.strictEqual(isRoleRestrictedFormXml('<form><tabs><cell><control id="Role" /></cell></tabs></form>'), false);
+  assert.strictEqual(isRoleRestrictedFormXml('<form><labels><label description="Role" /></labels></form>'), false);
+});
+
+test('missing or malformed formxml is not a restriction', () => {
+  // Fail OPEN here, not closed: an unreadable form must not produce a spurious security warning that
+  // sends someone hunting for a restriction that does not exist.
+  for (const bad of [undefined, null, '', '<form', 123, {}]) {
+    assert.strictEqual(isRoleRestrictedFormXml(bad), false, `${JSON.stringify(bad)} must not read as restricted`);
+  }
+});
+
+test('runDownload WARNS on stderr about a role-restricted form, naming it', async () => {
+  // BEHAVIOURAL. The two source-regex guards this replaces both stayed green under two realistic
+  // edits — dropping `formxml` from the systemform $select, and collapsing the capturing
+  // descriptionInventory accessor — either of which silences the warning completely.
+  //
+  // This is the single guard against a silent access WIDENING: `forms[]` is not reconstructed by the
+  // download, so a restricted form rebuilt into another environment comes back visible to every role.
+  const APP_ID = '6222e0f2-0000-4000-8000-000000000001';
+  const APP_UNIQUE = 'new_rolewarn';
+  const FORM_OPEN = '6222e0f2-0000-4000-8000-000000000002';
+  const FORM_LOCKED = '6222e0f2-0000-4000-8000-000000000003';
+  const SM_ID = '6222e0f2-0000-4000-8000-000000000004';
+  const SM_XML = '<SiteMap><Area Id="A"><Group Id="G"><SubArea Id="S" Entity="new_order" /></Group></Area></SiteMap>';
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-rolewarn-'));
+
+  const sdk = {
+    fetchArtifact: async () => ({
+      id: APP_ID, name: 'Role Warn', uniquename: APP_UNIQUE, description: '',
+      siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'Entity', entity: 'new_order' }] }] }] },
+    }),
+    queryRecords: async (logical, opts) => {
+      const filter = (opts && opts.filter) || '';
+      if (logical === 'appmodule') return [{ appmoduleid: APP_ID, appmoduleidunique: APP_ID, uniquename: APP_UNIQUE }];
+      if (logical === 'appmodulecomponent') {
+        if (/componenttype eq 60/.test(filter)) return [{ objectid: FORM_OPEN, componenttype: 60 }, { objectid: FORM_LOCKED, componenttype: 60 }];
+        if (/componenttype eq 62/.test(filter)) return [{ objectid: SM_ID, componenttype: 62 }];
+        return [];
+      }
+      if (logical === 'sitemap') return [{ sitemapxml: SM_XML }];
+      if (logical === 'systemform') {
+        return [
+          { formid: FORM_OPEN, name: 'Everyone Form', objecttypecode: 'new_order', description: '',
+            formxml: '<form><tabs /><DisplayConditions Order="0" FallbackForm="true"><Everyone /></DisplayConditions></form>' },
+          { formid: FORM_LOCKED, name: 'Dispatcher Form', objecttypecode: 'new_order', description: '',
+            formxml: '<form><tabs /><DisplayConditions Order="2" FallbackForm="false"><Role Id="{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}" /></DisplayConditions></form>' },
+        ];
+      }
+      return [];
+    },
+    fetchEntityMetadata: async (logical) => ({
+      logicalName: logical, schemaName: 'new_order', displayName: 'Order', primaryNameAttribute: 'new_name',
+      attributes: [{ logicalName: 'new_name', displayName: 'Name', attributeType: 'String', isCustomAttribute: true }],
+      relationships: [],
+    }),
+    dataverse: { get: async () => ({ status: 404, headers: {}, body: {} }) },
+  };
+  const genpage = fakeGenpage();
+
+  // The warning goes to stderr (non-fatal), the pattern used elsewhere in this suite.
+  const origWrite = process.stderr.write.bind(process.stderr);
+  const written = [];
+  process.stderr.write = (chunk, ...rest) => { written.push(String(chunk)); return origWrite(chunk, ...rest); };
+  let res;
+  try {
+    res = await runDownload({
+      sdk: currentReadSdk(sdk, { appId: APP_ID, layerId: APP_ID, sitemapXml: SM_XML }),
+      genpage, outDir: out, appId: APP_ID, appUnique: APP_UNIQUE,
+    });
+  } finally {
+    process.stderr.write = origWrite;
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+
+  assert.strictEqual(res.ok, true, `the download itself must succeed; got ${res.error || ''}`);
+  const text = written.join('');
+  // Scoped to the RESTRICTION warning's own line. The download also emits a separate
+  // not-round-tripped note (AB#6686423) that lists every deployed form by name — including the
+  // unrestricted one — so scanning all of stderr would now assert the wrong thing. The intent of
+  // this check has always been "the restriction warning must not name an unrestricted form".
+  const restrictionLine = text.split('\n').find((l) => /are restricted to specific security roles/.test(l)) || '';
+  assert.ok(restrictionLine, 'the warning must fire');
+  assert.match(restrictionLine, /new_order\.Dispatcher Form/, 'and must NAME the restricted form');
+  assert.doesNotMatch(restrictionLine, /Everyone Form/,
+    'the <Everyone /> form is the unrestricted DEFAULT — warning on it would make the warning noise');
+  assert.match(restrictionLine, /forms\[\]\.securityRoles/, 'and must say how to carry the restriction forward');
+
+  // AB#6686423 — BEHAVIOURAL: the same run must also report the artifact classes it did not
+  // reconstruct, and carry that report in the RESULT so `--json` consumers see it too. The unit
+  // tests in download-not-round-tripped.test.js pin the wording; this pins that it is actually
+  // reached from a real download, which a source-shape assertion could not.
+  //
+  // This app has only forms, and the sentence now names only the classes actually reported — it used
+  // to read "forms[], views[] or charts[]" regardless, telling the operator two things were missing
+  // that were never there.
+  assert.match(text, /NOTE: this download does not reconstruct forms\[\] —/);
+  assert.doesNotMatch(text, /does not reconstruct[^\n]*views\[\]/, 'no views were found, so none may be claimed');
+  assert.ok(res.notRoundTripped, 'the summary must ride on the runDownload result, not only on stderr');
+  assert.strictEqual(res.notRoundTripped.total, 2, JSON.stringify(res.notRoundTripped));
+  // SORTED, not in the order the mock returned them. `notRoundTripped` is compared between runs, so
+  // it sorts at every level, and `descriptionInventory` below is ordered the same way (table, then
+  // name, then id): the two lists carry the same forms in the same order.
+  assert.deepStrictEqual(res.notRoundTripped.entities, [{ entity: 'new_order', forms: ['Dispatcher Form', 'Everyone Form'], views: [], charts: [], commands: [], businessRules: [] }]);
+  // The spec on disk still carries them under descriptionInventory — the note's claim must be true.
+  assert.deepStrictEqual((res.spec.descriptionInventory.forms || []).map((f) => f.name), ['Dispatcher Form', 'Everyone Form']);
+});
+
+test('runDownload stays SILENT when no form is role-restricted', async () => {
+  // A warning that fires on every download is a warning nobody reads.
+  const APP_ID = '6333e0f2-0000-4000-8000-000000000001';
+  const SM_ID = '6333e0f2-0000-4000-8000-000000000002';
+  const FORM_ID = '6333e0f2-0000-4000-8000-000000000003';
+  const SM_XML = '<SiteMap><Area Id="A"><Group Id="G"><SubArea Id="S" Entity="new_order" /></Group></Area></SiteMap>';
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-nowarn-'));
+  const sdk = {
+    fetchArtifact: async () => ({
+      id: APP_ID, name: 'No Warn', uniquename: 'new_nowarn', description: '',
+      siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'Entity', entity: 'new_order' }] }] }] },
+    }),
+    queryRecords: async (logical, opts) => {
+      const filter = (opts && opts.filter) || '';
+      if (logical === 'appmodule') return [{ appmoduleid: APP_ID, appmoduleidunique: APP_ID, uniquename: 'new_nowarn' }];
+      if (logical === 'appmodulecomponent') {
+        if (/componenttype eq 60/.test(filter)) return [{ objectid: FORM_ID, componenttype: 60 }];
+        if (/componenttype eq 62/.test(filter)) return [{ objectid: SM_ID, componenttype: 62 }];
+        return [];
+      }
+      if (logical === 'sitemap') return [{ sitemapxml: SM_XML }];
+      if (logical === 'systemform') return [{ formid: FORM_ID, name: 'Main', objecttypecode: 'new_order', description: '', formxml: '<form><tabs /></form>' }];
+      return [];
+    },
+    fetchEntityMetadata: async (logical) => ({
+      logicalName: logical, schemaName: 'new_order', displayName: 'Order', primaryNameAttribute: 'new_name',
+      attributes: [{ logicalName: 'new_name', displayName: 'Name', attributeType: 'String', isCustomAttribute: true }],
+      relationships: [],
+    }),
+    dataverse: { get: async () => ({ status: 404, headers: {}, body: {} }) },
+  };
+  const genpage = fakeGenpage();
+  const origWrite = process.stderr.write.bind(process.stderr);
+  const written = [];
+  process.stderr.write = (chunk, ...rest) => { written.push(String(chunk)); return origWrite(chunk, ...rest); };
+  try {
+    const result = await runDownload({
+      sdk: currentReadSdk(sdk, { appId: APP_ID, layerId: APP_ID, sitemapXml: SM_XML }),
+      genpage, outDir: out, appId: APP_ID, appUnique: 'new_nowarn',
+    });
+    assert.strictEqual(result.ok, true, JSON.stringify(result));
+  } finally {
+    process.stderr.write = origWrite;
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+  assert.doesNotMatch(written.join(''), /restricted to specific security roles/);
+});
+
+
+// Minimal hydrateSpec input: only the app block varies across the #514 tests, so everything else is
+// a fixed stub. Keeps each assertion about the one field it is testing.
+const makeRead = (over = {}) => ({
+  // hydrateSpec walks app.siteMap.areas, so the stub has to carry a (minimal) sitemap.
+  app: async () => ({ siteMap: { areas: [] }, ...(over.app || { name: 'A', description: '', uniquename: 'p_a' }) }),
+  pages: async () => [],
+  entities: async () => [],
+  webResources: async () => [],
+  solution: async () => ({ uniqueName: 'S', publisherPrefix: 'new' }),
+});
+// --- #514: the app-shell settings the build writes but the download used to drop ------------------
+// A live app had NewLookAlwaysOn=true and HeaderAndNavigationRefresh=2 (the only app in its org with
+// either) and the downloaded spec carried neither. Rebuilding it into a FRESH environment would have
+// produced a classic-shell app with nothing reporting the loss.
+//
+// Plugin gap, not an SDK one: the SDK already exposes getAppSettings/retrieveSetting; the download
+// called neither.
+test('#514: hydrateSpec round-trips newLook and headerNavigationRefresh when the app overrides them', async () => {
+  const { hydrateSpec } = require('../lib/hydrate-spec.js');
+  const spec = await hydrateSpec(makeRead({
+    app: { name: 'A', description: '', uniquename: 'p_a', newLook: true, headerNavigationRefresh: true },
+  }));
+  assert.strictEqual(spec.app.newLook, true);
+  assert.strictEqual(spec.app.headerNavigationRefresh, true);
+});
+
+test('#514: an app with NO override omits them, so the rebuild keeps inheriting', async () => {
+  // Omitting is the faithful representation: the build leaves an omitted field alone, so emitting a
+  // value for an inherited setting would invent an override the app never had.
+  const { hydrateSpec } = require('../lib/hydrate-spec.js');
+  const spec = await hydrateSpec(makeRead({ app: { name: 'A', description: '', uniquename: 'p_a' } }));
+  assert.ok(!('newLook' in spec.app), 'no newLook key when the app has no override');
+  assert.ok(!('headerNavigationRefresh' in spec.app), 'no headerNavigationRefresh key either');
+});
+
+test('#514: an explicit OFF round-trips as false, not as absent', async () => {
+  // false and absent mean different things: false is an explicit override, absent is inheritance.
+  const { hydrateSpec } = require('../lib/hydrate-spec.js');
+  const spec = await hydrateSpec(makeRead({
+    app: { name: 'A', description: '', uniquename: 'p_a', newLook: false, headerNavigationRefresh: false },
+  }));
+  assert.strictEqual(spec.app.newLook, false);
+  assert.strictEqual(spec.app.headerNavigationRefresh, false);
+});
+
+test('#514: readAppShellSettings decodes the header tri-state, where 1 means DISABLED', async () => {
+  // THE trap. HeaderAndNavigationRefresh is a Number tri-state: 2 = on, 1 = OFF, 0 = platform
+  // default. A truthy read reports 1 as enabled, which is the same class of mistake that made
+  // `ai.appFeatures: false` silently disable a live app's features.
+  const { readAppShellSettings } = require('../download-model-app.js');
+  const sdk = (headerValue, newLookValue) => ({
+    queryRecords: async (entity) => {
+      if (entity === 'settingdefinition') {
+        return [
+          { settingdefinitionid: 'd1', uniquename: 'NewLookAlwaysOn' },
+          { settingdefinitionid: 'd2', uniquename: 'HeaderAndNavigationRefresh' },
+        ];
+      }
+      return [
+        { _settingdefinitionid_value: 'd1', value: newLookValue },
+        { _settingdefinitionid_value: 'd2', value: headerValue },
+      ];
+    },
+  });
+
+  assert.deepStrictEqual(await readAppShellSettings(sdk('2', 'true'), 'app-1'), { newLook: true, headerNavigationRefresh: true }, '2 = on');
+  assert.deepStrictEqual(await readAppShellSettings(sdk('1', 'false'), 'app-1'), { newLook: false, headerNavigationRefresh: false }, '1 = DISABLED, not enabled');
+  // 0 is "platform default", which is not an override at all — it must not be emitted either way.
+  assert.deepStrictEqual(await readAppShellSettings(sdk('0', 'false'), 'app-1'), { newLook: false }, '0 = platform default, so no header key');
+});
+
+test('#514: the appsetting read is bound by setting DEFINITION, so $top cannot decide the answer', async () => {
+  // `$top` is a hard cap in Dataverse and no `@odata.nextLink` is returned, so a row-limited read can
+  // come back partial. Here a partial page is not a visible truncation but a WRONG ANSWER: an absent
+  // row means "inherits the environment", so a shell override pushed off the page round-trips as
+  // inheritance and the rebuilt app silently reverts to the classic shell — the exact loss #514 fixed.
+  // Bounding the query by the two definitions makes the result at most one row each, whatever the cap.
+  const { readAppShellSettings } = require('../download-model-app.js');
+  let appsettingOpts = null;
+  const sdk = {
+    queryRecords: async (entity, opts) => {
+      if (entity === 'settingdefinition') {
+        return [
+          { settingdefinitionid: 'D1', uniquename: 'NewLookAlwaysOn' },
+          { settingdefinitionid: 'D2', uniquename: 'HeaderAndNavigationRefresh' },
+        ];
+      }
+      appsettingOpts = opts;
+      return [{ _settingdefinitionid_value: 'd1', value: 'true' }];
+    },
+  };
+  assert.deepStrictEqual(await readAppShellSettings(sdk, 'app-1'), { newLook: true });
+  assert.match(appsettingOpts.filter, /_parentappmoduleid_value eq app-1/);
+  assert.match(appsettingOpts.filter, /_settingdefinitionid_value eq d1/, 'the read must name the NewLookAlwaysOn definition');
+  assert.match(appsettingOpts.filter, /_settingdefinitionid_value eq d2/, 'and the HeaderAndNavigationRefresh one');
+});
+
+test('#514: a brace-wrapped id on either side of the join still resolves the setting', async () => {
+  // The join is FAIL-QUIET — an unrecognized id just `continue`s and the setting disappears from the
+  // spec with no error — so both sides are normalized. Measured live, Dataverse returns these ids
+  // bare, so this guards the caller-supplied `appId` and any future formatting drift, not an observed
+  // mismatch.
+  const { readAppShellSettings } = require('../download-model-app.js');
+  let appsettingOpts = null;
+  const sdk = {
+    queryRecords: async (entity, opts) => {
+      if (entity === 'settingdefinition') return [{ settingdefinitionid: '{D1}', uniquename: 'NewLookAlwaysOn' }];
+      appsettingOpts = opts;
+      return [{ _settingdefinitionid_value: '{d1}', value: 'true' }];
+    },
+  };
+  assert.deepStrictEqual(await readAppShellSettings(sdk, '{app-1}'), { newLook: true });
+  assert.ok(!/[{}]/.test(appsettingOpts.filter), `no braces reach the OData filter: ${appsettingOpts.filter}`);
+});
+
+test('#514: a tenant without the setting definitions still downloads cleanly', async () => {
+  // Best-effort: losing an optional shell setting must never fail a download.
+  const { readAppShellSettings } = require('../download-model-app.js');
+  const noDefs = { queryRecords: async () => [] };
+  assert.deepStrictEqual(await readAppShellSettings(noDefs, 'app-1'), {});
+  const throws = { queryRecords: async () => { throw new Error('no access to appsettings'); } };
+  assert.deepStrictEqual(await readAppShellSettings(throws, 'app-1'), {});
+});
+
+// ---------------------------------------------------------------------------
+// #564 — the emitted spec must be valid, and the reports must stay truthful.
+// ---------------------------------------------------------------------------
+
+test('#564 a downloaded spec carrying Choice/MultiChoice types still passes validateAppSpec', async () => {
+  // The companion rule is the whole reason the type used to be dropped: declaring type "Choice"
+  // obliges the column to carry options[] or a globalChoice, and a spec that fails its own gate is
+  // useless. This is the positive counterpart to the long-standing "must not claim a type it cannot
+  // substantiate" test — now that we CAN substantiate it, the result still has to validate.
+  const { validateAppSpec: validate } = require('../lib/app-spec.js');
+  const sdk = sdkWithOptionSets({
+    attributes: [
+      { logicalName: 'new_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true },
+      { logicalName: 'new_tags', displayName: 'Tags', attributeType: 'MultiSelectPicklist', isCustomAttribute: true },
+      { logicalName: 'new_stage', displayName: 'Stage', attributeType: 'Picklist', isCustomAttribute: true },
+    ],
+    picklist: [
+      picklistRow('new_status', { name: 'new_ticket_new_status', isGlobal: false, options: [[1, 'Open'], [2, 'Closed']] }),
+      picklistRow('new_stage', { name: 'shared_stage', isGlobal: true, options: [[1, 'Draft'], [2, 'Final']] }),
+    ],
+    multiSelect: [picklistRow('new_tags', { name: 'new_ticket_new_tags', isGlobal: false, options: [[1, 'Urgent']] })],
+  });
+  const meta = await readEntityWithDescriptions(sdk, 'new_ticket');
+  const decls = new Map();
+  collectGlobalChoices(meta, decls);
+  const res = validate({
+    solution: { uniqueName: 'S', publisherPrefix: 'new' },
+    app: { name: 'A' },
+    entities: [entityFromMetadata(meta, 'new_ticket')],
+    globalChoices: [...decls.values()],
+    appShell: { areas: [] },
+  }, { profile: 'deploy' });
+  assert.deepStrictEqual(res.errors, [], res.errors.join(' | '));
+});
+
+test('#564 roundTrippedAware stops the report claiming a DECLARED global choice was left behind', () => {
+  const { roundTrippedAware: aware } = require('../download-model-app.js');
+  const inventory = { globalChoices: [{ name: 'shared_stage' }, { name: 'untouched_set' }], forms: [{ name: 'F', entity: 'new_ticket' }] };
+  const decls = new Map([['shared_stage', { name: 'shared_stage', options: ['Draft'] }]]);
+  // The set the spec now declares IS carried forward, so reporting it as lost would be false. Every
+  // other set in the environment stays listed — the app does not bind it, so a rebuild will not
+  // recreate it, and that claim is still true.
+  assert.deepStrictEqual(aware(inventory, decls).globalChoices, [{ name: 'untouched_set' }]);
+  assert.deepStrictEqual(aware(inventory, decls).forms, [{ name: 'F', entity: 'new_ticket' }], 'unrelated classes must be untouched');
+  // Nothing left -> the KEY goes, not an empty array: notRoundTrippedSummary skips an empty class,
+  // and `globalChoices: []` would be indistinguishable from "the read returned no rows".
+  const allDeclared = aware({ globalChoices: [{ name: 'shared_stage' }] }, decls);
+  assert.ok(!('globalChoices' in allDeclared), 'an emptied class must be dropped, not left as []');
+  // Case-insensitive: Dataverse does not guarantee the casing of a returned option-set Name.
+  assert.ok(!('globalChoices' in aware({ globalChoices: [{ name: 'SHARED_STAGE' }] }, decls)));
+  // No declarations -> the inventory is returned untouched (identity, not a rebuilt copy).
+  assert.strictEqual(aware(inventory, new Map()), inventory);
+});
+
+test('#564 hydrateSpec emits globalChoices ONLY when the app actually binds one', async () => {
+  const { hydrateSpec: hydrate } = require('../lib/hydrate-spec.js');
+  const base = {
+    app: async () => ({ name: 'A', description: '', siteMap: { areas: [] } }),
+    pages: async () => [],
+    entities: async () => [],
+    webResources: async () => [],
+    solution: async () => ({ uniqueName: 'S', publisherPrefix: 'new' }),
+  };
+  const withNone = await hydrate(base);
+  // An empty `globalChoices: []` on every download would read as a positive claim that the app binds
+  // no shared choices — which a download whose option-set read failed cannot substantiate.
+  assert.ok(!('globalChoices' in withNone), 'an app binding no shared choice must not emit the key');
+  const withSome = await hydrate({ ...base, globalChoices: async () => [{ name: 'shared_stage', options: ['Draft'] }] });
+  assert.deepStrictEqual(withSome.globalChoices, [{ name: 'shared_stage', options: ['Draft'] }]);
+  // A legacy `read` with no globalChoices accessor must still hydrate (back-compat).
+  assert.ok(!('globalChoices' in (await hydrate({ ...base, globalChoices: undefined }))));
+});
+test('#564 option ORDER is Dataverse display order, not Value order', async () => {
+  // Dataverse returns options in their DISPLAY order, and the App Spec assigns
+  // value = 100000000 + index — so the array order is what a rebuild reproduces in the picker.
+  // Sorting by Value here would silently reorder any set whose author arranged it by hand. Values
+  // are deliberately DESCENDING so a sort would be visible.
+  //
+  // Driven through readEntityWithDescriptions ON PURPOSE: the ordering decision lives in the READ
+  // (optionSetFromRow), so a test that pre-attaches `optionSet` to the metadata proves nothing — an
+  // earlier version of this test did exactly that and a value-sort mutation survived it.
+  const sdk = sdkWithOptionSets({
+    attributes: [{ logicalName: 'new_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true }],
+    picklist: [picklistRow('new_status', { name: 'new_ticket_new_status', isGlobal: false, options: [[9, 'Last'], [3, 'Middle'], [1, 'First']] })],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'new_ticket'), 'new_ticket');
+  // Each option keeps its number too: 9, 3, 1 are not 100000000 + index, so the options are written as `{ value, label }` and a
+  // rebuild neither renumbers them nor reorders the picker.
+  assert.deepStrictEqual(e.columns.find((c) => c.schemaName === 'new_status').options, [{ value: 9, label: 'Last' }, { value: 3, label: 'Middle' }, { value: 1, label: 'First' }]);
+});
+test('#564 a MultiChoice column is NOT dropped even though Dataverse types it as "Virtual"', async () => {
+  // LIVE-MEASURED on a real table. A MultiSelectPicklist attribute reports:
+  //   { "LogicalName": "pp_tags",     "AttributeType": "Virtual", "AttributeTypeName": "MultiSelectPicklistType" }
+  // while its synthetic formatted-value shadow reports:
+  //   { "LogicalName": "pp_tagsname", "AttributeType": "Virtual", "AttributeTypeName": "VirtualType" }
+  // The SDK projection carries only `attributeType`, so BOTH looked like "Virtual" — a type the App
+  // Spec cannot declare — and the real MultiChoice column was filtered out of columns[] ENTIRELY.
+  // That is worse than the untyped degrade #564 describes: the column vanished from the spec, so a
+  // rebuild did not create it at all. The MultiSelect CAST read is the discriminator: only a genuine
+  // multi-select comes back from it, so an attribute it returned is a MultiChoice whatever
+  // `attributeType` claims. The `*name` shadow is absent from every cast read and stays filtered.
+  const sdk = sdkWithOptionSets({
+    attributes: [
+      { logicalName: 'pp_tags', displayName: 'Tags', attributeType: 'Virtual', isCustomAttribute: true },
+      { logicalName: 'pp_tagsname', displayName: 'Tags Name', attributeType: 'Virtual', isCustomAttribute: true },
+      { logicalName: 'pp_stagename', displayName: 'Stage Name', attributeType: 'Virtual', isCustomAttribute: true },
+    ],
+    multiSelect: [picklistRow('pp_tags', { name: 'pp_item_pp_tags', isGlobal: false, options: [[100000000, 'Urgent'], [100000001, 'Billable']] })],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_item'), 'pp_item');
+  const tags = e.columns.find((c) => c.schemaName === 'pp_tags');
+  assert.ok(tags, 'the MultiChoice column was dropped from columns[]');
+  assert.strictEqual(tags.type, 'MultiChoice');
+  assert.deepStrictEqual(tags.options, ['Urgent', 'Billable']);
+  // The synthetic shadows must STILL be filtered out: emitting them would feed defaultViewColumns
+  // and rewrite the table's default views with junk.
+  assert.deepStrictEqual(e.columns.map((c) => c.schemaName), ['pp_tags']);
+});
+
+test('2.21.0: a secured column downloads with isSecured: true; an unsecured one carries no isSecured', async () => {
+  // IsSecured comes with the attribute row the SDK already reads, so it costs no read. false is the create default and is left out:
+  // written out, it would ask a rebuild to unsecure the column.
+  const sdk = sdkWithOptionSets({
+    attributes: [
+      { logicalName: 'new_salary', displayName: 'Salary', attributeType: 'String', isCustomAttribute: true, isSecured: true },
+      { logicalName: 'new_notes', displayName: 'Notes', attributeType: 'String', isCustomAttribute: true, isSecured: false },
+    ],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'new_ticket'), 'new_ticket');
+  assert.strictEqual(e.columns.find((c) => c.schemaName === 'new_salary').isSecured, true);
+  assert.ok(!('isSecured' in e.columns.find((c) => c.schemaName === 'new_notes')));
+});
+
+test('#564 a Virtual attribute with NO option set is still filtered out', async () => {
+  // The relaxation above must be driven by the presence of companion data, not by the type name —
+  // otherwise every platform Virtual attribute would start appearing in columns[].
+  const sdk = sdkWithOptionSets({
+    attributes: [{ logicalName: 'pp_shadow', displayName: 'Shadow', attributeType: 'Virtual', isCustomAttribute: true }],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_item'), 'pp_item');
+  assert.deepStrictEqual(e.columns, []);
+});
+test('#564 the CAST type outranks the attributeType map (defensive precedence)', async () => {
+  // Today this precedence is not observable: the only disagreement measured in the wild is a
+  // MultiSelectPicklist reporting `Virtual`, which the map does not contain at all — so either order
+  // produces MultiChoice, and a mutation that swaps them survives the other tests. It is pinned
+  // anyway because the ordering is a deliberate contract, not an accident: the cast segment is
+  // direct evidence of what the attribute IS, while `attributeType` has already been observed to
+  // misreport it once. A future cleanup that "simplifies" the order should fail here.
+  const sdk = sdkWithOptionSets({
+    attributes: [{ logicalName: 'pp_odd', displayName: 'Odd', attributeType: 'Picklist', isCustomAttribute: true }],
+    multiSelect: [picklistRow('pp_odd', { name: 'pp_item_pp_odd', isGlobal: false, options: [[1, 'A']] })],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_item'), 'pp_item');
+  assert.strictEqual(e.columns.find((c) => c.schemaName === 'pp_odd').type, 'MultiChoice',
+    'the map said Choice and the multi-select cast said MultiChoice — the cast must win');
+});
+test('#564 a lookup name SHADOW is filtered out, but a logical CHOICE column is kept', async () => {
+  // LIVE-MEASURED. Creating a lookup `pp_parentorgid` also creates a synthetic formatted-name
+  // attribute `pp_parentorgidname`:
+  //   { AttributeType: "String", AttributeTypeName: "StringType", IsCustomAttribute: true, IsLogical: true }
+  // It reports IsCustomAttribute TRUE, so the custom-only filter let it through, and its String type
+  // maps cleanly to Text — so a downloaded spec declared a REAL Text column named after a lookup's
+  // shadow. Measured consequence on a fresh-environment rebuild: the build happily created
+  // `pp563_org2.pp563_parentorgidname (Text)`, an invented column that also collides with the name
+  // the real lookup's shadow needs. It is IsLogical (not stored on this table), which is what makes
+  // it distinguishable.
+  //
+  // The rule is deliberately "logical AND no option set", NOT plain "logical": on `account`, 6 REAL
+  // choice columns (address1_addresstypecode, address1_freighttermscode, address1_shippingmethodcode
+  // and their address2_ twins) are themselves IsLogical, because they live on the address entity and
+  // surface logically here. Dropping every logical attribute would delete real Choice columns from
+  // the spec — reintroducing exactly the silent column-loss this change exists to end.
+  const sdk = {
+    fetchEntityMetadata: async () => ({
+      logicalName: 'pp_org', schemaName: 'pp_org', displayName: 'Org', primaryNameAttribute: 'pp_name',
+      attributes: [
+        { logicalName: 'pp_parentorgidname', displayName: 'Parent Org Name', attributeType: 'String', isCustomAttribute: true },
+        { logicalName: 'pp_real', displayName: 'Real', attributeType: 'String', isCustomAttribute: true },
+        { logicalName: 'pp_addrtype', displayName: 'Address Type', attributeType: 'Picklist', isCustomAttribute: true },
+      ],
+    }),
+    dataverse: {
+      get: async (url) => {
+        if (/MultiSelectPicklistAttributeMetadata/.test(url)) return { status: 200, headers: {}, body: { value: [] } };
+        if (/PicklistAttributeMetadata/.test(url)) {
+          return { status: 200, headers: {}, body: { value: [picklistRow('pp_addrtype', { name: 'pp_addrtype_set', isGlobal: false, options: [[1, 'Bill To'], [2, 'Ship To']] })] } };
+        }
+        if (/\/Attributes\?/.test(url)) {
+          return { status: 200, headers: {}, body: { value: [
+            { LogicalName: 'pp_parentorgidname', IsLogical: true },
+            { LogicalName: 'pp_real', IsLogical: false },
+            // A REAL choice column that is nonetheless logical — must survive.
+            { LogicalName: 'pp_addrtype', IsLogical: true },
+          ] } };
+        }
+        return { status: 200, headers: {}, body: {} };
+      },
+    },
+  };
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_org'), 'pp_org');
+  const names = e.columns.map((c) => c.schemaName);
+  assert.ok(!names.includes('pp_parentorgidname'), 'the lookup name shadow must not be emitted as a real Text column');
+  assert.ok(names.includes('pp_real'), 'a normal custom column must survive');
+  assert.ok(names.includes('pp_addrtype'), 'a LOGICAL column that carries an option set is a real Choice and must survive');
+  assert.strictEqual(e.columns.find((c) => c.schemaName === 'pp_addrtype').type, 'Choice');
+});
+
+test('#564 an attribute whose IsLogical could not be read is KEPT, not dropped', async () => {
+  // Fail-safe: an absent flag means "we could not look", and dropping a real column on that basis is
+  // the more destructive error. Same reasoning as the existing isCustomAttribute handling, which
+  // drops only on an explicit `false`.
+  const sdk = sdkWithOptionSets({
+    attributes: [{ logicalName: 'pp_real', displayName: 'Real', attributeType: 'String', isCustomAttribute: true }],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_org'), 'pp_org');
+  assert.deepStrictEqual(e.columns.map((c) => c.schemaName), ['pp_real']);
+});
+// ---------------------------------------------------------------------------
+// Findings from the adversarial review of the #564 work.
+// ---------------------------------------------------------------------------
+
+// Builds the `/Attributes?$select=...` row the label/shape read returns.
+const attrRow = (logicalName, { isLogical = false, typeName = undefined } = {}) => ({
+  LogicalName: logicalName,
+  ...(isLogical !== undefined ? { IsLogical: isLogical } : {}),
+  ...(typeName ? { AttributeTypeName: { Value: typeName } } : {}),
+});
+
+// An sdk with FULL control of both reads: the attribute shape read and the two casts.
+function sdkFull({ attributes, attrRows = [], picklist = [], multiSelect = [], picklistStatus = 200, multiSelectStatus = 200, attrStatus = 200 }) {
+  return {
+    fetchEntityMetadata: async (logical) => ({ logicalName: logical, schemaName: logical, displayName: 'T', primaryNameAttribute: 'pp_name', attributes }),
+    dataverse: {
+      get: async (url) => {
+        if (/MultiSelectPicklistAttributeMetadata/.test(url)) return { status: multiSelectStatus, headers: {}, body: { value: multiSelect } };
+        if (/PicklistAttributeMetadata/.test(url)) return { status: picklistStatus, headers: {}, body: { value: picklist } };
+        if (/\/Attributes\?/.test(url)) return { status: attrStatus, headers: {}, body: { value: attrRows } };
+        return { status: 200, headers: {}, body: {} };
+      },
+    },
+  };
+}
+
+test('a cross-language AMBIGUOUS option set leaves the column untyped instead of aborting the whole download', async () => {
+  // Reported by adversarial review, proven reachable. Option labels need not be unique across
+  // options OR languages in Dataverse, so this set is legal:
+  //   options[0] = "Open"                       (English only)
+  //   options[1] = { 1033: "Closed", 3082: "Open" }
+  // "Open" then names BOTH options. `ambiguousChoiceAliases` treats that as an ERROR (not a warning)
+  // when either side is localized, because the collision is invisible on the page. Emitting it made
+  // `validateAppSpec` fail, and runDownload returns BEFORE writing the spec — so ONE colliding pair
+  // anywhere aborted the download of the ENTIRE app, and --allow-lossy-download does not bypass that
+  // gate. Pre-#564 these columns carried no options[], so the rule returned early and the download
+  // succeeded. Refusing to type just this column restores that, and is the same fail-safe already
+  // used for an unreadable label.
+  const localized = { 1033: 'Closed', 3082: 'Open' };
+  const sdk = sdkFull({
+    attributes: [{ logicalName: 'pp_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true }],
+    attrRows: [attrRow('pp_status', { typeName: 'PicklistType' })],
+    picklist: [picklistRow('pp_status', { name: 'pp_t_pp_status', isGlobal: false, options: [[1, 'Open'], [2, localized]] })],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_t'), 'pp_t');
+  const col = e.columns.find((c) => c.schemaName === 'pp_status');
+  assert.ok(col, 'the column must still be emitted');
+  assert.strictEqual(col.type, undefined, 'an ambiguous option set must not be typed');
+  assert.strictEqual(col.options, undefined, 'and must not carry the invalid options[]');
+  assert.deepStrictEqual(untypedColumnNames([e]), ['pp_t.pp_status'], 'it is named in the untyped warning instead');
+  // The whole point: the emitted spec must still validate.
+  const { validateAppSpec: validate } = require('../lib/app-spec.js');
+  const res = validate({ solution: { uniqueName: 'S', publisherPrefix: 'pp' }, app: { name: 'A' }, entities: [e], appShell: { areas: [] } }, { profile: 'plan', reconstructed: true });
+  assert.deepStrictEqual(res.errors, [], res.errors.join(' | '));
+});
+
+test('duplicate PLAIN labels are still typed (they are a warning, not an error)', async () => {
+  // Only the localized/hidden collision is an error. Two identical plain strings provisioned fine
+  // before this rule existed, so refusing to type them would reject specs that still work.
+  const sdk = sdkFull({
+    attributes: [{ logicalName: 'pp_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true }],
+    attrRows: [attrRow('pp_status', { typeName: 'PicklistType' })],
+    picklist: [picklistRow('pp_status', { name: 'pp_t_pp_status', isGlobal: false, options: [[1, 'Open'], [2, 'Open']] })],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_t'), 'pp_t');
+  assert.strictEqual(e.columns.find((c) => c.schemaName === 'pp_status').type, 'Choice');
+});
+
+test('the untyped-column warning names a label clash as the cause where that is it, and words every other column as before', () => {
+  const { untypedColumnWarnings } = require('../download-model-app.js');
+  const before = 'WARNING: 1 column(s) were captured WITHOUT a type (pp_t.pp_unread) — most likely Choice/MultiChoice columns whose option set could not be read. Rebuilding this spec into an environment that already has the table is unaffected, but rebuilding into a FRESH environment would create them as single-line Text. Add the type and options[] (or a globalChoice reference) by hand before a cross-environment rebuild.\n';
+  assert.deepStrictEqual(untypedColumnWarnings(['pp_t.pp_unread']), [before], 'no clash: the warning it always was');
+  assert.deepStrictEqual(untypedColumnWarnings([]), []);
+  const clashes = new Map([['pp_t.pp_status', "'Open' names options[0] and options[1]"]]);
+  const lines = untypedColumnWarnings(['pp_t.pp_status', 'pp_t.pp_unread'], clashes);
+  assert.strictEqual(lines.length, 2);
+  assert.strictEqual(lines[0], before, 'the column the clash does not explain keeps its own warning');
+  assert.match(lines[1], /^WARNING: 1 Choice\/MultiChoice column\(s\) were captured WITHOUT a type because one text names two of their options \(pp_t\.pp_status: 'Open' names options\[0\] and options\[1\]\) and their two labels differ in at least one language/);
+  assert.match(lines[1], /Their option sets were read/);
+  assert.doesNotMatch(lines[1], /could not be read/);
+});
+
+test('a MultiChoice survives an unusable option label - untyped and NAMED, never dropped', async () => {
+  // Reported by adversarial review. A MultiSelectPicklist is `Virtual`, so before this the ONLY
+  // thing keeping it in columns[] was a successfully PARSED option set. An unusable label made
+  // optionSetFromRow return null, the cast membership was discarded, and the column vanished from
+  // the spec entirely while the warning claimed it was "captured WITHOUT a type".
+  const sdk = sdkFull({
+    attributes: [{ logicalName: 'pp_tags', displayName: 'Tags', attributeType: 'Virtual', isCustomAttribute: true }],
+    attrRows: [attrRow('pp_tags', { typeName: 'MultiSelectPicklistType' })],
+    multiSelect: [{ LogicalName: 'pp_tags', OptionSet: { Name: 'pp_t_pp_tags', IsGlobal: false, Options: [{ Value: 1, Label: { LocalizedLabels: [], UserLocalizedLabel: null } }] } }],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_t'), 'pp_t');
+  assert.ok(e.columns.find((c) => c.schemaName === 'pp_tags'), 'the MultiChoice column must not vanish');
+  assert.strictEqual(e.columns.find((c) => c.schemaName === 'pp_tags').type, undefined);
+  assert.deepStrictEqual(untypedColumnNames([e]), ['pp_t.pp_tags'], 'and it must be NAMED, so the loss is never silent');
+});
+
+test('a MultiChoice survives a FAILED or EMPTY option-set read, identified by AttributeTypeName', async () => {
+  // Two shapes, same requirement. The cast can fail (503) or answer 200 with an empty value[] — the
+  // second does not even throw, so nothing was recorded and the column disappeared with ZERO
+  // operator signal. `AttributeTypeName` identifies a multi-select INDEPENDENTLY of the cast, so
+  // membership is no longer the only thing standing between a real column and silent deletion.
+  for (const variant of [{ multiSelectStatus: 503 }, { multiSelect: [] }]) {
+    const sdk = sdkFull({
+      attributes: [{ logicalName: 'pp_tags', displayName: 'Tags', attributeType: 'Virtual', isCustomAttribute: true }],
+      attrRows: [attrRow('pp_tags', { typeName: 'MultiSelectPicklistType' })],
+      ...variant,
+    });
+    const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_t'), 'pp_t');
+    const label = JSON.stringify(variant);
+    assert.ok(e.columns.find((c) => c.schemaName === 'pp_tags'), 'MultiChoice vanished for ' + label);
+    assert.deepStrictEqual(untypedColumnNames([e]), ['pp_t.pp_tags'], 'not named for ' + label);
+  }
+});
+
+test('a LOGICAL choice column is not dropped when the option-set read fails', async () => {
+  // The isLogical shadow filter keyed off `optionSet === undefined`, so a genuine logical Choice
+  // whose option read failed was DROPPED rather than left untyped — and the warning then promised a
+  // Text column that a rebuild would never create. Positive type evidence (AttributeTypeName) now
+  // protects it; the shadow, which has none, is still dropped.
+  const sdk = sdkFull({
+    attributes: [
+      { logicalName: 'pp_logchoice', displayName: 'Logical Choice', attributeType: 'Picklist', isCustomAttribute: true },
+      { logicalName: 'pp_parentidname', displayName: 'Parent Name', attributeType: 'String', isCustomAttribute: true },
+    ],
+    attrRows: [
+      attrRow('pp_logchoice', { isLogical: true, typeName: 'PicklistType' }),
+      attrRow('pp_parentidname', { isLogical: true, typeName: 'StringType' }),
+    ],
+    picklistStatus: 503,
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_t'), 'pp_t');
+  const names = e.columns.map((c) => c.schemaName);
+  assert.ok(names.includes('pp_logchoice'), 'a real logical Choice must survive a failed option read');
+  assert.ok(!names.includes('pp_parentidname'), 'the lookup shadow must still be dropped');
+  assert.deepStrictEqual(untypedColumnNames([e]), ['pp_t.pp_logchoice']);
+});
+
+test('a failing SECOND cast does not discard the successful first one', async () => {
+  // readOptionSets threw on the first non-2xx, so a 503 on the multi-select cast threw away an
+  // already-valid Picklist map and every Choice on the table lost its type.
+  const sdk = sdkFull({
+    attributes: [{ logicalName: 'pp_status', displayName: 'Status', attributeType: 'Picklist', isCustomAttribute: true }],
+    attrRows: [attrRow('pp_status', { typeName: 'PicklistType' })],
+    picklist: [picklistRow('pp_status', { name: 'pp_t_pp_status', isGlobal: false, options: [[1, 'Open']] })],
+    multiSelectStatus: 503,
+  });
+  const meta = await readEntityWithDescriptions(sdk, 'pp_t');
+  const e = entityFromMetadata(meta, 'pp_t');
+  assert.strictEqual(e.columns.find((c) => c.schemaName === 'pp_status').type, 'Choice', 'the successful cast must survive the other one failing');
+  assert.ok(meta.optionSetReadFailed, 'the partial failure is still recorded');
+});
+
+test('globalChoices declares only sets an EMITTED column actually references', async () => {
+  // collectGlobalChoices scanned raw metadata, so a set bound only by a SYSTEM attribute (filtered
+  // out of columns[]) or by a table later dropped for having no primary name still produced a
+  // declaration — and the build then creates or reuses every declaration in the target environment.
+  const sdk = sdkFull({
+    attributes: [
+      { logicalName: 'pp_mine', displayName: 'Mine', attributeType: 'Picklist', isCustomAttribute: true },
+      { logicalName: 'sys_theirs', displayName: 'Theirs', attributeType: 'Picklist', isCustomAttribute: false },
+    ],
+    attrRows: [attrRow('pp_mine', { typeName: 'PicklistType' }), attrRow('sys_theirs', { typeName: 'PicklistType' })],
+    picklist: [
+      picklistRow('pp_mine', { name: 'bound_set', isGlobal: true, options: [[1, 'A']] }),
+      picklistRow('sys_theirs', { name: 'orphan_set', isGlobal: true, options: [[1, 'B']] }),
+    ],
+  });
+  const meta = await readEntityWithDescriptions(sdk, 'pp_t');
+  const e = entityFromMetadata(meta, 'pp_t');
+  const candidates = collectGlobalChoices(meta, new Map());
+  const decls = finalizeGlobalChoices([e], candidates);
+  assert.deepStrictEqual(decls.map((g) => g.name), ['bound_set'], 'the orphan set must not be declared');
+});
+
+test('a global-choice reference is canonicalized to the declaration casing', async () => {
+  // Declarations dedupe case-insensitively but each column kept its own raw casing, and
+  // entity-provision looks up `globalChoiceIds[c.globalChoice]` CASE-SENSITIVELY — so a second
+  // casing left that column unbound and it fell back to an empty inline option list.
+  const e = {
+    schemaName: 'pp_t',
+    columns: [
+      { schemaName: 'a', type: 'Choice', globalChoice: 'Shared_Set' },
+      { schemaName: 'b', type: 'Choice', globalChoice: 'shared_set' },
+    ],
+  };
+  const candidates = new Map([['shared_set', { name: 'Shared_Set', options: ['A'] }]]);
+  const decls = finalizeGlobalChoices([e], candidates);
+  assert.deepStrictEqual(decls.map((g) => g.name), ['Shared_Set']);
+  assert.deepStrictEqual(e.columns.map((c) => c.globalChoice), ['Shared_Set', 'Shared_Set'], 'every reference must match the declaration exactly');
+});
+test('runDownload emits ONLY referenced globalChoices (drives the real wiring, not the helper)', async () => {
+  // Deliberately driven through runDownload. An earlier version of this test called
+  // finalizeGlobalChoices directly, and a mutation that reverted the ACCESSOR to
+  // `[...globalChoiceDecls.values()]` survived it — the helper was right while the wiring was not.
+  const APP_ID = 'a1b2c3d4-0000-4000-8000-0000000000c1';
+  const APP_UNIQUE = 'test_gcwiring';
+  const SM_ID = '5111e0f2-0000-4000-8000-0000000000c2';
+  const SOL_ID = '5111e0f2-0000-4000-8000-0000000000c4';
+  const MID = { bound_set: '5111e0f2-0000-4000-8000-0000000000c5', orphan_set: '5111e0f2-0000-4000-8000-0000000000c6', unrelated_set: '5111e0f2-0000-4000-8000-0000000000c7' };
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-gc-'));
+  try {
+    const sdk = {
+      fetchArtifact: async () => ({ name: 'GC App', description: '', siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'Entity', entity: 'contoso_item' }] }] }] } }),
+      queryRecords: async (logical, opts) => {
+        const filter = (opts && opts.filter) || '';
+        if (logical === 'appmodule') {
+          const m = filter.match(/uniquename eq '([^']+)'/);
+          if (m) return m[1] === APP_UNIQUE ? [{ appmoduleid: APP_ID, appmoduleidunique: 'c0ffee00-0000-4000-8000-0000000000c3' }] : [];
+          return [{ appmoduleid: APP_ID, appmoduleidunique: 'c0ffee00-0000-4000-8000-0000000000c3', uniquename: APP_UNIQUE }];
+        }
+        if (logical === 'appmodulecomponent') return [{ objectid: SM_ID, componenttype: 62 }];
+        if (logical === 'sitemap') return [{ sitemapxml: '<SiteMap><Area><Group><SubArea Entity="contoso_item"/></Group></Area></SiteMap>' }];
+        // The app's solution is recoverable and OWNS `orphan_set` (#586 item 5); `bound_set` is only
+        // BOUND, so it can reach the inventory through the emitted column alone.
+        if (logical === 'solutioncomponent' && filter === `objectid eq ${APP_ID}`) return [{ _solutionid_value: SOL_ID }];
+        if (logical === 'solution') return [{ solutionid: SOL_ID, uniquename: 'GcSln', ismanaged: false }];
+        if (logical === 'solutioncomponent' && /componenttype eq 9\b/.test(filter)) return [{ objectid: MID.orphan_set }];
+        return [];
+      },
+      fetchEntityMetadata: async (logical) => ({
+        schemaName: logical, displayName: 'Item', primaryNameAttribute: 'contoso_name',
+        attributes: [
+          { logicalName: 'contoso_mine', displayName: 'Mine', attributeType: 'Picklist', isCustomAttribute: true },
+          // SYSTEM attribute: filtered out of columns[], so the set it binds must NOT be declared.
+          { logicalName: 'sys_theirs', displayName: 'Theirs', attributeType: 'Picklist', isCustomAttribute: false },
+        ],
+      }),
+      dataverse: {
+        get: async (url) => {
+          if (/MultiSelectPicklistAttributeMetadata/.test(url)) return { status: 200, headers: {}, body: { value: [] } };
+          if (/PicklistAttributeMetadata/.test(url)) {
+            return { status: 200, headers: {}, body: { value: [
+              picklistRow('contoso_mine', { name: 'bound_set', isGlobal: true, options: [[1, 'A']] }),
+              picklistRow('sys_theirs', { name: 'orphan_set', isGlobal: true, options: [[1, 'B']] }),
+            ] } };
+          }
+          if (/\/Attributes\?/.test(url)) {
+            return { status: 200, headers: {}, body: { value: [
+              { LogicalName: 'contoso_mine', AttributeTypeName: { Value: 'PicklistType' } },
+              { LogicalName: 'sys_theirs', AttributeTypeName: { Value: 'PicklistType' } },
+            ] } };
+          }
+          if (/GlobalOptionSetDefinitions/.test(url)) {
+            return { status: 200, headers: {}, body: { value: Object.entries(MID).map(([Name, MetadataId]) => ({ Name, MetadataId, IsManaged: false })) } };
+          }
+          return { status: 200, headers: {}, body: {} };
+        },
+      },
+    };
+    const genpage = fakeGenpage();
+    const res = await runDownload({
+      sdk: currentReadSdk(sdk, { appId: APP_ID, layerId: 'c0ffee00-0000-4000-8000-0000000000c3',
+        sitemapXml: '<SiteMap><Area><Group><SubArea Entity="contoso_item"/></Group></Area></SiteMap>' }),
+      genpage, outDir: out, appId: APP_ID, appUnique: APP_UNIQUE,
+    });
+    assert.ok(res.ok, JSON.stringify(res));
+    assert.deepStrictEqual((res.spec.globalChoices || []).map((g) => g.name), ['bound_set'],
+      'a set bound only by a filtered SYSTEM attribute must not be declared — the build writes every declaration into the target org');
+    const col = res.spec.entities[0].columns.find((c) => c.schemaName === 'contoso_mine');
+    assert.strictEqual(col.globalChoice, 'bound_set');
+    // The report subtracts what the spec DECLARES. `orphan_set` is a raw candidate (its metadata was
+    // read) that is never declared, so subtracting the candidates hid it; and the org-wide
+    // `unrelated_set` is not the app's at all (#586 item 5).
+    const gc = ((res.notRoundTripped && res.notRoundTripped.orgScoped) || []).find((c) => c.kind === 'globalChoices');
+    assert.deepStrictEqual(gc && gc.names, ['orphan_set'], JSON.stringify(res.notRoundTripped));
+    // The inventory still carries the BOUND set (its description is kept) though the solution does
+    // not own it — which is only possible if the wiring hands the emitted columns' bindings through.
+    assert.deepStrictEqual(((res.spec.descriptionInventory || {}).globalChoices || []).map((g) => g.name).sort(), ['bound_set', 'orphan_set']);
+    // And tearing down this downloaded spec RETAINS the set it declares, as it retains the tables —
+    // an org-wide option set this download cannot prove the app created (#587 item 6).
+    const { planTeardown } = require('../lib/sdk-teardown.js');
+    const gcSteps = planTeardown(res.spec).filter((s) => s.kind === 'globalChoice');
+    assert.deepStrictEqual(gcSteps.map((s) => [s.target.name, s.target.existing]), [['bound_set', true]]);
+    // And the emitted spec must still validate.
+    assert.deepStrictEqual(validateAppSpec(res.spec, { profile: 'plan' }).errors, []);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('cast membership still keeps a column when the ATTRIBUTE read also failed', async () => {
+  // The combination neither guard covers alone: no AttributeTypeName (attribute read 403) AND an
+  // unparseable option label. Cast MEMBERSHIP is then the only evidence the column exists, so the
+  // entry must be recorded even when its options cannot be parsed.
+  const sdk = sdkFull({
+    attributes: [{ logicalName: 'pp_tags', displayName: 'Tags', attributeType: 'Virtual', isCustomAttribute: true }],
+    attrStatus: 403,
+    multiSelect: [{ LogicalName: 'pp_tags', OptionSet: { Name: 'pp_t_pp_tags', IsGlobal: false, Options: [{ Value: 1, Label: { LocalizedLabels: [], UserLocalizedLabel: null } }] } }],
+  });
+  const e = entityFromMetadata(await readEntityWithDescriptions(sdk, 'pp_t'), 'pp_t');
+  assert.ok(e.columns.find((c) => c.schemaName === 'pp_tags'), 'cast membership must keep the column when nothing else can');
+  assert.deepStrictEqual(untypedColumnNames([e]), ['pp_t.pp_tags']);
+});
+
+test('#574 a POLYMORPHIC lookup shadow is filtered out via AttributeOf, even though IsLogical is false', async () => {
+  // LIVE-MEASURED on a Customer-type lookup `cfo_billto` targeting account + contact. Dataverse
+  // creates THREE shadows for it, and unlike a single-target lookup they are physically stored:
+  //   cfo_billtoname      AttributeOf=cfo_billto  IsLogical=FALSE  AttributeType=String
+  //   cfo_billtoyominame  AttributeOf=cfo_billto  IsLogical=FALSE  AttributeType=String
+  //   cfo_billtoidtype    AttributeOf=cfo_billto  IsLogical=FALSE  AttributeType=EntityName
+  // vs a single-target lookup, whose shadow IS logical:
+  //   cfo_customeridname  AttributeOf=cfo_customerid  IsLogical=TRUE
+  // So the IsLogical rule cannot see the polymorphic ones: they were emitted as real Text columns
+  // and a fresh-environment rebuild invented two text fields where a lookup used to be.
+  const e = entityFromMetadata({
+    schemaName: 'cfo_workorder', displayName: 'Work Order', primaryNameAttribute: 'cfo_name',
+    attributes: [
+      { logicalName: 'cfo_name', attributeType: 'String', IsCustomAttribute: true },
+      { logicalName: 'cfo_intakeref', attributeType: 'String', IsCustomAttribute: true },
+      { logicalName: 'cfo_billtoname', attributeType: 'String', IsCustomAttribute: true, IsLogical: false, AttributeOf: 'cfo_billto' },
+      { logicalName: 'cfo_billtoyominame', attributeType: 'String', IsCustomAttribute: true, IsLogical: false, AttributeOf: 'cfo_billto' },
+      { logicalName: 'cfo_customeridname', attributeType: 'String', IsCustomAttribute: true, IsLogical: true, AttributeOf: 'cfo_customerid' },
+    ],
+  }, 'cfo_workorder');
+  assert.deepStrictEqual(e.columns.map((c) => c.schemaName), ['cfo_intakeref'],
+    `only the authored column survives; got ${JSON.stringify(e.columns.map((c) => c.schemaName))}`);
+});
+
+test('#574 a REAL column is never dropped by the AttributeOf rule (AttributeOf is null on authored columns)', async () => {
+  // The lookup itself, and every ordinary column, report AttributeOf: null -- so nothing authored
+  // is at risk. Guards the rule against becoming a silent column deletion.
+  const e = entityFromMetadata({
+    schemaName: 'cfo_workorder', displayName: 'Work Order', primaryNameAttribute: 'cfo_name',
+    attributes: [
+      { logicalName: 'cfo_intakeref', attributeType: 'String', IsCustomAttribute: true, AttributeOf: null },
+      { logicalName: 'cfo_resolution', attributeType: 'Memo', IsCustomAttribute: true, AttributeOf: null },
+      { logicalName: 'cfo_onsiteduration', attributeType: 'Integer', IsCustomAttribute: true },
+    ],
+  }, 'cfo_workorder');
+  assert.deepStrictEqual(e.columns.map((c) => c.schemaName), ['cfo_intakeref', 'cfo_resolution', 'cfo_onsiteduration']);
+});
+
+test('#574 an attribute whose AttributeOf could not be read is KEPT, not dropped', async () => {
+  // When the label read fails NO attribute carries AttributeOf. Dropping on absent would empty the
+  // table\u0027s columns[] entirely -- the same direction every other rule here takes: "we could not
+  // look" must never become a deletion.
+  const e = entityFromMetadata({
+    schemaName: 'cfo_workorder', displayName: 'Work Order', primaryNameAttribute: 'cfo_name',
+    attributes: [{ logicalName: 'cfo_intakeref', attributeType: 'String', IsCustomAttribute: true }],
+  }, 'cfo_workorder');
+  assert.deepStrictEqual(e.columns.map((c) => c.schemaName), ['cfo_intakeref']);
+});
+
+test('#574 AttributeOf survives the description merge, so the shadow is dropped through the REAL read path', async () => {
+  // The unit tests above hand AttributeOf straight to entityFromMetadata. This one drives the
+  // integration seam: the SDK metadata has NO AttributeOf (it is not in its projection), so the
+  // value only reaches the filter if readEntityWithDescriptions merges it off the label read.
+  // Dropping that one field from the merge silently re-enables the leak.
+  const sdk = {
+    fetchEntityMetadata: async (logical) => ({
+      logicalName: logical, schemaName: 'cfo_workorder', displayName: 'Work Order', primaryNameAttribute: 'cfo_name',
+      attributes: [
+        { logicalName: 'cfo_intakeref', attributeType: 'String', IsCustomAttribute: true },
+        { logicalName: 'cfo_billtoname', attributeType: 'String', IsCustomAttribute: true },
+        { logicalName: 'cfo_billtoyominame', attributeType: 'String', IsCustomAttribute: true },
+      ],
+    }),
+    queryRecords: async (set) => { throw new Error(`queryRecords must not be used for metadata paths (got \u0027${set}\u0027)`); },
+    dataverse: {
+      get: async (url) => {
+        if (/\/Attributes\?/.test(url)) {
+          // Exactly the live shape: polymorphic shadows are NOT logical, so only AttributeOf marks them.
+          return { status: 200, headers: {}, body: { value: [
+            { LogicalName: 'cfo_intakeref', IsLogical: false, AttributeOf: null },
+            { LogicalName: 'cfo_billtoname', IsLogical: false, AttributeOf: 'cfo_billto' },
+            { LogicalName: 'cfo_billtoyominame', IsLogical: false, AttributeOf: 'cfo_billto' },
+          ] } };
+        }
+        return { status: 200, headers: {}, body: {} };
+      },
+    },
+  };
+  const meta574 = await readEntityWithDescriptions(sdk, 'cfo_workorder');
+  const e574 = entityFromMetadata(meta574, 'cfo_workorder');
+  assert.deepStrictEqual(e574.columns.map((c) => c.schemaName), ['cfo_intakeref'],
+    `the polymorphic shadows must not survive the real read path; got ${JSON.stringify(e574.columns.map((c) => c.schemaName))}`);
+});
+
+// A platform-generated companion that carries NO AttributeOf, is not logical, and reports
+// IsCustomAttribute true slips past every rule above. `<money>_base` is the canonical case.
+test('#574 follow-up: the base-currency twin is dropped via IsBaseCurrency, and the real Money column is kept', async () => {
+  // LIVE-MEASURED on stock `opportunity`:
+  //   estimatedvalue       IsBaseCurrency=false IsValidForCreate=true
+  //   estimatedvalue_base  IsBaseCurrency=TRUE  IsValidForCreate=false
+  const e = entityFromMetadata({
+    primaryNameAttribute: 'cfo_name',
+    attributes: [
+      { SchemaName: 'cfo_name', LogicalName: 'cfo_name', AttributeType: 'String', IsCustomAttribute: true, IsLogical: false, AttributeOf: null },
+      { SchemaName: 'cfo_budget', LogicalName: 'cfo_budget', AttributeType: 'Money', IsCustomAttribute: true, IsLogical: false, AttributeOf: null },
+      { SchemaName: 'cfo_budget_base', LogicalName: 'cfo_budget_base', AttributeType: 'Money', IsCustomAttribute: true, IsLogical: false, AttributeOf: null, IsBaseCurrency: true },
+    ],
+  }, 'cfo_rtproject');
+  assert.deepStrictEqual(e.columns.map((c) => c.schemaName), ['cfo_budget'],
+    `the base-currency twin must not be emitted as an authored column; got ${JSON.stringify(e.columns.map((c) => c.schemaName))}`);
+});
+
+// The capability flag is NOT a substitute for IsBaseCurrency. This spec deliberately supports
+// authored columns with `isValidForCreate: false` (app-spec-schema.md), so filtering on it turns a
+// round-trip into a DELETION of a legitimately read-only column. Live-measured counter-example:
+// stock `opportunity.totalamount` has IsValidForCreate=false and IsBaseCurrency=false.
+test('#574 follow-up: a real column that is merely NOT CREATABLE is kept, not mistaken for a generated twin', async () => {
+  const e = entityFromMetadata({
+    primaryNameAttribute: 'cfo_name',
+    attributes: [
+      { SchemaName: 'cfo_name', LogicalName: 'cfo_name', AttributeType: 'String', IsCustomAttribute: true },
+      { SchemaName: 'cfo_rollup', LogicalName: 'cfo_rollup', AttributeType: 'Money', IsCustomAttribute: true, IsValidForCreate: false, IsBaseCurrency: false },
+    ],
+  }, 'cfo_rtproject');
+  assert.deepStrictEqual(e.columns.map((c) => c.schemaName), ['cfo_rollup'],
+    'a read-only authored column must survive a download');
+});
+
+test('#574 follow-up: an attribute whose IsBaseCurrency could not be read is KEPT, not dropped', async () => {
+  // Same fail-open direction as every other rule: when the Money cast read fails, no attribute
+  // carries IsBaseCurrency, and "we could not look" must never become a column deletion.
+  const e = entityFromMetadata({
+    primaryNameAttribute: 'cfo_name',
+    attributes: [
+      { SchemaName: 'cfo_name', LogicalName: 'cfo_name', AttributeType: 'String', IsCustomAttribute: true },
+      { SchemaName: 'cfo_budget', LogicalName: 'cfo_budget', AttributeType: 'Money', IsCustomAttribute: true },
+    ],
+  }, 'cfo_rtproject');
+  assert.deepStrictEqual(e.columns.map((c) => c.schemaName), ['cfo_budget']);
+});
+
+test('#574 follow-up: IsBaseCurrency is read through the Money CAST and drops the twin on the REAL read path', async () => {
+  // IsBaseCurrency lives on MoneyAttributeMetadata, not the base attribute type, so it needs its own
+  // cast read. Dropping that read silently re-enables the leak.
+  let castRequested = false;
+  const sdk = {
+    fetchEntityMetadata: async (logical) => ({
+      logicalName: logical, schemaName: 'cfo_rtproject', displayName: 'RT Project', primaryNameAttribute: 'cfo_name',
+      attributes: [
+        { logicalName: 'cfo_budget', attributeType: 'Money', IsCustomAttribute: true },
+        { logicalName: 'cfo_budget_base', attributeType: 'Money', IsCustomAttribute: true },
+      ],
+    }),
+    queryRecords: async (set) => { throw new Error(`queryRecords must not be used for metadata paths (got \u0027${set}\u0027)`); },
+    dataverse: {
+      get: async (url) => {
+        if (/MoneyAttributeMetadata/.test(url)) {
+          castRequested = true;
+          return { status: 200, headers: {}, body: { value: [
+            { LogicalName: 'cfo_budget', IsBaseCurrency: false },
+            { LogicalName: 'cfo_budget_base', IsBaseCurrency: true },
+          ] } };
+        }
+        if (/\/Attributes\?/.test(url)) {
+          return { status: 200, headers: {}, body: { value: [
+            { LogicalName: 'cfo_budget', IsLogical: false, AttributeOf: null },
+            { LogicalName: 'cfo_budget_base', IsLogical: false, AttributeOf: null },
+          ] } };
+        }
+        return { status: 200, headers: {}, body: {} };
+      },
+    },
+  };
+  const meta = await readEntityWithDescriptions(sdk, 'cfo_rtproject');
+  assert.ok(castRequested, 'the Money cast read must be issued');
+  const e = entityFromMetadata(meta, 'cfo_rtproject');
+  assert.deepStrictEqual(e.columns.map((c) => c.schemaName), ['cfo_budget'],
+    `the base-currency twin must not survive the real read path; got ${JSON.stringify(e.columns.map((c) => c.schemaName))}`);
+});
+
+// --- #584 item 1: an N:N whose deployed SchemaName diverges from the generated default -----------
+//
+// The N:N read already retrieved `SchemaName` and then threw it away, emitting only
+// { type, entity1, entity2 }. A relationship deployed as `new_CustomTicketTagLink` therefore came
+// back as the generated `new_tag_new_ticket`, so a rebuild into the SAME environment creates a
+// SECOND intersect relationship beside the existing one instead of matching it — while the download
+// presents itself as rebuildable. The 1:N branch had carried the deployed name for exactly this
+// reason; this applies the identical rule.
+test('readRelationships carries a divergent N:N SchemaName, and omits it when it matches the default', async () => {
+  const mk = (schemaName) => ({
+    dataverse: {
+      get: async (url) => {
+        if (/ManyToManyRelationships/.test(url)) {
+          return { status: 200, body: { value: [{ SchemaName: schemaName, Entity1LogicalName: 'new_ticket', Entity2LogicalName: 'new_tag', IsCustomRelationship: true }] } };
+        }
+        // No 1:N and no lookup metadata for this probe.
+        return { status: 200, body: { value: [] } };
+      },
+    },
+  });
+
+  // 1. DIVERGENT and correctly prefixed -> carried verbatim.
+  const divergent = await readRelationships(mk('new_CustomTicketTagLink'), ['new_ticket', 'new_tag'], 'new');
+  const nn = (divergent.relationships || []).filter((r) => r.type === 'ManyToMany');
+  assert.strictEqual(nn.length, 1, `expected one N:N; got ${JSON.stringify(divergent.relationships)}`);
+  assert.strictEqual(nn[0].schemaName, 'new_CustomTicketTagLink', 'a deployed name a rebuild could not guess must be carried');
+
+  // 2. The GENERATED default -> omitted, so the spec stays minimal and the build composes it.
+  const { manyToManySchemaName } = require('../lib/app-spec.js');
+  const auto = manyToManySchemaName({ entity1: 'new_ticket', entity2: 'new_tag' }, 'new');
+  const matching = await readRelationships(mk(auto), ['new_ticket', 'new_tag'], 'new');
+  const nn2 = (matching.relationships || []).filter((r) => r.type === 'ManyToMany');
+  assert.strictEqual(nn2.length, 1);
+  assert.ok(!('schemaName' in nn2[0]), `a name equal to the generated default adds nothing; got ${JSON.stringify(nn2[0])}`);
+
+  // 3. FOREIGN publisher prefix -> carried, with a warning that a new environment cannot create
+  //    that name. Omitting it made a same-environment rebuild CREATE under the generated name and
+  //    halt. Lint warns on existing: true rather than refusing the download.
+  const warnings = [];
+  const foreign = await readRelationships(mk('zzz_ForeignPrefixLink'), ['new_ticket', 'new_tag'], 'new', (m) => warnings.push(m));
+  const nn3 = (foreign.relationships || []).filter((r) => r.type === 'ManyToMany');
+  assert.strictEqual(nn3.length, 1, 'the relationship is still carried');
+  assert.strictEqual(nn3[0].schemaName, 'zzz_ForeignPrefixLink');
+  assert.ok(warnings.some((w) => /zzz_ForeignPrefixLink/.test(w) && /new environment/i.test(w) && /cannot create/i.test(w)),
+    `the foreign name must be warned, not renamed; got ${JSON.stringify(warnings)}`);
+  assert.deepStrictEqual((foreign.skipped || []).filter((s) => /zzz_ForeignPrefixLink/.test(s.name)), [],
+    'and never counted as skipped — it IS in the rebuildable spec');
+});
+// An earlier release's `pac model genpage download` wrote every file of a page folder starting `ef bb bf`, so a folder it wrote can still be
+// read by a rebuild — and the BOM is only an encoding marker.
+// LIVE-REPRODUCED: that config.json starts `ef bb bf`. Node's
+// 'utf8' decode keeps that BOM as U+FEFF and JSON.parse REJECTS a leading U+FEFF, so a perfectly
+// valid downloaded config threw and the old catch substituted `{}` — the page's table bindings
+// vanished from the emitted spec, and the rebuilt page queried a table it was no longer bound to.
+//
+// Also separates the two cases the old code conflated: a MISSING config is genuinely optional,
+// while a PRESENT-but-unparseable one means the bindings are UNKNOWN and must not be reported as
+// none.
+test('a BOM-prefixed downloaded config.json keeps its data-source bindings', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dlbom-'));
+  const mk = (id, bytes) => {
+    const d = path.join(root, id);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'page.tsx'), 'export default () => null;', 'utf8');
+    if (bytes !== undefined) fs.writeFileSync(path.join(d, 'config.json'), bytes);
+    return d;
+  };
+
+  const CONFIG = JSON.stringify({ dataSources: ['contoso_ticket'] });
+  mk('11111111-1111-1111-1111-111111111111', Buffer.from('\uFEFF' + CONFIG, 'utf8')); // BOM, as pac writes it
+  mk('22222222-2222-2222-2222-222222222222', Buffer.from(CONFIG, 'utf8'));            // plain
+  mk('33333333-3333-3333-3333-333333333333');                                          // no config at all
+  mk('44444444-4444-4444-4444-444444444444', Buffer.from('{ not json', 'utf8'));      // present, broken
+
+  // The fixture really is BOM-prefixed on disk, so this cannot pass by writing a plain file.
+  const first = fs.readFileSync(path.join(root, '11111111-1111-1111-1111-111111111111', 'config.json'));
+  assert.deepStrictEqual([...first.slice(0, 3)], [0xef, 0xbb, 0xbf]);
+
+  const unreadable = [];
+  const pages = parseDownloadedPages(root, root, null, unreadable);
+  const byId = new Map(pages.map((x) => [x.pageId, x]));
+
+  assert.deepStrictEqual(byId.get('11111111-1111-1111-1111-111111111111').dataSources, ['contoso_ticket'],
+    'a BOM must not cost the page its bindings');
+  assert.deepStrictEqual(byId.get('22222222-2222-2222-2222-222222222222').dataSources, ['contoso_ticket'],
+    'and a plain config must still work');
+  assert.deepStrictEqual(byId.get('33333333-3333-3333-3333-333333333333').dataSources, [],
+    'a MISSING config is optional — no bindings, no complaint');
+
+  assert.deepStrictEqual(unreadable.map((u) => u.pageId), ['44444444-4444-4444-4444-444444444444'],
+    'only the present-but-broken config counts as unreadable — not the absent one, not the BOM one');
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+// A prompt.txt carries the same BOM, and it becomes the rebuilt page's prompt.
+test('a BOM-prefixed downloaded prompt.txt does not keep the BOM in the prompt', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dlbom2-'));
+  const d = path.join(root, '55555555-5555-5555-5555-555555555555');
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'page.tsx'), 'x', 'utf8');
+  fs.writeFileSync(path.join(d, 'prompt.txt'), Buffer.from('\uFEFFConversation with 1 prompts:', 'utf8'));
+  const pages = parseDownloadedPages(root, root, null, []);
+  assert.strictEqual(pages[0].prompt.charCodeAt(0) !== 0xFEFF, true, 'the prompt must not start with a BOM');
+  assert.strictEqual(pages[0].prompt, 'Conversation with 1 prompts:');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+// The parse-level test above proves an unreadable config is RECORDED. It does not prove the
+// download REFUSES to emit a spec because of it — the policy is what protects the user, and making
+// the gate unconditionally false left the parse test passing while `runDownload` happily returned
+// ok:true with the bindings silently dropped. This asserts the GATE, not just the parse.
+//
+// The page folder is written by the plugin from what the SDK read, so its config.json is always well-formed JSON; what can still be
+// unreadable is the page's own `dataSources` — a value the spec cannot hold (a blank entry, one that is no table name), which would be
+// written into the spec as a binding to nothing.
+test('runDownload REFUSES to emit a spec when a page\'s data sources cannot be understood, unless the loss is accepted', async () => {
+  const GP = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
+  const APP_ID = 'a1b2c3d4-0000-4000-8000-00000000beef';
+  const APP_UNIQ_VALUE = 'c0ffee00-0000-4000-8000-00000000cafe';
+  const SM_ID = '5111e0f2-0000-4000-8000-0000000000ab';
+  const APP_UNIQUE = 'test_gate';
+  const SM_XML = `<SiteMap><Area><Group><SubArea GenPageId="${GP}" Title="Sitemap Page"/><SubArea Entity="contoso_item"/></Group></Area></SiteMap>`;
+
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-gate-'));
+  const mkSdk = () => currentReadSdk({
+    fetchArtifact: async () => ({
+      name: 'Gate App', description: '',
+      siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [
+        { type: 'GenPage', genPageId: GP, title: 'Sitemap Page' },
+        { type: 'Entity', entity: 'contoso_item' },
+      ] }] }] },
+    }),
+    queryRecords: async (logical, opts) => {
+      const filter = (opts && opts.filter) || '';
+      if (logical === 'appmodule') {
+        const m = filter.match(/uniquename eq '([^']+)'/);
+        if (m) return m[1] === APP_UNIQUE ? [{ appmoduleid: APP_ID, appmoduleidunique: APP_UNIQ_VALUE }] : [];
+        return [{ appmoduleid: APP_ID, appmoduleidunique: APP_UNIQ_VALUE, uniquename: APP_UNIQUE }];
+      }
+      if (logical === 'appmodulecomponent') return [{ objectid: SM_ID, componenttype: 62 }];
+      if (logical === 'sitemap') return [{ sitemapxml: SM_XML }];
+      return [];
+    },
+    fetchEntityMetadata: async (logical) => ({
+      schemaName: logical, displayName: 'Item', primaryNameAttribute: `${String(logical).split('_')[0]}_name`,
+    }),
+  }, { appId: APP_ID, layerId: APP_UNIQ_VALUE, sitemapXml: SM_XML });
+  // The page exists and is read, but its data sources are not table names — a blank entry and a number.
+  const genpage = fakeGenpage({ pages: [{ pageId: GP, name: 'Env Page', dataSources: ['', 3] }] });
+
+  try {
+    const refused = await runDownload({ sdk: mkSdk(), genpage, outDir: out, appId: APP_ID, appUnique: APP_UNIQUE });
+    assert.strictEqual(refused.ok, false, `an unreadable config must abort the download; got ${JSON.stringify(refused).slice(0, 300)}`);
+    assert.match(refused.error, /config\.json/, 'the failure names what could not be read');
+    assert.match(refused.error, /non-empty table logical names/, 'and why');
+    assert.match(refused.error, /--allow-lossy-download/, 'and advertises the override');
+    assert.strictEqual(refused.spec, undefined, 'no spec may be produced — emitting one IS the silent loss');
+
+    // With the loss explicitly accepted it completes, warns, and the bindings are simply absent.
+    const warned = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => { warned.push(String(chunk)); return realWrite(chunk, ...rest); };
+    let lossy;
+    try {
+      lossy = await runDownload({ sdk: mkSdk(), genpage, outDir: out, appId: APP_ID, appUnique: APP_UNIQUE, allowLossy: true });
+    } finally { process.stderr.write = realWrite; }
+    assert.strictEqual(lossy.ok, true, `--allow-lossy-download must let it through: ${JSON.stringify(lossy).slice(0, 300)}`);
+    assert.ok(warned.some((w) => /unreadable/i.test(w) && /DROPPED/.test(w)),
+      `the accepted loss must still be announced; saw ${JSON.stringify(warned)}`);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// --- PR review: a MISSING optional file is not an explicitly blank one --------------------------
+// `prompt` used to default to '' for a page with no prompt.txt. The build's blank-provenance guard
+// then read that as "the author supplied an empty prompt" and ABORTED the rebuild — so downloading
+// an app and rebuilding it broke for every page lacking the optional file. Omission must stay
+// omission; a file that EXISTS but is blank stays explicit so it still fails closed.
+test('a page with NO prompt.txt omits prompt entirely, rather than claiming an empty one', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dlprompt-'));
+  const mk = (id, promptBytes) => {
+    const d = path.join(root, id);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'page.tsx'), 'export default () => null;', 'utf8');
+    fs.writeFileSync(path.join(d, 'config.json'), Buffer.from(JSON.stringify({ dataSources: [] }), 'utf8'));
+    if (promptBytes !== undefined) fs.writeFileSync(path.join(d, 'prompt.txt'), promptBytes);
+  };
+  mk('11111111-1111-1111-1111-111111111111');                                  // no prompt.txt
+  mk('22222222-2222-2222-2222-222222222222', Buffer.from('   \n', 'utf8'));    // present, blank
+  mk('33333333-3333-3333-3333-333333333333', Buffer.from('real prompt', 'utf8'));
+
+  const pages = parseDownloadedPages(root, root, null, []);
+  const byId = new Map(pages.map((p) => [p.pageId, p]));
+
+  assert.strictEqual(byId.get('11111111-1111-1111-1111-111111111111').prompt, undefined,
+    'a missing prompt.txt is an OMISSION — the wrapper default applies, the build must not refuse');
+  assert.strictEqual(byId.get('22222222-2222-2222-2222-222222222222').prompt, '   \n',
+    'a present-but-blank file stays explicit, including its whitespace, so the blank-provenance guard still fails closed');
+  assert.strictEqual(byId.get('33333333-3333-3333-3333-333333333333').prompt, 'real prompt');
+
+  // The emitted spec must not carry the key at all for the omitted case — `undefined` is dropped by
+  // JSON.stringify, which is what makes the rebuild use the default rather than refuse.
+  const round = JSON.parse(JSON.stringify(byId.get('11111111-1111-1111-1111-111111111111')));
+  assert.ok(!('prompt' in round), `prompt must be absent from the serialized page; got ${JSON.stringify(round)}`);
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+// `existsSync` returns false for a file that exists but cannot be OPENED, which made an unreadable
+// config indistinguishable from a missing one: the page was emitted with no bindings and never
+// recorded as unreadable, slipping past the --allow-lossy-download gate entirely.
+test('a config that exists but cannot be READ is recorded unreadable, not treated as absent', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dlacl-'));
+  const d = path.join(root, '44444444-4444-4444-4444-444444444444');
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'page.tsx'), 'export default () => null;', 'utf8');
+  // A DIRECTORY named config.json reproduces "exists but unreadable" portably: readFileSync fails
+  // with EISDIR, which is emphatically not ENOENT.
+  fs.mkdirSync(path.join(d, 'config.json'));
+
+  const unreadable = [];
+  const pages = parseDownloadedPages(root, root, null, unreadable);
+  assert.strictEqual(pages.length, 1, 'the page is still emitted');
+  assert.deepStrictEqual(unreadable.map((u) => u.pageId), ['44444444-4444-4444-4444-444444444444'],
+    'an unreadable config must reach the lossy-download gate rather than read as "no bindings"');
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('parseDownloadedPages: a refusal of the fs it reads with (a staging folder found replaced) stops it, never an unreadable config or an absent prompt (#814)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-refused-read-'));
+  try {
+    const d = path.join(root, '55555555-5555-5555-5555-555555555555');
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'page.tsx'), 'export default () => null;', 'utf8');
+    fs.writeFileSync(path.join(d, 'config.json'), '{"dataSources":[]}', 'utf8');
+    fs.writeFileSync(path.join(d, 'prompt.txt'), 'a prompt', 'utf8');
+    for (const file of ['config.json', 'prompt.txt']) {
+      const refusing = { ...fs, readFileSync(p, ...rest) {
+        if (path.basename(String(p)) === file) throw Object.assign(new Error(`refusing to use ${root} as an output directory`), { code: 'UNSAFE_OUTPUT' });
+        return fs.readFileSync(p, ...rest);
+      } };
+      const unreadable = [];
+      assert.throws(() => parseDownloadedPages(root, root, null, unreadable, [], [], refusing), (e) => e.code === 'UNSAFE_OUTPUT', file);
+      assert.deepStrictEqual(unreadable, [], file);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- Task D: downloaded page config and prompt must be exact and fail closed ----------------------
+
+test('parseDownloadedPages treats present malformed dataSources as unreadable config, while absent means unbound', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dlds-shapes-'));
+  try {
+    const mk = (id, config) => {
+      const d = path.join(root, id);
+      fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, 'page.tsx'), 'export default () => null;', 'utf8');
+      if (config !== undefined) fs.writeFileSync(path.join(d, 'config.json'), JSON.stringify(config), 'utf8');
+    };
+    mk('11111111-1111-1111-1111-111111111111', { dataSources: 'contoso_ticket' });
+    mk('22222222-2222-2222-2222-222222222222', { dataSources: null });
+    mk('33333333-3333-3333-3333-333333333333', { dataSources: ['contoso_ticket', 18] });
+    mk('44444444-4444-4444-4444-444444444444', { dataSources: ['contoso_ticket', 'contoso_asset'] });
+    mk('55555555-5555-5555-5555-555555555555', { model: 'm' });
+
+    const unreadable = [];
+    const pages = parseDownloadedPages(root, root, null, unreadable);
+    const byId = new Map(pages.map((p) => [p.pageId, p]));
+    assert.deepStrictEqual(unreadable.map((u) => u.pageId).sort(), [
+      '11111111-1111-1111-1111-111111111111',
+      '22222222-2222-2222-2222-222222222222',
+      '33333333-3333-3333-3333-333333333333',
+    ]);
+    // The reason is shown to the maker, so it must name the problem rather than a JavaScript error
+    // such as "config.dataSources.find is not a function".
+    const reason = (id) => unreadable.find((u) => u.pageId === id).reason;
+    assert.match(reason('11111111-1111-1111-1111-111111111111'), /dataSources is present but is not an array/);
+    assert.match(reason('22222222-2222-2222-2222-222222222222'), /dataSources is present but is not an array/);
+    assert.match(reason('33333333-3333-3333-3333-333333333333'), /non-empty table logical names/);
+    assert.deepStrictEqual(byId.get('44444444-4444-4444-4444-444444444444').dataSources, ['contoso_ticket', 'contoso_asset']);
+    assert.deepStrictEqual(byId.get('55555555-5555-5555-5555-555555555555').dataSources, [], 'an absent key is a valid unbound page');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('parseDownloadedPages keeps downloaded prompt text exact except for a leading BOM', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dlprompt-exact-'));
+  try {
+    const mk = (id, prompt) => {
+      const d = path.join(root, id);
+      fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, 'page.tsx'), 'export default () => null;', 'utf8');
+      fs.writeFileSync(path.join(d, 'config.json'), JSON.stringify({ dataSources: [] }), 'utf8');
+      fs.writeFileSync(path.join(d, 'prompt.txt'), prompt, 'utf8');
+    };
+    const exact = '  Conversation with 1 prompts:\r\n1. Keep surrounding whitespace.\r\n';
+    mk('11111111-1111-1111-1111-111111111111', exact);
+    mk('22222222-2222-2222-2222-222222222222', '\uFEFF' + exact);
+
+    const pages = parseDownloadedPages(root, root, null, []);
+    const byId = new Map(pages.map((p) => [p.pageId, p]));
+    assert.strictEqual(byId.get('11111111-1111-1111-1111-111111111111').prompt, exact);
+    assert.strictEqual(byId.get('22222222-2222-2222-2222-222222222222').prompt, exact, 'only the BOM is stripped');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('complete reads use SDK pagination where truncation would change download decisions', async () => {
+  const calls = [];
+  const sdk = {
+    queryRecords: async (set, opts) => {
+      calls.push({ set, opts });
+      if (set === 'appmodule') return [{ appmoduleidunique: COMPONENT_LAYER_ID }];
+      if (set === 'appmodulecomponent') return [];
+      if (set === 'solution') return [{ solutionid: 'sol-1' }];
+      if (set === 'solutioncomponent') return [];
+      return [];
+    },
+    dataverse: { get: async () => ({ status: 200, body: { value: [] } }) },
+  };
+
+  const current = currentReadSdk(sdk, { appId: COMPONENT_APP_ID, layerId: COMPONENT_LAYER_ID });
+  await appComponentEntities(current, COMPONENT_APP_ID);
+  await readDescriptionInventory(current, COMPONENT_APP_ID, 'ContosoSolution', new Set());
+
+  const appComponentReads = calls.filter((c) => c.set === 'appmodulecomponent');
+  assert.ok(appComponentReads.length >= 4, 'component reads should be exercised');
+  for (const call of appComponentReads) {
+    assert.strictEqual(call.opts.paginate, true, `${call.opts.filter} must paginate`);
+    assert.strictEqual(call.opts.top, undefined, `${call.opts.filter} must not cap with top`);
+  }
+  const solutionComponentReads = calls.filter((c) => c.set === 'solutioncomponent');
+  assert.ok(solutionComponentReads.length >= 1, 'solution component reads should be exercised');
+  for (const call of solutionComponentReads) {
+    assert.strictEqual(call.opts.paginate, true, `${call.opts.filter} must paginate`);
+    assert.strictEqual(call.opts.top, undefined, `${call.opts.filter} must not cap with top`);
+  }
+});
+
+test('runDownload names a custom field security profile on a secured column in a NOTE and its result, and the spec declares no profile', async () => {
+  // A field security profile is shared security policy and no store proves one is this app's, so a download reports it and declares
+  // none: the secured column round-trips (isSecured), the profile and its permissions and holders stay in the environment untouched.
+  const APP_ID = '6444e0f2-0000-4000-8000-000000000001';
+  const APP_UNIQUE = 'new_fsp';
+  const SM_ID = '6444e0f2-0000-4000-8000-000000000002';
+  const HR = '6444e0f2-0000-4000-8000-0000000000f1';
+  const ADMIN = '572329c1-a042-4e22-be47-367c6374ea45';
+  const SM_XML = '<SiteMap><Area Id="A"><Group Id="G"><SubArea Id="S" Entity="new_order" /></Group></Area></SiteMap>';
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-fsp-'));
+  const asked = [];
+  const sdk = {
+    fetchArtifact: async () => ({
+      id: APP_ID, name: 'Fsp', uniquename: APP_UNIQUE, description: '',
+      siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'Entity', entity: 'new_order' }] }] }] },
+    }),
+    queryRecords: async (logical, opts) => {
+      const filter = (opts && opts.filter) || '';
+      if (logical === 'appmodule') return [{ appmoduleid: APP_ID, appmoduleidunique: APP_ID, uniquename: APP_UNIQUE }];
+      if (logical === 'appmodulecomponent') return /componenttype eq 62/.test(filter) ? [{ objectid: SM_ID, componenttype: 62 }] : [];
+      if (logical === 'sitemap') return [{ sitemapxml: SM_XML }];
+      if (logical === 'fieldpermission') {
+        asked.push({ logical, ...opts });
+        return /entityname eq 'new_order'/.test(filter) && /attributelogicalname eq 'new_salary'/.test(filter)
+          ? [{ _fieldsecurityprofileid_value: ADMIN }, { _fieldsecurityprofileid_value: HR }] : [];
+      }
+      if (logical === 'fieldsecurityprofile') {
+        asked.push({ logical, ...opts });
+        return [{ fieldsecurityprofileid: HR, name: 'HR' }].filter((p) => filter.includes(p.fieldsecurityprofileid));
+      }
+      return [];
+    },
+    fetchEntityMetadata: async (logical) => ({
+      logicalName: logical, schemaName: 'new_order', displayName: 'Order', primaryNameAttribute: 'new_name',
+      attributes: [
+        { logicalName: 'new_name', displayName: 'Name', attributeType: 'String', isCustomAttribute: true },
+        { logicalName: 'new_salary', displayName: 'Salary', attributeType: 'String', isCustomAttribute: true, isSecured: true },
+      ],
+      relationships: [],
+    }),
+    dataverse: { get: async () => ({ status: 404, headers: {}, body: {} }) },
+  };
+  const origWrite = process.stderr.write.bind(process.stderr);
+  const written = [];
+  process.stderr.write = (chunk, ...rest) => { written.push(String(chunk)); return origWrite(chunk, ...rest); };
+  let res;
+  try {
+    res = await runDownload({ sdk: currentReadSdk(sdk, { appId: APP_ID, layerId: APP_ID, sitemapXml: SM_XML }), genpage: fakeGenpage(), outDir: out, appId: APP_ID, appUnique: APP_UNIQUE });
+  } finally {
+    process.stderr.write = origWrite;
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+  assert.strictEqual(res.ok, true, res.error);
+  const note = written.join('').split('\n').find((l) => /field security profile/.test(l)) || '';
+  assert.match(note, /^NOTE: 1 field security profile \(HR\) is not declared in fieldSecurityProfiles\[\]: .*a rebuild neither changes nor recreates it/);
+  assert.doesNotMatch(written.join(''), /System Administrator/);
+  assert.deepStrictEqual(res.fieldSecurityProfiles, { omitted: [{ kind: 'fieldSecurityProfile', id: HR, name: 'HR', code: 'ownership-unproven', reason: 'no binding store record proves this app authored it, so it is not declared' }] });
+  // The spec: the column stays secured; no profile, permission or holder; and the inventory key stays out of descriptionInventory.
+  assert.strictEqual(res.spec.entities[0].columns.find((c) => c.schemaName === 'new_salary').isSecured, true);
+  assert.ok(!('fieldSecurityProfiles' in res.spec));
+  assert.ok(!res.spec.descriptionInventory || !('fieldSecurityProfiles' in res.spec.descriptionInventory));
+  assert.doesNotMatch(JSON.stringify(res.spec), new RegExp(`${HR}|${ADMIN}`));
+  assert.deepStrictEqual(asked.map((q) => [q.logical, q.select]), [['fieldpermission', ['_fieldsecurityprofileid_value']], ['fieldsecurityprofile', ['fieldsecurityprofileid', 'name']]]);
+});

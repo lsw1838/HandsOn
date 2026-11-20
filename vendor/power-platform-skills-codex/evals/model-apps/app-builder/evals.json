@@ -1,0 +1,662 @@
+{
+  "skill_name": "app-builder",
+  "eval_instructions": "Offline, deterministic structural evals for /app-builder. See EVAL_GUIDE.md. Each eval's fixture is an App Spec (app-spec.json); the runner computes per-stage facts (author/plan/data/ui/app/verify/page) from the plugin's pure primitives and grades them against the common_stage_assertions + per-eval expect block. No live env, no network.",
+  "common_stage_assertions": [
+    "author: validateAppSpec(plan profile) passes with no errors",
+    "author: spec-lint reports no errors",
+    "author: page quote warnings remain visible without rewriting approved names",
+    "plan: every planned item targets a known engine phase",
+    "security: the plan authors exactly one role per declared persona",
+    "security: each app-access persona role injects app-module read; opted-out personas do not",
+    "design: every mapped persona job resolves to a surface that exists",
+    "design: every custom table icon is described by what it depicts, not a token name",
+    "security: every persona privilege on an app-owned table resolves to a provisioned entity",
+    "security: each persona role grants exactly its declared job privileges (no over-grant)",
+    "data: schema-facts provision exactly the expected tables",
+    "data: schema-facts provision exactly the expected relationships",
+    "ui: wire-facts build exactly the expected views and charts",
+    "ui: explicit container names display flags and field state match authored intent",
+    "app: every sitemap subarea resolves to a concrete target (no dangling entity/page/dashboard)",
+    "app: every navigatesTo target resolves to a known page key",
+    "verify: reconcile against an all-present reader returns ok with no missing",
+    "verify: every required check kind actually ran",
+    "verify: served Main form order is checked or explicitly unavailable",
+    "generate-pages: no PAGEREF_ navigation target is left unresolved",
+    "teardown: the solution container is deleted last",
+    "teardown: every declared table has a teardown step",
+    "teardown: web resources are deleted after tables",
+    "round-trip: download hydrate recovers the same solution and tables",
+    "round-trip: the sitemap round-trips with the same subareas",
+    "round-trip: generative pages preserve their keys",
+    "round-trip: generative pages preserve their names and models",
+    "round-trip: authored directEntry survives unchanged",
+    "teardown: every declared dashboard has a teardown step",
+    "teardown: every declared command bar has a teardown step",
+    "teardown: every declared business rule and process flow has a teardown step",
+    "process: every business rule binds only columns the spec creates",
+    "process: every business rule compiles at least one condition and one action",
+    "process: every BPF step binds a field on the flow entity",
+    "process: every BPF stage is scoped to the flow entity (v1 is single-entity)",
+    "ui: enriched default views keep parent lookups and drop createdon",
+    "ui: each sub-grid is a full-width section titled by the child display name",
+    "ui: every compiled form places each field exactly once",
+    "ui: every compiled form places exactly the fields it intends to carry",
+    "round-trip: a lookup's shadow columns are never recovered as spec columns (#574)",
+    "round-trip: a download recovers no column the spec never authored",
+    "author: an optional capability is in the spec only when the prompt asks for it, and each one it asks for is authored as expected"
+  ],
+  "evals": [
+    {
+      "id": 1,
+      "tier": "smoke",
+      "spec": "app-spec.json",
+      "prompt": "Support desk: customers, tickets, and comments.",
+      "expect": {
+        "tables": [
+          "new_customer",
+          "new_ticket",
+          "new_comment"
+        ],
+        "relationships": [
+          "new_customer_new_ticket",
+          "new_ticket_new_comment"
+        ],
+        "views": [
+          "Active Customers",
+          "Active Tickets",
+          "Active Comments"
+        ],
+        "charts": [
+          "Tickets by Priority",
+          "Tickets by Status"
+        ]
+      },
+      "expectations": []
+    },
+    {
+      "id": 2,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Orders app with an overview page that navigates to an order-detail page.",
+      "expect": {
+        "tables": [
+          "new_customer",
+          "new_order"
+        ],
+        "relationships": [
+          "new_customer_new_order"
+        ],
+        "views": [
+          "Active Orders"
+        ],
+        "charts": [
+          "Orders by Status"
+        ],
+        "pages": [
+          "overview",
+          "order-detail"
+        ]
+      },
+      "expectations": []
+    },
+    {
+      "id": 3,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Assets app with a shared status choice, an on-click command, and an operations dashboard pinned to the nav.",
+      "expect": {
+        "tables": [
+          "new_asset"
+        ],
+        "relationships": [],
+        "views": [
+          "Active Assets"
+        ],
+        "charts": [
+          "Assets by Status"
+        ]
+      },
+      "expectations": []
+    },
+    {
+      "id": 4,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Hardening: a lookup-heavy ticket table, an N:N to tags, a sub-grid, and valid relational sample data — exercises fixes #1/#2/#3/#4/#5/#7.",
+      "expect": {
+        "tables": [
+          "new_customer",
+          "new_ticket",
+          "new_tag"
+        ],
+        "relationships": [
+          "new_customer_new_ticket",
+          "new_tag_new_ticket"
+        ],
+        "views": [
+          "Open Tickets"
+        ],
+        "charts": []
+      },
+      "expectations": [
+        "the ticket default view keeps new_customerid even though the table has 8 scalar columns (#2)",
+        "no enriched default view carries createdon (#7)",
+        "the N:N relationship name is the alphabetically-sorted new_tag_new_ticket (#3)",
+        "the customer form's ticket sub-grid is a 1-column full-width section titled 'Tickets' from the child pluralName (#5)",
+        "validateAppSpec accepts the relational sample data: the $parent match resolves and the Choice labels are declared (#1/#4)",
+        "quick create is enabled on the new_ticket table (#8)"
+      ]
+    },
+    {
+      "id": 5,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Process logic: a case table worked through a staged business process flow, with two business rules gating its fields — exercises businessProcessFlows[] and businessRules[].",
+      "expect": {
+        "tables": [
+          "new_customer",
+          "new_case"
+        ],
+        "relationships": [
+          "new_customer_new_case"
+        ],
+        "views": [
+          "Open Cases"
+        ],
+        "charts": []
+      },
+      "expectations": [
+        "the BPF stage order is Intake, Investigate, Resolve and every step binds a declared column",
+        "the BPF binds the relationship lookup new_accountref, not just the case table’s own columns",
+        "a rule with two conditions compiles both, ANDed, and neither is dropped",
+        "every business rule and the process flow each get exactly one teardown step"
+      ]
+    },
+    {
+      "id": 6,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Delivery: projects and work items on hand-authored forms — a two-form-column tab with 65/35 widths, two-column sections, a full-width title, a collapsed tab, and a polymorphic Customer lookup.",
+      "expect": {
+        "tables": [
+          "new_project",
+          "new_workitem"
+        ],
+        "relationships": [
+          "new_project_new_workitem"
+        ],
+        "views": [
+          "Active Projects",
+          "Open Work Items"
+        ],
+        "charts": [
+          "Work Items by Status"
+        ]
+      },
+      "expectations": [
+        "ui: an explicit layout compiles to the authored tab, form-column and section topology (it is not flattened)",
+        "ui: an authored colspan and rowspan survive into the compiled cell"
+      ]
+    },
+    {
+      "id": 7,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Reconcile a delivery form: insert Intake, reorder the Details and Administration tabs and the Notes and Execution sections, hide containers and fields, keep read-only state, split omitted column widths equally, preserve the Project Quick View, and serve Work Item before Work Item Review.",
+      "expect": {
+        "tables": ["cnt_project", "cnt_workitem"],
+        "relationships": ["cnt_project_cnt_workitem"],
+        "views": [],
+        "charts": [],
+        "formReconcile": {
+          "entity": "cnt_workitem",
+          "form": "Work Item",
+          "beforeTabs": ["tab_admin", "tab_details"],
+          "afterTabs": ["tab_intake", "tab_details", "tab_admin"],
+          "insertedTabs": ["tab_intake"],
+          "sectionTab": "tab_details",
+          "beforeSections": ["section_execution", "section_notes"],
+          "afterSections": ["section_notes", "section_execution"],
+          "beforeMainFormOrder": ["Work Item Review", "Work Item"],
+          "afterMainFormOrder": ["Work Item", "Work Item Review"],
+          "quickViews": 1
+        }
+      },
+      "expectations": [
+        "ui: an explicit layout compiles to the authored tab, form-column and section topology (it is not flattened)",
+        "ui: an authored colspan and rowspan survive into the compiled cell",
+        "verify: form reconciliation exercises an inserted tab and reordered existing containers",
+        "verify: Quick View bindings survive form reconciliation"
+      ]
+    },
+    {
+      "id": 8,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Download order pages whose own names differ from their sitemap titles. Unescape the PAC-stored Revenue \\\"FY\\\" name, preserve its gpt-4.1 model and table source, leave an absent model absent, and omit an invalid model with an explicit diagnostic.",
+      "expect": {
+        "tables": ["cnt_order"],
+        "relationships": [],
+        "views": [],
+        "charts": [],
+        "pages": ["revenue", "help", "archive"],
+        "unkeptModels": [
+          { "pageId": "00000000-0000-0000-0000-000000000803", "model": "model with spaces" }
+        ]
+      },
+      "expectations": [
+        "round-trip: invalid downloaded models are omitted with explicit diagnostics"
+      ]
+    },
+    {
+      "id": 9,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Compare an identity-bound last-applied Orders baseline with edited page bytes. Only overview changed: classify a fast re-upload of that page alone. Adding cnt_priority instead requires a full data-model build, and comparing identical spec and source bytes must report noop.",
+      "expect": {
+        "tables": ["cnt_order"],
+        "relationships": [],
+        "views": [],
+        "charts": [],
+        "pages": ["overview", "detail"],
+        "changedOnly": [
+          { "name": "page-only", "verdict": "fast", "changedPhases": ["pages"],
+            "fastChanges": [{ "shape": "page", "phase": "pages", "identity": "overview" }], "fullReasons": [] },
+          { "name": "column-edit", "verdict": "full", "changedPhases": ["data-model"],
+            "fastChanges": [], "fullReasons": ["data-model: changed"] },
+          { "name": "identical", "verdict": "noop", "changedPhases": [], "fastChanges": [], "fullReasons": [] }
+        ]
+      },
+      "expectations": [
+        "changed-only: page bytes use a page-only fast path data-model edits use full and identical inputs are noop"
+      ]
+    },
+    {
+      "id": 10,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Give Orders and Tickets the same Information form, Queue view, and Status Summary chart names without cross-table duplicate warnings. Preserve approved page names verbatim: warn for Revenue \"FY\", but not for Clerk's Queue or Revenue \u201cFY\u201d. Same-table duplicates remain invalid for this fixture.",
+      "expect": {
+        "tables": ["cnt_order", "cnt_ticket"],
+        "relationships": [],
+        "views": ["Queue", "Queue"],
+        "charts": ["Status Summary", "Status Summary"],
+        "pages": ["straight-quote", "apostrophe", "typographic"],
+        "nameScope": [
+          { "kind": "form", "name": "Information", "formType": "Main", "entities": ["cnt_order", "cnt_ticket"] },
+          { "kind": "view", "name": "Queue", "entities": ["cnt_order", "cnt_ticket"] },
+          { "kind": "chart", "name": "Status Summary", "entities": ["cnt_order", "cnt_ticket"] }
+        ]
+      },
+      "expectations": [
+        "author: artifact-name warnings use per-table and form-type scope"
+      ]
+    },
+    {
+      "id": 11,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Shipments carry a Region from a shared choice whose numbers an integration depends on (North 1, South 2, Export 10), a bilingual Priority whose numbers must not change between environments (Low 1, High 5), and a Stage whose Held option must stay 100000005. The High Priority view filters on Priority 5.",
+      "expect": { "tables": ["cnt_shipment"], "relationships": [], "views": ["High Priority"], "charts": [], "pages": [],
+        "viewFilters": [{ "entity": "cnt_shipment", "view": "High Priority", "attr": "cnt_priority", "op": "eq", "value": 5 }],
+        "optionValues": { "cnt_region": { "1": "North", "2": "South", "10": "Export" }, "cnt_shipment.cnt_priority": { "1": "Low", "5": "High" }, "cnt_shipment.cnt_stage": { "100000005": "Held" } } },
+      "expectations": [
+        "author: option values the maker depends on are written as { value, label } and the spec asks for 2.21.0",
+        "ui: a view filter the prompt names is built from filters[] attr/op/value"
+      ]
+    },
+    {
+      "id": 12,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Contracts have a renewal date and a signed-on date that are calendar days, a site kickoff time that must read the same clock everywhere, a last-contact time shown in each user's own time zone, and a reviewed timestamp.",
+      "expect": { "tables": ["cnt_contract"], "relationships": [], "views": ["Renewals"], "charts": [], "pages": [],
+        "dateTimeBehavior": { "cnt_contract.cnt_renewaldate": "DateOnly", "cnt_contract.cnt_signedon": "DateOnly", "cnt_contract.cnt_kickoff": "TimeZoneIndependent", "cnt_contract.cnt_lastcontact": "UserLocal", "cnt_contract.cnt_reviewed": "UserLocal" } },
+      "expectations": [
+        "author: calendar days use DateOnly, a same-clock time uses TimeZoneIndependent, a per-user time is UserLocal or omitted"
+      ]
+    },
+    {
+      "id": 13,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Employee salary and medical notes are confidential: the HR team (team id 11111111-1111-4111-8111-111111111111) may read and update them, and may also enter medical notes on a new employee; Payroll may read salary but nobody is named for it yet.",
+      "expect": { "tables": ["cnt_employee"], "relationships": [], "views": ["Directory"], "charts": [], "pages": [],
+        "fieldSecurity": { "secured": ["cnt_employee.cnt_salary", "cnt_employee.cnt_medicalnotes"], "assigned": ["hr"], "unassigned": ["payroll"],
+          "grants": { "hr": { "cnt_employee.cnt_salary": ["read", "update"], "cnt_employee.cnt_medicalnotes": ["create", "read", "update"] }, "payroll": { "cnt_employee.cnt_salary": ["read"] } },
+          "principals": { "hr": { "teams": ["11111111-1111-4111-8111-111111111111"] } } } },
+      "expectations": [
+        "author: confidential columns are isSecured with explicit profiles; assignees are named, never inferred, and an unassigned profile says so"
+      ]
+    },
+    {
+      "id": 14,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "This app should only show the Summary form for Items.",
+      "expect": { "tables": ["contoso_item"], "relationships": [], "views": ["All Items"], "charts": [], "pages": [],
+        "appMembership": { "mainForms": { "contoso_item": ["Summary"] }, "mainFormsOnUpdate": "exact" } },
+      "expectations": [
+        "author: \"only these forms\" lists them in app.mainForms with mainFormsOnUpdate \"exact\"; \"add a form\" never asks for exact"
+      ]
+    },
+    {
+      "id": 15,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A new Project Costs app: projects in the navigation, plus a chart of expenses by category in the app.",
+      "expect": { "tables": ["cnt_project", "cnt_expense"], "relationships": [], "views": ["Active Projects"], "charts": ["Expenses by Category"], "pages": [],
+        "appMembership": { "pinDeclaredArtifacts": true, "offNavigation": ["cnt_expense"] } },
+      "expectations": [
+        "author: a new app with a chart or view of a table outside its navigation pins the declared artifacts"
+      ]
+    },
+    {
+      "id": 16,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A new Help Desk app: tickets that users find by ticket number, customers they find by email, a list of open tickets that shows each ticket's customer name, and a chart of tickets by priority.",
+      "expect": {
+        "tables": [
+          "cnt_customer",
+          "cnt_ticket"
+        ],
+        "relationships": [
+          "cnt_customer_cnt_ticket"
+        ],
+        "views": [
+          "Open Tickets",
+          "Customer Directory"
+        ],
+        "charts": [
+          "Tickets by Priority"
+        ],
+        "pages": [],
+        "quickFind": {
+          "cnt_ticket": [
+            "cnt_ticketnumber"
+          ],
+          "cnt_customer": [
+            "cnt_email"
+          ]
+        },
+        "linkEntities": {
+          "cnt_ticket/Open Tickets": [
+            "cnt_customer"
+          ]
+        }
+      },
+      "expectations": [
+        "author: every view and chart of a new app is declared, and no other kind carries reconcile or a command key",
+        "author: each new table searches on its primary name plus the identifiers the prompt names",
+        "author: a column from a related table joins that table on the view that shows it, and only there"
+      ]
+    },
+    {
+      "id": 17,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "Declared web resource: the process-logic case app, where the maker asked the build to keep one HTML web resource's content in step with the spec on every rebuild — exercises reconcile: \"declared\" on webResources[].",
+      "expect": {
+        "tables": ["new_customer", "new_case"],
+        "relationships": ["new_customer_new_case"],
+        "views": ["Open Cases"],
+        "charts": [],
+        "declaredWebResources": ["new_casebanner"]
+      },
+      "expectations": [
+        "the BPF stage order is Intake, Investigate, Resolve and every step binds a declared column",
+        "the BPF binds the relationship lookup new_accountref, not just the case table’s own columns",
+        "a rule with two conditions compiles both, ANDed, and neither is dropped",
+        "every business rule and the process flow each get exactly one teardown step",
+        "author: a web resource the maker asked to keep in step is declared, never shared, and is the only kind besides views and charts that carries reconcile"
+      ]
+    },
+    {
+      "id": 18,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A Field Requests app, shipped as version 1.2.0.0: requests with a title, a requester email and a priority. It calls our dispatch service, whose base URL and API key differ per environment (the key is a secret), sends field notices through SharePoint, offers an Escalate action on a request that takes a reason and answers whether it was accepted, and flags requests that have the same requester email.",
+      "expect": {
+        "tables": [
+          "contoso_request"
+        ],
+        "relationships": [],
+        "views": [
+          "Open Requests"
+        ],
+        "charts": [],
+        "pages": [],
+        "configuration": {
+          "solutionVersion": "1.2.0.0",
+          "environmentVariables": [
+            "contoso_DispatchApiBase",
+            "contoso_DispatchApiKey"
+          ],
+          "secrets": [
+            "contoso_DispatchApiKey"
+          ],
+          "connectionReferences": [
+            "contoso_sharepoint"
+          ],
+          "customApis": [
+            "contoso_EscalateRequest"
+          ],
+          "duplicateDetectionRules": [
+            "contoso_request"
+          ]
+        }
+      },
+      "expectations": [
+        "author: each configuration item the prompt needs is declared, and no value that differs per environment is in the spec"
+      ]
+    },
+    {
+      "id": 19,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A new Field Visits app for site visits, branded: Contoso blue (#0F6CBD), a dark blue header with white text, and our Contoso logo in the header.",
+      "expect": {
+        "tables": [
+          "cnt_visit"
+        ],
+        "relationships": [],
+        "views": [
+          "Upcoming Visits"
+        ],
+        "charts": [],
+        "pages": [],
+        "appTheme": {
+          "basePaletteColor": "#0F6CBD",
+          "appHeader": {
+            "background": "#0F3D6E",
+            "foreground": "#FFFFFF"
+          },
+          "logo": true
+        }
+      },
+      "expectations": [
+        "author: a theme is declared only on an explicit branding ask, with the asked colours, no unasked font, and a declared image web resource as the logo, never a URL",
+        "verify: a declared app theme is read back once, as API state, and passes only when live"
+      ]
+    },
+    {
+      "id": 20,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A new Equipment Loans app: loans of equipment to staff with a status and a due date, a list of open loans and a chart of loans by status.",
+      "expect": {
+        "tables": [
+          "cnt_loan"
+        ],
+        "relationships": [],
+        "views": [
+          "Open Loans"
+        ],
+        "charts": [
+          "Loans by Status"
+        ],
+        "pages": [],
+        "createIdentity": "stable-v1"
+      },
+      "expectations": [
+        "author: a new app opts into stable create ids with the 2.21.0 floor, and a downloaded or existing spec never gains them",
+        "author: the skill tells the maker that an unsent local edit stops a stable build and running again does not merge it"
+      ]
+    },
+    {
+      "id": 21,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A Site Inspections app: sites with their inspections and open issues. Lay out the site form myself and keep it that way on every rebuild: the name across the full width, the site code read-only, the region shown, the address two rows tall, a grid of inspections and a grid of issues, and run Site.onLoad from cnt_site.js when it opens.",
+      "expect": {
+        "tables": [
+          "cnt_site",
+          "cnt_inspection",
+          "cnt_issue"
+        ],
+        "relationships": [
+          "cnt_site_cnt_inspection",
+          "cnt_site_cnt_issue"
+        ],
+        "views": [
+          "Sites by Region"
+        ],
+        "charts": [],
+        "pages": [],
+        "declared": {
+          "forms": { "tables": ["cnt_site"] }
+        }
+      },
+      "expectations": [
+        "ui: an explicit layout compiles to the authored tab, form-column and section topology (it is not flattened)",
+        "ui: an authored colspan and rowspan survive into the compiled cell"
+      ]
+    },
+    {
+      "id": 22,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A Field Ops app for work orders with a Field Operations dashboard: a wide list of open work orders, a chart of work orders by status and a tall crew map from https://contoso.example/field-map. Keep its tiles the way the spec says on every rebuild, but leave any tile I add in Maker alone.",
+      "expect": {
+        "tables": [
+          "cnt_workorder"
+        ],
+        "relationships": [],
+        "views": [
+          "Open Work Orders"
+        ],
+        "charts": [
+          "Work Orders by Status"
+        ],
+        "pages": [],
+        "declared": {
+          "dashboards": { "minCount": 1 }
+        },
+        "declaredDashboards": [
+          {
+            "tiles": [
+              { "type": "list", "entity": "cnt_workorder", "view": "Open Work Orders", "minColspan": 2 },
+              { "type": "chart", "entity": "cnt_workorder", "chart": "Work Orders by Status" },
+              { "type": "iframe", "url": "https://contoso.example/field-map", "minRowspan": 13 }
+            ]
+          }
+        ]
+      },
+      "expectations": [
+        "process: a declared dashboard holds exactly the tiles the prompt describes, each bound to the view, chart or address it names and sized as asked"
+      ]
+    },
+    {
+      "id": 23,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A Service Desk app for service requests. Keep two business rules the way the spec says on every rebuild: a closed request needs a resolution and its notes lock, and a request in progress with no assignee shows an error on every form.",
+      "expect": {
+        "tables": [
+          "cnt_request"
+        ],
+        "relationships": [],
+        "views": [
+          "Open Requests"
+        ],
+        "charts": [],
+        "pages": [],
+        "declared": {
+          "businessRules": { "tables": ["cnt_request"], "minCount": 2 }
+        },
+        "declaredRules": [
+          {
+            "when": [{ "field": "cnt_status", "operator": "Equals", "option": "Closed" }],
+            "do": [
+              { "type": "SetBusinessRequired", "field": "cnt_resolution", "required": true },
+              { "type": "LockUnlock", "field": "cnt_notes", "lock": true }
+            ]
+          },
+          {
+            "when": [
+              { "field": "cnt_status", "operator": "Equals", "option": "In Progress" },
+              { "field": "cnt_assignee", "operator": "DoesNotContainData" }
+            ],
+            "logic": "AND",
+            "scope": "AllForms",
+            "do": [{ "type": "ShowErrorMessage", "hasMessage": true }]
+          }
+        ]
+      },
+      "expectations": [
+        "process: each declared business rule has the condition, scope and actions the prompt describes"
+      ]
+    },
+    {
+      "id": 24,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A Claims Desk app for insurance claims. Keep its process flow the way the spec says on every rebuild: a claim moves through intake, assessment and a decision, and renaming a stage must not move the claims already on it.",
+      "expect": {
+        "tables": [
+          "cnt_claim"
+        ],
+        "relationships": [],
+        "views": [
+          "Open Claims"
+        ],
+        "charts": [],
+        "pages": [],
+        "declared": {
+          "businessProcessFlows": { "tables": ["cnt_claim"] }
+        },
+        "declaredFlows": [
+          { "stages": [{ "pattern": "intake" }, { "pattern": "assess" }, { "pattern": "decision|decide" }] }
+        ]
+      },
+      "expectations": [
+        "process: a declared process flow has exactly the stages the prompt names, in order"
+      ]
+    },
+    {
+      "id": 25,
+      "tier": "full",
+      "spec": "app-spec.json",
+      "prompt": "A new Parts Counter app: parts with a stock level and a price, and a list of all parts. No branding, no outside services or per-environment settings, no business rules or process flows, and no fixed form or dashboard layouts.",
+      "expect": {
+        "tables": [
+          "cnt_part"
+        ],
+        "relationships": [],
+        "views": [
+          "All Parts"
+        ],
+        "charts": [],
+        "pages": [],
+        "configuration": {},
+        "noBusinessLogic": true
+      },
+      "expectations": [
+        "author: each configuration item the prompt needs is declared, and no value that differs per environment is in the spec",
+        "author: a theme is declared only on an explicit branding ask, with the asked colours, no unasked font, and a declared image web resource as the logo, never a URL",
+        "author: a maker who declines business rules and process flows gets no rule and no flow of any kind"
+      ]
+    }
+  ]
+}

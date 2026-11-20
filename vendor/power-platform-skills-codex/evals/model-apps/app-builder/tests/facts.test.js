@@ -1,0 +1,1417 @@
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert');
+const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
+const { spawnSync } = require('node:child_process');
+const { stageFacts, makeAllPresentReader } = require('../lib/facts.js');
+const { ASSERTIONS } = require('../lib/assertions.js');
+const { loadFixtures } = require('../lib/fixture-loader.js');
+const evalsManifest = require('../evals.json');
+
+function fixtureFor(id) {
+  const fixture = loadFixtures(path.join(__dirname, '..', 'fixtures')).find((f) => f.id === id);
+  assert.ok(fixture, `fixture ${id} exists`);
+  return fixture;
+}
+
+function score(text, facts, fixture) {
+  const check = ASSERTIONS.get(text);
+  assert.strictEqual(typeof check, 'function', `registered assertion: ${text}`);
+  return check({ facts, spec: fixture.spec, eval: evalsManifest.evals.find((e) => e.id === fixture.id) });
+}
+
+// A minimal but valid schemaVersion:2 spec covering all stage primitives: one entity with a
+// Choice column, a view, a chart, a form, an intent page (no .tsx), and a sitemap subarea for each.
+// The page key and display name intentionally differ: v2 sitemap references use the stable key.
+const spec = {
+  schemaVersion: 2,
+  solution: { uniqueName: 'S', publisherPrefix: 'new' },
+  app: { name: 'T', description: '' },
+  entities: [{
+    schemaName: 'new_order', displayName: 'Order',
+    primaryAttribute: { schemaName: 'new_name', displayName: 'Name' },
+    columns: [{ schemaName: 'new_status', displayName: 'Status', type: 'Choice', options: ['New', 'Done'] }],
+  }],
+  views: [{ entity: 'new_order', name: 'Active Orders', columns: ['new_name', 'new_status'], activeOnly: true }],
+  charts: [{ entity: 'new_order', name: 'Orders by Status', groupBy: 'new_status', measure: 'count', chartType: 'Pie' }],
+  forms: [{ entity: 'new_order', type: 'main', name: 'Order', layout: 'auto' }],
+  pages: [{ key: 'overview', name: 'Overview', source: { kind: 'intent' }, navigatesTo: [{ targetKey: 'overview' }] }],
+  appShell: { areas: [{ label: 'M', groups: [{ label: 'G', subAreas: [
+    { entity: 'new_order', title: 'Orders' },
+    { page: 'overview', title: 'Overview' },
+  ] }] }] },
+};
+
+test('stageFacts.author validates under the plan profile and lints clean', async () => {
+  const f = await stageFacts(spec);
+  assert.strictEqual(f.author.validate.ok, true, JSON.stringify(f.author.validate.errors));
+  assert.strictEqual(f.author.lint.errors.length, 0, JSON.stringify(f.author.lint.errors));
+});
+
+test('stageFacts.data/ui expose normalized structural facts', async () => {
+  const f = await stageFacts(spec);
+  assert.deepStrictEqual(f.data.tables.map((t) => t.logicalName), ['new_order']);
+  assert.deepStrictEqual(f.ui.views.map((v) => v.name), ['Active Orders']);
+  assert.deepStrictEqual(f.ui.charts.map((c) => c.name), ['Orders by Status']);
+  assert.ok(f.ui.forms[0].fields.includes('new_name'), 'primary field placed in form');
+});
+
+test('stageFacts.app resolves every sitemap subarea and reports no dangling nav', async () => {
+  const f = await stageFacts(spec);
+  const refs = f.app.areas.flatMap((a) => a.groups.flatMap((g) => g.subAreas.map((s) => s.ref)));
+  assert.ok(refs.every((r) => r), `all subareas should have a resolved ref; got ${JSON.stringify(refs)}`);
+  // overview→overview: targetKey "overview" matches p.key "overview" → not dangling.
+  assert.deepStrictEqual(f.app.danglingNav, []);
+});
+
+test('stageFacts.plan groups items by known engine phase; verify runs offline', async () => {
+  const f = await stageFacts(spec);
+  assert.ok(f.plan.phases.every((p) => f.PHASES.includes(p)), `unknown phase in plan: ${f.plan.phases.filter((p) => !f.PHASES.includes(p))}`);
+  assert.strictEqual(f.verify.ok, true, `unexpected verify result: ${JSON.stringify(f.verify)}`);
+  assert.deepStrictEqual(f.verify.missing, []);
+});
+
+test('verification exceptions fail the eval rather than skip', async () => {
+  const layoutSpec = require('../fixtures/6-form-layout/app-spec.json');
+  const check = ASSERTIONS.get('verify: reconcile against an all-present reader returns ok with no missing');
+  const positive = await stageFacts(layoutSpec);
+  assert.strictEqual(check({ facts: positive }).status, 'pass');
+
+  const throwingVerifier = await stageFacts(layoutSpec, {
+    verifier: async () => { throw new Error('verifier regression'); },
+  });
+  assert.strictEqual(throwingVerifier.verify.ok, false);
+  assert.strictEqual(throwingVerifier.verify.skipped, undefined);
+  const failure = check({ facts: throwingVerifier });
+  assert.strictEqual(failure.status, 'fail');
+  assert.match(failure.reason, /verifier regression/);
+
+  const reader = makeAllPresentReader(layoutSpec);
+  reader.formTopology = async () => { throw new Error('topology read regression'); };
+  const throwingReader = await stageFacts(layoutSpec, { verifyReader: reader });
+  assert.strictEqual(throwingReader.verify.ok, false);
+  assert.strictEqual(check({ facts: throwingReader }).status, 'fail');
+  assert.ok(throwingReader.verify.missing.some((m) => /topology read regression/.test(m.detail)));
+
+  // Isolate the injected plugin export in a child process: a scorer failure must also reach the
+  // runner's exit code, without altering the production module or another test's require cache.
+  const runner = path.join(__dirname, '..', 'run-app-builder.js');
+  const verifierPath = path.join(__dirname, '..', '..', '..', '..', 'plugins', 'model-apps', 'scripts', 'lib', 'verify-spec.js');
+  const child = spawnSync(process.execPath, ['-e', `
+    require(${JSON.stringify(verifierPath)}).verifySpec = async () => { throw new Error('verifier regression'); };
+    process.argv = [process.execPath, ${JSON.stringify(runner)}, '--eval', '6'];
+    require(${JSON.stringify(runner)}).main();
+  `], { encoding: 'utf8' });
+  assert.strictEqual(child.status, 1, child.stdout + child.stderr);
+  assert.match(child.stdout, /not ok \d+ - verify: reconcile against an all-present reader/);
+  assert.match(child.stdout, /verifier regression/);
+
+  const malformed = await stageFacts(layoutSpec, { verifier: async () => ({ skipped: 'unspecified optional extension' }) });
+  assert.strictEqual(check({ facts: malformed }).status, 'fail', 'a skip-shaped result is not required verification');
+  const noTopology = makeAllPresentReader(layoutSpec);
+  delete noTopology.formTopology;
+  const absentReader = await stageFacts(layoutSpec, { verifyReader: noTopology });
+  assert.strictEqual(check({ facts: absentReader }).status, 'fail', 'topology is required, unlike the served-order capability');
+  assert.match(check({ facts: absentReader }).reason, /UNVERIFIED/);
+});
+
+test('verification requires each applicable check kind, not just an ok flag', async () => {
+  const f = await stageFacts(require('../fixtures/6-form-layout/app-spec.json'));
+  const check = ASSERTIONS.get('verify: every required check kind actually ran');
+  assert.strictEqual(typeof check, 'function', 'the required-check assertion is registered');
+  assert.strictEqual(check({ facts: f }).status, 'pass');
+  for (const kind of ['entity', 'column', 'view', 'chart', 'form', 'form-order', 'form-topology', 'form-order-served']) {
+    assert.ok(f.verify.requiredChecks[kind] > 0, `${kind} is required by fixture 6`);
+    const drifted = structuredClone(f);
+    drifted.verify.checks = drifted.verify.checks.filter((c) => c.kind !== kind);
+    const result = check({ facts: drifted });
+    assert.strictEqual(result.status, 'fail', `${kind} cannot silently stop running`);
+    assert.ok(result.reason.includes(kind), result.reason);
+  }
+  const empty = structuredClone(f);
+  empty.verify.checks = [];
+  assert.strictEqual(check({ facts: empty }).status, 'fail', 'ok:true with no checks is not verification');
+});
+
+test('an unavailable optional served-form reader is a named skip, never a verifier-error skip', async () => {
+  const layoutSpec = require('../fixtures/6-form-layout/app-spec.json');
+  const check = ASSERTIONS.get('verify: served Main form order is checked or explicitly unavailable');
+  assert.strictEqual(typeof check, 'function', 'the optional capability assertion is registered');
+  const positive = await stageFacts(layoutSpec);
+  assert.strictEqual(check({ facts: positive }).status, 'pass');
+
+  const reader = makeAllPresentReader(layoutSpec);
+  delete reader.servedMainForms;
+  const unavailable = await stageFacts(layoutSpec, { verifyReader: reader });
+  assert.strictEqual(unavailable.verify.ok, true);
+  const result = check({ facts: unavailable });
+  assert.strictEqual(result.status, 'skip');
+  assert.match(result.reason, /servedMainForms.*optional/i);
+
+  reader.servedMainForms = async () => { throw new Error('served order regression'); };
+  const broken = await stageFacts(layoutSpec, { verifyReader: reader });
+  assert.strictEqual(check({ facts: broken }).status, 'fail');
+});
+
+test('the all-present reader renders the Notes timeline and placed sub-grids, so verify proves them offline', async () => {
+  // Verify checks the timeline and a placed grid on any layout, and the reader has to answer with the form a matching
+  // environment holds — the timeline as the compiler writes it, each grid where the spec places it — or a spec that
+  // uses either fails offline on a gap in this fixture rather than on a finding about the spec.
+  const named = (schemaName, displayName, columns = []) => ({ schemaName, displayName, pluralName: `${displayName}s`, primaryAttribute: { schemaName: 'new_name', displayName: 'Name' }, columns });
+  const placedSpec = () => ({
+    schemaVersion: 2,
+    solution: { uniqueName: 'S', publisherPrefix: 'new' },
+    app: { name: 'T', description: '' },
+    entities: [
+      named('new_order', 'Order', [{ schemaName: 'new_status', displayName: 'Status', type: 'Text' }, { schemaName: 'new_remark', displayName: 'Remark', type: 'Memo' }]),
+      named('new_line', 'Line'),
+      named('new_part', 'Part'),
+      named('new_bin', 'Bin'),
+    ],
+    relationships: [
+      { type: 'OneToMany', referenced: 'new_order', referencing: 'new_line', lookup: { schemaName: 'new_orderid', displayName: 'Order' } },
+      { type: 'OneToMany', referenced: 'new_part', referencing: 'new_bin', lookup: { schemaName: 'new_partid', displayName: 'Part' } },
+    ],
+    forms: [
+      { entity: 'new_order', name: 'Order', notes: true, subgrids: [{ childEntity: 'new_line', after: 'sec_head' }],
+        tabs: [{ name: 'tab_main', label: 'Main', sections: [
+          { name: 'sec_head', label: 'Head', columns: 1, fields: ['new_name', 'new_status'] },
+          { name: 'sec_tail', label: 'Tail', columns: 1, fields: ['new_remark'] },
+        ] }] },
+      { entity: 'new_part', name: 'Part', notes: true, subgrids: [{ childEntity: 'new_bin', before: 'section_general' }] },
+    ],
+    appShell: { areas: [{ label: 'M', groups: [{ label: 'G', subAreas: [{ entity: 'new_order', title: 'Orders' }, { entity: 'new_part', title: 'Parts' }] }] }] },
+  });
+  const kindsOf = (facts, kind) => facts.verify.checks.filter((c) => c.kind === kind);
+
+  const placed = placedSpec();
+  const facts = await stageFacts(placed);
+  assert.strictEqual(facts.author.validate.ok, true, JSON.stringify(facts.author.validate.errors));
+  assert.strictEqual(facts.verify.ok, true, JSON.stringify(facts.verify.missing));
+  // An explicit layout and an auto layout both: the timeline and the grid are proven on each.
+  assert.strictEqual(kindsOf(facts, 'form-timeline').length, 2);
+  assert.strictEqual(kindsOf(facts, 'form-subgrid').length, 2);
+  assert.strictEqual(facts.verify.requiredChecks['form-timeline'], 2, 'the timeline check cannot silently stop running');
+  assert.strictEqual(facts.verify.requiredChecks['form-subgrid'], 2, 'the placement check cannot silently stop running');
+  const required = ASSERTIONS.get('verify: every required check kind actually ran');
+  assert.strictEqual(required({ facts }).status, 'pass');
+  const dropped = structuredClone(facts);
+  dropped.verify.checks = dropped.verify.checks.filter((c) => c.kind !== 'form-subgrid');
+  assert.strictEqual(required({ facts: dropped }).status, 'fail');
+
+  // The reader renders what the compiler writes, not a form that passes by construction: a form still carrying the
+  // timeline an older build wrote, or a grid left where it was appended, fails the same verify.
+  const stale = makeAllPresentReader(placed);
+  const render = stale.formTopology;
+  stale.formTopology = async (entity, id) => String(await render(entity, id))
+    .replace(/id="notescontrol"/g, 'id="0f0f0f0f-0000-4000-8000-000000000001"').replace(/rowspan="23"/g, 'rowspan="1"');
+  const oldTimeline = await stageFacts(placed, { verifyReader: stale });
+  assert.strictEqual(oldTimeline.verify.ok, false);
+  assert.strictEqual(kindsOf(oldTimeline, 'form-timeline').filter((c) => !c.present).length, 2);
+
+  const elsewhere = placedSpec();
+  elsewhere.forms[0].subgrids = [{ childEntity: 'new_line', after: 'sec_tail' }];
+  elsewhere.forms[1].subgrids = [{ childEntity: 'new_bin', after: 'section_general' }];
+  const moved = await stageFacts(placed, { verifyReader: makeAllPresentReader(elsewhere) });
+  assert.strictEqual(moved.verify.ok, false);
+  assert.strictEqual(kindsOf(moved, 'form-subgrid').filter((c) => !c.present).length, 2, JSON.stringify(kindsOf(moved, 'form-subgrid')));
+});
+
+test('the all-present reader keeps the Notes section the form asks for beside a layout section of the same name', async () => {
+  // A layout may declare a section named `section_notes` (a natural name for note fields) and the compiler's own Notes
+  // section carries that name too. The two are told apart by place in the column — a lookup by name would find the
+  // layout's for both and drop the compiler's whenever a grid is placed in that column, so verify would fail
+  // form-timeline offline on a gap in this fixture rather than on a finding about the spec.
+  const named = (schemaName, displayName, columns = []) => ({ schemaName, displayName, pluralName: `${displayName}s`, primaryAttribute: { schemaName: 'new_name', displayName: 'Name' }, columns });
+  const orderSpec = {
+    schemaVersion: 2,
+    solution: { uniqueName: 'S', publisherPrefix: 'new' },
+    app: { name: 'T', description: '' },
+    entities: [named('new_order', 'Order', [{ schemaName: 'new_remark', displayName: 'Remark', type: 'Memo' }]), named('new_line', 'Line')],
+    relationships: [{ type: 'OneToMany', referenced: 'new_order', referencing: 'new_line', lookup: { schemaName: 'new_orderid', displayName: 'Order' } }],
+    forms: [{ entity: 'new_order', name: 'Order', notes: true, subgrids: [{ childEntity: 'new_line', after: 'sec_head' }],
+      tabs: [{ name: 'tab_main', label: 'Main', sections: [
+        { name: 'sec_head', label: 'Head', columns: 1, fields: ['new_name'] },
+        { name: 'section_notes', label: 'Remarks', columns: 1, fields: ['new_remark'] },
+      ] }] }],
+    appShell: { areas: [{ label: 'M', groups: [{ label: 'G', subAreas: [{ entity: 'new_order', title: 'Orders' }] }] }] },
+  };
+  const facts = await stageFacts(orderSpec);
+  assert.strictEqual(facts.author.validate.ok, true, JSON.stringify(facts.author.validate.errors));
+  const timeline = facts.verify.checks.filter((c) => c.kind === 'form-timeline');
+  assert.deepStrictEqual(timeline.map((c) => c.present), [true], JSON.stringify(timeline));
+  assert.deepStrictEqual(facts.verify.checks.filter((c) => c.kind === 'form-subgrid').map((c) => c.present), [true]);
+  assert.strictEqual(facts.verify.ok, true, JSON.stringify(facts.verify.missing));
+
+  // The reader's form holds BOTH sections: the layout's, with its field, and the compiler's, with the timeline.
+  const xml = String(await makeAllPresentReader(orderSpec).formTopology('new_order', 'Order'));
+  const sections = xml.match(/<section\b[\s\S]*?<\/section>/g).filter((s) => /name="section_notes"/.test(s));
+  assert.strictEqual(sections.length, 2);
+  assert.ok(sections[0].includes('datafieldname="new_remark"') && !sections[0].includes('notescontrol'), 'the layout\u2019s section first');
+  assert.ok(sections[1].includes('id="notescontrol"') && !sections[1].includes('datafieldname'), 'then the Notes section the compiler adds');
+});
+
+test('stageFacts.teardown plans a reverse-of-build delete ending at the solution, web resources after tables', async () => {
+  const f = await stageFacts(spec);
+  const kinds = f.teardown.kinds;
+  assert.strictEqual(kinds[kinds.length - 1], 'solution', 'the solution container is deleted last');
+  assert.ok(kinds.includes('table'), 'a table delete step is planned');
+  // Web resources (incl. the build's generated icon + the page manifest) are torn down AFTER tables —
+  // a table's icon web resource is referenced by the table, so it cannot be removed until the table is.
+  const lastTable = kinds.lastIndexOf('table');
+  const firstWr = kinds.indexOf('webResource');
+  assert.ok(firstWr > lastTable, `web-resource step (${firstWr}) must follow the last table (${lastTable})`);
+});
+
+test('stageFacts.roundTrip preserves the compared synthetic metadata (solution, tables, pages, sitemap)', async () => {
+  const f = await stageFacts(spec);
+  assert.strictEqual(f.roundTrip.error, undefined, f.roundTrip.error);
+  assert.strictEqual(f.roundTrip.solution, 'S', 'the solution round-trips');
+  assert.deepStrictEqual(f.roundTrip.tables, ['new_order'], 'tables round-trip');
+  assert.deepStrictEqual(f.roundTrip.pageKeys, ['overview'], 'page keys round-trip');
+  assert.deepStrictEqual(f.roundTrip.origSubareaTargets, f.roundTrip.hydratedSubareaTargets, 'the sitemap subareas round-trip unchanged');
+  assert.deepStrictEqual(f.roundTrip.hydratedSubareaTargets, ['entity:new_order', 'page:overview']);
+});
+
+// A spec with a classic dashboard pinned to the nav — exercises the download→rebuild dashboard
+// reconstruction (readDashboards + DashBoard-subarea hydrate) and the teardown dashboard step.
+const dashSpec = {
+  schemaVersion: 2,
+  solution: { uniqueName: 'D', publisherPrefix: 'new' },
+  app: { name: 'A', description: '' },
+  entities: [{ schemaName: 'new_asset', displayName: 'Asset', primaryAttribute: { schemaName: 'new_name', displayName: 'Name' },
+    columns: [{ schemaName: 'new_status', displayName: 'Status', type: 'Choice', options: ['A', 'B'] }] }],
+  views: [{ entity: 'new_asset', name: 'Active Assets', columns: ['new_name', 'new_status'], activeOnly: true }],
+  charts: [{ entity: 'new_asset', name: 'Assets by Status', groupBy: 'new_status', measure: 'count', chartType: 'Column' }],
+  dashboards: [{ name: 'Ops', tiles: [{ type: 'chart', chart: 'Assets by Status', view: 'Active Assets' }, { type: 'list', view: 'Active Assets', name: 'Recent' }] }],
+  appShell: { areas: [{ label: 'M', groups: [{ label: 'G', subAreas: [{ entity: 'new_asset', title: 'Assets' }, { dashboard: 'Ops', title: 'Dash' }] }] }] },
+};
+
+test('stageFacts round-trips a classic DashBoard subarea and plans its teardown', async () => {
+  const f = await stageFacts(dashSpec);
+  assert.strictEqual(f.author.validate.ok, true, JSON.stringify(f.author.validate.errors));
+  assert.ok(f.teardown.kinds.includes('dashboard'), 'a dashboard delete step is planned');
+  assert.strictEqual(f.roundTrip.error, undefined, f.roundTrip.error);
+  // The DashBoard subarea is reconstructed by name (readDashboards id-passthrough) and survives the round-trip.
+  assert.deepStrictEqual(f.roundTrip.hydratedSubareaTargets, ['entity:new_asset', 'dashboard:Ops']);
+});
+
+// A lookup-heavy child (8 scalars + a 1:N parent lookup) with a no-label sub-grid — exercises the
+// hardening fixes at the fact level: the default view keeps the lookup, there is no createdon, and
+// the sub-grid gets its own 1-column section titled by the child pluralName.
+const hardeningSpec = {
+  schemaVersion: 2,
+  solution: { uniqueName: 'H', publisherPrefix: 'new' },
+  app: { name: 'H', description: '' },
+  entities: [
+    { schemaName: 'new_customer', displayName: 'Customer', pluralName: 'Customers', primaryAttribute: { schemaName: 'new_name', displayName: 'Name' }, columns: [] },
+    { schemaName: 'new_ticket', displayName: 'Ticket', pluralName: 'Tickets', primaryAttribute: { schemaName: 'new_subject', displayName: 'Subject' },
+      columns: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'].map((s) => ({ schemaName: `new_${s}`, displayName: s.toUpperCase(), type: 'Text' })) },
+  ],
+  relationships: [{ type: 'OneToMany', referenced: 'new_customer', referencing: 'new_ticket', lookup: { schemaName: 'new_CustomerId', displayName: 'Customer' } }],
+  forms: [{ entity: 'new_customer', type: 'main', name: 'Customer', layout: 'auto', subgrids: [{ childEntity: 'new_ticket', view: 'Open Tickets' }] }],
+  views: [{ entity: 'new_ticket', name: 'Open Tickets', columns: ['new_subject'], activeOnly: true }],
+  appShell: { areas: [{ label: 'M', groups: [{ label: 'G', subAreas: [{ entity: 'new_customer', title: 'Customers' }] }] }] },
+  sampleData: { new_customer: [{ new_name: 'Acme' }], new_ticket: [{ new_subject: 'Down', new_a: 'x', $parent: { entity: 'new_customer', match: { new_name: 'Acme' } } }] },
+};
+
+test('stageFacts.ui.defaultViews keep the parent lookup despite 8 scalars (#2) and drop createdon (#7)', async () => {
+  const f = await stageFacts(hardeningSpec);
+  assert.strictEqual(f.author.validate.ok, true, JSON.stringify(f.author.validate.errors));
+  const tk = f.ui.defaultViews['new_ticket'];
+  assert.ok(tk, 'new_ticket is enrichable');
+  assert.ok(tk.columns.includes('new_customerid'), `#2: parent lookup kept; got [${tk.columns}]`);
+  assert.strictEqual(tk.lookupsPresent, true, '#2: every parent lookup present');
+  assert.strictEqual(tk.hasCreatedon, false, '#7: no createdon in the enriched default view');
+});
+
+test('stageFacts.ui.subgrids give each sub-grid a 1-column section titled by the child pluralName (#5)', async () => {
+  const f = await stageFacts(hardeningSpec);
+  const sg = f.ui.subgrids.find((s) => s.childEntity === 'new_ticket');
+  assert.ok(sg, 'sub-grid fact present');
+  assert.strictEqual(sg.sectionColumns, 1, '#5: full-width 1-column section');
+  assert.strictEqual(sg.label, 'Tickets', '#5: title from child pluralName, not the logical name');
+});
+
+// Two personas exercising the security facts: an app-access "Agent" (jobs touch two authored tables +
+// one external table) and an opted-out "Analyst" (appAccess:false). Proves securityFacts computes the
+// declared/granted unions, the appmodule injection, and clean app-table resolution (#1 + #2 evals).
+const personaSpec = {
+  schemaVersion: 2,
+  solution: { uniqueName: 'P', publisherPrefix: 'new' },
+  app: { name: 'P', description: '' },
+  entities: [
+    { schemaName: 'new_order', displayName: 'Order', primaryAttribute: { schemaName: 'new_name', displayName: 'Name' }, columns: [] },
+    { schemaName: 'new_customer', displayName: 'Customer', primaryAttribute: { schemaName: 'new_name', displayName: 'Name' }, columns: [] },
+  ],
+  appShell: { areas: [{ label: 'M', groups: [{ label: 'G', subAreas: [
+    { entity: 'new_order', title: 'Orders' }, { entity: 'new_customer', title: 'Customers' },
+  ] }] }] },
+  personas: [
+    { persona: 'Agent', jobs: [{ name: 'Handle orders', privileges: [
+      { entity: 'new_order', access: ['read', 'write', 'create'], scope: 'businessUnit' },
+      { entity: 'new_customer', access: ['read'], scope: 'organization' },
+      { entity: 'account', access: ['read'], scope: 'organization' },
+    ] }] },
+    { persona: 'Analyst', appAccess: false, jobs: [{ name: 'Report', privileges: [
+      { entity: 'new_order', access: ['read'], scope: 'organization' },
+    ] }] },
+  ],
+};
+
+test('stageFacts.security computes declared/granted unions, appmodule injection, and clean table resolution', async () => {
+  const f = await stageFacts(personaSpec);
+  assert.strictEqual(f.author.validate.ok, true, JSON.stringify(f.author.validate.errors));
+  const agent = f.security.find((r) => r.persona === 'Agent');
+  const analyst = f.security.find((r) => r.persona === 'Analyst');
+  // Agent has app access -> appmodule read injected into GRANTED but never into DECLARED.
+  assert.strictEqual(agent.appAccess, true);
+  assert.strictEqual(agent.appModuleRead, true);
+  assert.deepStrictEqual(agent.granted.appmodule, { read: 'organization' }, 'granted carries the injected appmodule read');
+  assert.strictEqual(agent.declared.appmodule, undefined, 'declared never carries the injection');
+  // Declared union preserves per-(entity, access) scope (businessUnit lower-cased).
+  assert.deepStrictEqual(agent.declared.new_order, { create: 'businessunit', read: 'businessunit', write: 'businessunit' });
+  assert.deepStrictEqual(agent.declared.new_customer, { read: 'organization' });
+  // No app-prefixed table is unprovisioned; the external `account` is exempt (not `new`-prefixed).
+  assert.deepStrictEqual(agent.unresolvedAppTables, []);
+  // Analyst opted out of app access -> no appmodule injection anywhere.
+  assert.strictEqual(analyst.appAccess, false);
+  assert.strictEqual(analyst.appModuleRead, false);
+  assert.strictEqual(analyst.granted.appmodule, undefined);
+});
+
+test('stageFacts.security flags a persona privilege on an app-prefixed table the app never provisions (#1)', async () => {
+  const bogus = JSON.parse(JSON.stringify(personaSpec));
+  // `new_bogus` carries the app's own `new` prefix but is not in entities[] -> unresolved.
+  bogus.personas[0].jobs[0].privileges.push({ entity: 'new_bogus', access: ['read'], scope: 'user' });
+  const f = await stageFacts(bogus);
+  const agent = f.security.find((r) => r.persona === 'Agent');
+  assert.deepStrictEqual(agent.unresolvedAppTables, ['new_bogus']);
+});
+
+// Drive the #1/#2 assertions directly with synthetic facts so the FAIL paths are proven (fixtures only
+// exercise the PASS/SKIP paths). Mirrors how the runner invokes a check: `check({ facts, spec, eval })`.
+const coverageCheck = ASSERTIONS.get('security: every persona privilege on an app-owned table resolves to a provisioned entity');
+const overGrantCheck = ASSERTIONS.get('security: each persona role grants exactly its declared job privileges (no over-grant)');
+
+test('security #1 coverage assertion: skips with no personas, fails on an unresolved app table', () => {
+  assert.strictEqual(coverageCheck({ facts: { security: [] } }).status, 'skip');
+  const r = coverageCheck({ facts: { security: [{ persona: 'X', unresolvedAppTables: ['new_bogus'] }] } });
+  assert.strictEqual(r.status, 'fail');
+  assert.match(r.reason, /new_bogus/);
+});
+
+test('security #2 least-privilege assertion: passes faithful mapping, catches over-grant / scope inflation / under-grant / leak', () => {
+  const wrap = (rec) => ({ facts: { security: [rec] } });
+  // Faithful mapping (declared == granted, plus the allowed appmodule injection) passes.
+  assert.strictEqual(overGrantCheck(wrap({ persona: 'A', appAccess: true,
+    declared: { new_order: { read: 'user' } },
+    granted: { new_order: { read: 'user' }, appmodule: { read: 'organization' } },
+  })).status, 'pass');
+  // Extra entity the author never declared.
+  assert.match(overGrantCheck(wrap({ persona: 'A', appAccess: true,
+    declared: { new_order: { read: 'user' } },
+    granted: { new_order: { read: 'user' }, new_secret: { read: 'user' } },
+  })).reason, /new_secret/);
+  // Extra access token beyond declared.
+  assert.match(overGrantCheck(wrap({ persona: 'A', appAccess: true,
+    declared: { new_order: { read: 'user' } },
+    granted: { new_order: { read: 'user', delete: 'user' } },
+  })).reason, /delete/);
+  // PER-ACCESS scope inflation: the entity's max declared scope is organization (read), but write is
+  // only declared @user — granting write@organization must still fail even though read@org is declared.
+  assert.match(overGrantCheck(wrap({ persona: 'A', appAccess: true,
+    declared: { new_order: { read: 'organization', write: 'user' } },
+    granted: { new_order: { read: 'organization', write: 'organization' } },
+  })).reason, /write.*scope|scope/);
+  // UNDER-grant: a declared privilege the role does not carry (mapper dropped it).
+  assert.match(overGrantCheck(wrap({ persona: 'A', appAccess: true,
+    declared: { new_order: { read: 'user', write: 'user' } },
+    granted: { new_order: { read: 'user' } },
+  })).reason, /under-grant/);
+  // appmodule granted while the persona opted out of app access (and never declared it) = leak.
+  assert.match(overGrantCheck(wrap({ persona: 'A', appAccess: false,
+    declared: { new_order: { read: 'user' } },
+    granted: { new_order: { read: 'user' }, appmodule: { read: 'organization' } },
+  })).reason, /leak/);
+});
+
+// The form-shape oracle used to FLATTEN sections across form-columns on both sides, so a section
+// that moved from column 0 to column 1 — keeping its order and fields — produced identical flat
+// lists and passed. That is precisely the topology this assertion exists to prove, so the oracle was
+// blind to the defect class it was written for. Both projections now group by form-column.
+test('the form-topology assertion sees a section moved between form-columns', () => {
+  const check = ASSERTIONS.get('ui: an explicit layout compiles to the authored tab, form-column and section topology (it is not flattened)');
+  const sec = (label, fields) => ({ label, columns: 1, fields });
+  const tab = (byColumn) => ({
+    label: 'General', expanded: true, columnCount: byColumn.length,
+    declaredWidths: byColumn.map(() => null), sectionsByColumn: byColumn,
+  });
+  const authored = [tab([[sec('L', ['a'])], [sec('R', ['b'])]])];
+  const run = (compiled) => check({ facts: { ui: { forms: [{ name: 'F', authoredShape: authored, compiledShape: compiled, placements: [] }] } } });
+
+  assert.strictEqual(run([tab([[sec('L', ['a'])], [sec('R', ['b'])]])]).status, 'pass',
+    'the authored topology compiled faithfully must still pass');
+
+  // Both sections collapsed into column 0. Flattened, this is still [L, R] — indistinguishable from
+  // the correct shape, which is exactly how it used to slip through.
+  const collapsed = run([tab([[sec('L', ['a']), sec('R', ['b'])], []])]);
+  assert.strictEqual(collapsed.status, 'fail', 'a section moved out of its form-column must fail');
+  assert.match(collapsed.reason, /form-column 0/, `the failure must name the form-column: ${collapsed.reason}`);
+
+  // Same section count per column, but swapped between them — the subtlest version, where every
+  // per-column count matches and only the contents moved.
+  const swapped = run([tab([[sec('R', ['b'])], [sec('L', ['a'])]])]);
+  assert.strictEqual(swapped.status, 'fail', 'sections swapped between form-columns must fail');
+});
+
+test('form facts detect state order width and quick-view drift', async () => {
+  const fixture = fixtureFor(7);
+  const facts = await stageFacts(fixture.spec, { fixture });
+  assert.ok(facts.formReconcile, 'independent deployed form evidence is scored');
+  const topology = 'ui: an explicit layout compiles to the authored tab, form-column and section topology (it is not flattened)';
+  const state = 'ui: explicit container names display flags and field state match authored intent';
+  const baseline = 'verify: form reconciliation exercises an inserted tab and reordered existing containers';
+  const quickViews = 'verify: Quick View bindings survive form reconciliation';
+  const verify = 'verify: reconcile against an all-present reader returns ok with no missing';
+  for (const text of [topology, state, baseline, quickViews, verify]) {
+    assert.strictEqual(score(text, facts, fixture).status, 'pass', text);
+  }
+  const badBaseline = structuredClone(facts);
+  badBaseline.formReconcile.edits.find((e) => e.name === 'Work Item').before = [];
+  const baselineFailure = score(baseline, badBaseline, fixture);
+  assert.strictEqual(baselineFailure.status, 'fail', 'a fresh-only fixture cannot masquerade as an edit baseline');
+  assert.match(baselineFailure.reason, /baseline tab order/);
+  const main = facts.ui.forms.find((f) => f.name === 'Work Item');
+  assert.deepStrictEqual(main.authoredShape[1].expectedWidths, ['50%', '50%']);
+  assert.strictEqual(main.authoredShape[2].name, 'tab_admin');
+  assert.strictEqual(main.authoredShape[2].visible, false);
+  assert.strictEqual(main.authoredShape[1].sectionsByColumn[0][0].visible, false);
+  assert.strictEqual(main.authoredShape[1].sectionsByColumn[0][1].showLabel, false);
+  assert.ok(main.authoredPlacements.some((p) => p.field === 'cnt_projectid' && p.hidden && p.readOnly));
+  assert.ok(facts.verify.checks.some((c) => c.kind === 'form-order-served' && c.present));
+
+  const xml = fixture.evidence.formReconcile.forms[0].xml;
+  const swap = (source, tag, first, second) => {
+    const block = (name) => new RegExp(`<${tag} name="${name}"[\\s\\S]*?<\\/${tag}>`).exec(source)[0];
+    const a = block(first), b = block(second);
+    return source.replace(a, '__FIRST_CONTAINER__').replace(b, a).replace('__FIRST_CONTAINER__', b);
+  };
+  const changes = [
+    ['hidden tab', (s) => s.replace('name="tab_admin" visible="false"', 'name="tab_admin" visible="true"'), /tab_admin.*visible/],
+    ['collapsed tab', (s) => s.replace('name="tab_admin" visible="false" expanded="false"', 'name="tab_admin" visible="false" expanded="true"'), /tab_admin.*expanded/],
+    ['hidden section', (s) => s.replace('name="section_notes" columns="1" visible="false"', 'name="section_notes" columns="1" visible="true"'), /section_notes.*visible/],
+    ['section label display', (s) => s.replace('name="section_execution" columns="11" visible="true" showlabel="false"', 'name="section_execution" columns="11" visible="true" showlabel="true"'), /section_execution.*showlabel/],
+    ['hidden field', (s) => s.replace('id="lookup_cell" visible="false"', 'id="lookup_cell" visible="true"'), /cnt_projectid.*visible/],
+    ['read-only field', (s) => s.replace('id="project_lookup" datafieldname="cnt_projectid" disabled="true"', 'id="project_lookup" datafieldname="cnt_projectid" disabled="false"'), /cnt_projectid.*disabled/],
+    ['equal-split width', (s) => s.replace('width="50%"', 'width="100%"'), /form-column 1.*100%.*50%/],
+    ['grid width', (s) => s.replace('name="section_execution" columns="11"', 'name="section_execution" columns="1"'), /section_execution.*column/],
+    ['tab order', (s) => swap(s, 'tab', 'tab_intake', 'tab_admin'), /tabs.*order/],
+    ['section order', (s) => swap(s, 'section', 'section_notes', 'section_execution'), /sections.*order/],
+    ['inserted tab missing', (s) => s.replace(/<tab name="tab_intake"[\s\S]*?<\/tab>/, ''), /tab_intake.*absent/],
+    ['field span', (s) => s.replace('colspan="2"', 'colspan="1"'), /cnt_title.*colspan/],
+    ['field rowspan', (s) => s.replace('rowspan="2"', 'rowspan="1"'), /cnt_notes.*rowspan/],
+    ['stored form order', (s) => s.replace('Order="0"', 'Order="2"'), /form-order.*not after/],
+  ];
+  for (const [name, change, reason] of changes) {
+    const changed = structuredClone(fixture);
+    const deployed = change(xml);
+    assert.notStrictEqual(deployed, xml, `${name} changes one deployed fact`);
+    changed.evidence.formReconcile.forms[0].xml = deployed;
+    const drift = await stageFacts(changed.spec, { fixture: changed });
+    const result = score(verify, drift, changed);
+    assert.strictEqual(result.status, 'fail', name);
+    assert.match(result.reason, reason, `${name}: ${result.reason}`);
+  }
+
+  const served = structuredClone(fixture);
+  served.evidence.formReconcile.servedMainForms.cnt_workitem.reverse();
+  const wrongOrder = await stageFacts(served.spec, { fixture: served });
+  assert.strictEqual(score(verify, wrongOrder, served).status, 'fail');
+  assert.match(score(verify, wrongOrder, served).reason, /form-order-served.*Work Item Review/);
+
+  for (const [name, change, reason] of [
+    ['missing Quick View', (s) => s.replace(/<cell id="quickview_cell"[\s\S]*?<\/cell>/, ''), /Quick View.*missing/],
+    ['wrong Quick View form', (s) => s.replace('00000000-0000-0000-0000-000000000703</QuickFormId>', '00000000-0000-0000-0000-000000000704</QuickFormId>'), /Quick View.*form/],
+    ['wrong Quick View lookup', (s) => s.replace('id="project_quickview" classid="{5C5600E0-1D6E-4205-A272-BE80DA87FD42}" datafieldname="cnt_projectid"', 'id="project_quickview" classid="{5C5600E0-1D6E-4205-A272-BE80DA87FD42}" datafieldname="cnt_wrongid"'), /Quick View.*lookup/],
+    ['wrong Quick View target table', (s) => s.replace('QuickFormId entityname="cnt_project"', 'QuickFormId entityname="cnt_workitem"'), /Quick View.*form/],
+    ['wrong Quick View class', (s) => s.replace('classid="{5C5600E0-1D6E-4205-A272-BE80DA87FD42}"', 'classid="{4273EDBD-AC1D-40D3-9FB2-095C621B552D}"'), /Quick View.*control class/],
+  ]) {
+    const changed = structuredClone(fixture);
+    changed.evidence.formReconcile.forms[0].xml = change(xml);
+    assert.notStrictEqual(changed.evidence.formReconcile.forms[0].xml, xml, name);
+    const result = score(quickViews, await stageFacts(changed.spec, { fixture: changed }), changed);
+    assert.strictEqual(result.status, 'fail', name);
+    assert.match(result.reason, reason);
+  }
+
+  // The Quick View is encountered before the ordinary lookup and has the same binding. Its display
+  // state must neither mask a wrong lookup state nor make a correct lookup fail.
+  const independentCard = structuredClone(fixture);
+  independentCard.evidence.formReconcile.forms[0].xml = xml
+    .replace('id="quickview_cell" visible="false"', 'id="quickview_cell" visible="true"')
+    .replace('datafieldname="cnt_projectid" disabled="true">\n', 'datafieldname="cnt_projectid" disabled="false">\n');
+  const unchangedLookup = await stageFacts(independentCard.spec, { fixture: independentCard });
+  assert.strictEqual(score(verify, unchangedLookup, independentCard).status, 'pass');
+
+  for (const [name, mutate] of [
+    ['tab name', (f) => { f.compiledShape[2].name = 'tab_wrong'; }],
+    ['section name', (f) => { f.compiledShape[1].sectionsByColumn[0][0].name = 'section_wrong'; }],
+    ['tab visibility', (f) => { f.compiledShape[2].visible = true; }],
+    ['section visibility', (f) => { f.compiledShape[1].sectionsByColumn[0][0].visible = true; }],
+    ['section showLabel', (f) => { f.compiledShape[1].sectionsByColumn[0][1].showLabel = true; }],
+    ['compiled field state', (f) => { f.placements.find((p) => p.field === 'cnt_reviewer').readOnly = false; }],
+    ['compiled hidden field', (f) => { f.placements.find((p) => p.field === 'cnt_notes').hidden = false; }],
+  ]) {
+    const drift = structuredClone(facts);
+    mutate(drift.ui.forms.find((f) => f.name === 'Work Item'));
+    const result = score(state, drift, fixture);
+    assert.strictEqual(result.status, 'fail', name);
+    assert.match(result.reason, /Work Item/);
+  }
+  const wrongWidth = structuredClone(facts);
+  wrongWidth.ui.forms.find((f) => f.name === 'Work Item').compiledShape[1].declaredWidths[0] = '100%';
+  assert.strictEqual(score(topology, wrongWidth, fixture).status, 'fail', 'omitted authored widths still require the independent equal split');
+});
+
+test('page round-trip facts preserve own names and models through the real download helpers and hydrator', async () => {
+  const fixture = fixtureFor(8);
+  const facts = await stageFacts(fixture.spec, { fixture });
+  assert.strictEqual(facts.roundTrip.source, 'pac-download-fixture', 'read committed PAC files, not a compiler-generated page');
+  const text = 'round-trip: generative pages preserve their names and models';
+  assert.strictEqual(score(text, facts, fixture).status, 'pass');
+  const page = (f, key) => f.roundTrip.pageMetadata.find((p) => p.key === key);
+  assert.strictEqual(page(facts, 'revenue').name, 'Revenue "FY"');
+  assert.strictEqual(page(facts, 'revenue').model, 'gpt-4.1');
+  assert.deepStrictEqual(page(facts, 'revenue').dataSources, ['cnt_order']);
+  assert.strictEqual(page(facts, 'help').model, null);
+  assert.strictEqual(page(facts, 'archive').model, null);
+  assert.deepStrictEqual(facts.roundTrip.origSubareaTargets, facts.roundTrip.hydratedSubareaTargets);
+
+  for (const [name, key, field, value] of [
+    ['lost name', 'revenue', 'name', undefined],
+    ['navigation title used as name', 'revenue', 'name', 'Revenue Navigation'],
+    ['escaping accumulates', 'revenue', 'name', 'Revenue \\"FY\\"'],
+    ['model emptied', 'revenue', 'model', ''],
+    ['model dropped', 'revenue', 'model', null],
+    ['absent model invented', 'help', 'model', 'gpt-4.1'],
+    ['invalid model retained', 'archive', 'model', 'model with spaces'],
+  ]) {
+    const changed = structuredClone(facts);
+    page(changed, key)[field] = value;
+    const result = score(text, changed, fixture);
+    assert.strictEqual(result.status, 'fail', name);
+    assert.match(result.reason, new RegExp(`${key}.*${field}`));
+  }
+
+  const { hydrateSpec } = require('../../../../plugins/model-apps/scripts/lib/hydrate-spec.js');
+  for (const field of ['name', 'model']) {
+    const changed = await stageFacts(fixture.spec, { fixture, hydrator: async (reader) => {
+      const hydrated = await hydrateSpec(reader);
+      delete hydrated.pages.find((p) => p.key === 'revenue')[field];
+      return hydrated;
+    } });
+    assert.strictEqual(score(text, changed, fixture).status, 'fail', `a broken hydrate dropping ${field} cannot score green`);
+  }
+});
+
+test('invalid downloaded page models are dropped with discriminating loss diagnostics', async () => {
+  const fixture = fixtureFor(8);
+  const facts = await stageFacts(fixture.spec, { fixture });
+  const text = 'round-trip: invalid downloaded models are omitted with explicit diagnostics';
+  assert.strictEqual(score(text, facts, fixture).status, 'pass');
+  assert.deepStrictEqual(facts.roundTrip.unkeptModels, [
+    { pageId: '00000000-0000-0000-0000-000000000803', model: 'model with spaces' },
+  ]);
+  const missingWarning = structuredClone(facts);
+  missingWarning.roundTrip.unkeptModels = [];
+  assert.strictEqual(score(text, missingWarning, fixture).status, 'fail', 'silent model loss is not a successful round trip');
+  const retained = structuredClone(facts);
+  retained.roundTrip.pageMetadata.find((p) => p.key === 'archive').model = 'model with spaces';
+  assert.strictEqual(score(text, retained, fixture).status, 'fail', 'a diagnostic does not excuse retaining invalid metadata');
+  const unreadable = structuredClone(facts);
+  unreadable.roundTrip.unreadableConfigs = [{ pageId: '00000000-0000-0000-0000-000000000801', reason: 'invalid JSON' }];
+  assert.strictEqual(score(text, unreadable, fixture).status, 'fail', 'unknown bindings must not look like an absent model');
+});
+
+test('changed-only facts use real hashes snapshots and classifications and reject wrong verdicts', async () => {
+  const fixture = fixtureFor(9);
+  const facts = await stageFacts(fixture.spec, { fixture });
+  assert.ok(facts.changedOnly, 'the real changed-only decision core is exercised');
+  const text = 'changed-only: page bytes use a page-only fast path data-model edits use full and identical inputs are noop';
+  assert.strictEqual(score(text, facts, fixture).status, 'pass');
+  assert.strictEqual(facts.changedOnly.snapshot.eligible, true);
+  assert.strictEqual(facts.changedOnly.baselineVerified, true);
+  assert.ok(facts.verify.checks.some((c) => c.kind === 'page' && c.present), 'implemented pages must also be verified');
+  assert.ok(facts.verify.requiredChecks.page > 0);
+  const cases = facts.changedOnly.cases;
+  assert.deepStrictEqual(cases.map((c) => [c.name, c.verdict]), [
+    ['page-only', 'fast'], ['column-edit', 'full'], ['identical', 'noop'],
+  ]);
+  const hashes = facts.changedOnly.contentHashes;
+  for (const row of hashes) {
+    assert.match(row.before, /^[0-9a-f]{64}$/);
+    assert.match(row.after, /^[0-9a-f]{64}$/);
+    assert.strictEqual(row.before !== row.after, row.key === 'overview', 'only overview bytes differ');
+  }
+  assert.deepStrictEqual(cases[0].fastChanges.map((c) => [c.shape, c.phase, c.identity]), [['page', 'pages', 'overview']]);
+  assert.match(cases[1].fullReasons[0], /data-model: changed/);
+
+  for (const [index, wrong] of [[0, 'noop'], [0, 'full'], [1, 'fast'], [1, 'noop'], [2, 'fast'], [2, 'full']]) {
+    const changed = structuredClone(facts);
+    changed.changedOnly.cases[index].verdict = wrong;
+    const result = score(text, changed, fixture);
+    assert.strictEqual(result.status, 'fail', `${cases[index].name} cannot report ${wrong}`);
+    assert.match(result.reason, /verdict/);
+  }
+  for (const [name, mutate, reason] of [
+    ['wrong page identity', (c) => { c.cases[0].fastChanges[0].identity = 'detail'; }, /page-only.*fast changes/],
+    ['extra page upload', (c) => { c.cases[0].fastChanges.push({ shape: 'page', phase: 'pages', identity: 'detail' }); }, /page-only.*fast changes/],
+    ['wrong phase', (c) => { c.cases[0].changedPhases = ['forms']; }, /page-only.*phases/],
+    ['wrong full reason', (c) => { c.cases[1].fullReasons = ['pages changed']; }, /column-edit.*reason/],
+    ['missing case', (c) => { c.cases.pop(); }, /case/],
+    ['ineligible snapshot', (c) => { c.snapshot.eligible = false; }, /snapshot/],
+    ['unverified baseline', (c) => { c.baselineVerified = false; }, /baseline/],
+    ['unexpected debt', (c) => { c.cases[1].debt = [{ artifactType: 'entity', identity: 'cnt_order', reason: 'unexpected debt' }]; }, /debt/],
+  ]) {
+    const changed = structuredClone(facts);
+    mutate(changed.changedOnly);
+    const result = score(text, changed, fixture);
+    assert.strictEqual(result.status, 'fail', name);
+    assert.match(result.reason, reason);
+  }
+});
+
+test('artifact names are per-table and page quote warnings remain visible', async () => {
+  const fixture = fixtureFor(10);
+  const facts = await stageFacts(fixture.spec, { fixture });
+  const names = 'author: artifact-name warnings use per-table and form-type scope';
+  const quotes = 'author: page quote warnings remain visible without rewriting approved names';
+  assert.strictEqual(facts.author.validate.ok, true, JSON.stringify(facts.author.validate.errors));
+  assert.deepStrictEqual(facts.author.lint.errors, []);
+  assert.strictEqual(score(names, facts, fixture).status, 'pass');
+  assert.strictEqual(score(quotes, facts, fixture).status, 'pass');
+  assert.deepStrictEqual(facts.author.artifactNameCollisions, [], 'shared names on different tables are not collisions');
+  assert.deepStrictEqual(facts.author.pageNames.map((p) => p.name), fixture.spec.pages.map((p) => p.name));
+  const quoteWarnings = facts.author.lint.warnings.filter((w) => w.includes('ASCII double quote'));
+  assert.strictEqual(quoteWarnings.length, 1);
+  assert.match(quoteWarnings[0], /Revenue "FY"/);
+  assert.ok(!quoteWarnings.some((w) => w.includes("Clerk's Queue") || w.includes('Revenue \u201cFY\u201d')));
+  assert.ok(facts.author.lint.warnings.some((w) => !w.includes('ASCII double quote')), 'other legitimate warnings remain non-fatal');
+
+  for (const [collection, kind] of [['forms', 'form'], ['views', 'view'], ['charts', 'chart']]) {
+    const changed = structuredClone(fixture);
+    changed.spec[collection].push(structuredClone(changed.spec[collection][0]));
+    const duplicate = await stageFacts(changed.spec, { fixture: changed });
+    assert.ok(duplicate.author.lint.warnings.some((w) => w.startsWith(`Duplicate ${kind} name on cnt_order:`)), `${kind}: same-table duplicate is flagged by the real linter`);
+    const result = score(names, duplicate, changed);
+    assert.strictEqual(result.status, 'fail', `${kind}: a same-table duplicate cannot pass the fixture contract`);
+    assert.match(result.reason, /same-table duplicate.*cnt_order/);
+  }
+
+  const otherType = structuredClone(fixture);
+  otherType.spec.forms.push({ ...otherType.spec.forms[0], formType: 'QuickView' });
+  const typeScoped = await stageFacts(otherType.spec, { fixture: otherType });
+  assert.strictEqual(score(names, typeScoped, otherType).status, 'pass', 'Main and QuickView names have separate identities');
+  assert.ok(typeScoped.author.lint.warnings.some((w) => /QuickView.*isn't placed/.test(w)), 'an unrelated advisory does not become a blanket failure');
+
+  const globalCollision = structuredClone(facts);
+  globalCollision.author.lint.warnings.push('Duplicate form name on cnt_ticket: Information');
+  assert.strictEqual(score(names, globalCollision, fixture).status, 'fail', 'a globally scoped duplicate warning is a false positive');
+  const missingQuote = structuredClone(facts);
+  missingQuote.author.lint.warnings = missingQuote.author.lint.warnings.filter((w) => !w.includes('ASCII double quote'));
+  assert.strictEqual(score(quotes, missingQuote, fixture).status, 'fail', 'quote warnings must not silently disappear');
+  for (const key of ['apostrophe', 'typographic']) {
+    const changed = structuredClone(facts);
+    const name = fixture.spec.pages.find((p) => p.key === key).name;
+    changed.author.lint.warnings.push(`Page '${name}': pac stores each ASCII double quote`);
+    assert.strictEqual(score(quotes, changed, fixture).status, 'fail', `${key} is not an ASCII-quote warning`);
+  }
+  const rewritten = structuredClone(facts);
+  rewritten.author.pageNames.find((p) => p.key === 'straight-quote').name = 'Revenue FY';
+  assert.strictEqual(score(quotes, rewritten, fixture).status, 'fail', 'the approved name must not be silently sanitized');
+
+  const runner = path.join(__dirname, '..', 'run-app-builder.js');
+  const shown = spawnSync(process.execPath, [runner, '--eval', '10'], { encoding: 'utf8' });
+  assert.strictEqual(shown.status, 0, shown.stdout + shown.stderr);
+  assert.match(shown.stdout, /# lint warning:.*ASCII double quote/, 'the warning is visible in green TAP output');
+  const lintPath = path.join(__dirname, '..', '..', '..', '..', 'plugins', 'model-apps', 'scripts', 'lib', 'spec-lint.js');
+  const lost = spawnSync(process.execPath, ['-e', `
+    const lint = require(${JSON.stringify(lintPath)});
+    const realLint = lint.lintAppSpec;
+    lint.lintAppSpec = (spec) => {
+      const result = realLint(spec);
+      return { ...result, warnings: result.warnings.filter((w) => !w.includes('ASCII double quote')) };
+    };
+    process.argv = [process.execPath, ${JSON.stringify(runner)}, '--eval', '10'];
+    require(${JSON.stringify(runner)}).main();
+  `], { encoding: 'utf8' });
+  assert.strictEqual(lost.status, 1, lost.stdout + lost.stderr);
+  assert.match(lost.stdout, /not ok \d+ - author: page quote warnings/);
+
+  const sanitized = spawnSync(process.execPath, ['-e', `
+    const lint = require(${JSON.stringify(lintPath)});
+    const realLint = lint.lintAppSpec;
+    lint.lintAppSpec = (spec) => {
+      for (const page of spec.pages || []) page.name = page.name.replace(/"/g, '');
+      return realLint(spec);
+    };
+    process.argv = [process.execPath, ${JSON.stringify(runner)}, '--eval', '10'];
+    require(${JSON.stringify(runner)}).main();
+  `], { encoding: 'utf8' });
+  assert.strictEqual(sanitized.status, 1, 'an input-mutating linter cannot rewrite its own approved-name expectation:\n' + sanitized.stdout + sanitized.stderr);
+  assert.match(sanitized.stdout, /approved page names were rewritten/);
+});
+
+test('evidence loading rejects malformed form records and out-of-fixture XML paths by fixture name', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-evidence-'));
+  const dir = path.join(root, '6-form-evidence');
+  try {
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'app-spec.json'), JSON.stringify(require('../fixtures/6-form-layout/app-spec.json')));
+    fs.writeFileSync(path.join(dir, 'inside.xml'), '<form/>');
+    fs.writeFileSync(path.join(root, 'outside.xml'), '<form/>');
+    const form = { id: '00000000-0000-0000-0000-000000000601', entity: 'new_workitem', name: 'Work Item', xmlFile: 'inside.xml' };
+    const write = (body) => fs.writeFileSync(path.join(dir, 'evidence.json'), JSON.stringify(body));
+    write({ formReconcile: { forms: [form] } });
+    assert.strictEqual(loadFixtures(root)[0].evidence.formReconcile.forms[0].xml, '<form/>');
+    for (const body of [
+      { formReconcile: 'not an object' },
+      { formReconcile: { forms: 'not an array' } },
+      { formReconcile: { forms: [null] } },
+    ]) {
+      write(body);
+      assert.throws(() => loadFixtures(root), /Fixture 6-form-evidence:.*formReconcile/);
+    }
+    write({ formReconcile: { forms: [{ ...form, xmlFile: path.join('..', 'outside.xml') }] } });
+    assert.throws(() => loadFixtures(root), /Fixture 6-form-evidence:.*outside the fixture/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('evidence XML remains confined when the fixtures root is accessed through a junction or symlink', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-evidence-link-'));
+  const corpus = path.join(root, 'corpus');
+  const dir = path.join(corpus, '6-linked-evidence');
+  const alias = path.join(root, 'alias');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'app-spec.json'), JSON.stringify(require('../fixtures/6-form-layout/app-spec.json')));
+    fs.writeFileSync(path.join(dir, 'inside.xml'), '<form/>');
+    const form = { id: '00000000-0000-0000-0000-000000000601', entity: 'new_workitem', name: 'Work Item', xmlFile: 'inside.xml' };
+    fs.writeFileSync(path.join(dir, 'evidence.json'), JSON.stringify({ formReconcile: { forms: [form] } }));
+    fs.symlinkSync(corpus, alias, 'junction');
+    assert.strictEqual(loadFixtures(alias)[0].evidence.formReconcile.forms[0].xml, '<form/>');
+    fs.writeFileSync(path.join(corpus, 'outside.xml'), '<form/>');
+    fs.writeFileSync(path.join(dir, 'evidence.json'), JSON.stringify({ formReconcile: { forms: [{ ...form, xmlFile: path.join('..', 'outside.xml') }] } }));
+    assert.throws(() => loadFixtures(alias), /Fixture 6-linked-evidence:.*outside the fixture/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the app-builder fixture roster and required assertion texts match the registry', () => {
+  const fixtures = loadFixtures(path.join(__dirname, '..', 'fixtures'));
+  const check = (inputs, manifest) => {
+    assert.deepStrictEqual(inputs.map((f) => f.id).sort((a, b) => a - b), manifest.evals.map((e) => e.id).sort((a, b) => a - b), 'fixture ids match the manifest');
+    for (const ev of manifest.evals) for (const text of [...manifest.common_stage_assertions, ...(ev.expectations || [])]) {
+      assert.ok(ASSERTIONS.has(text), `unregistered assertion for eval ${ev.id}: ${text}`);
+    }
+  };
+  check(fixtures, evalsManifest);
+  assert.throws(() => check(fixtures.slice(1), evalsManifest), /fixture ids/);
+  const typo = structuredClone(evalsManifest);
+  typo.evals.find((e) => e.id === 7).expectations.push('verify: an unregistered required assertion');
+  assert.throws(() => check(fixtures, typo), /unregistered assertion/);
+});
+
+test('2.21.0 authoring expectations pass on their fixtures and fail when the spec drifts from the prompt', () => {
+  const fixtures = loadFixtures(path.join(__dirname, '..', 'fixtures'));
+  const grade = (id, mutate) => {
+    const ev = evalsManifest.evals.find((e) => e.id === id);
+    const spec = structuredClone(fixtures.find((f) => f.id === id).spec);
+    if (mutate) mutate(spec);
+    return ASSERTIONS.get(ev.expectations[0])({ spec, eval: ev, facts: {} }).status;
+  };
+  for (const id of [11, 12, 13]) assert.strictEqual(grade(id), 'pass', `eval ${id}`);
+  const col = (spec, name) => spec.entities[0].columns.find((c) => c.schemaName === name);
+  assert.strictEqual(grade(11, (s) => { s.minimumPluginVersion = '2.20.6'; }), 'fail');
+  assert.strictEqual(grade(11, (s) => { s.globalChoices[0].options[2] = 'Export'; }), 'fail');
+  assert.strictEqual(grade(11, (s) => { col(s, 'cnt_stage').options[1] = 'Held'; }), 'fail');
+  assert.strictEqual(grade(12, (s) => { col(s, 'cnt_renewaldate').dateTimeBehavior = 'UserLocal'; }), 'fail');
+  assert.strictEqual(grade(12, (s) => { col(s, 'cnt_kickoff').dateTimeBehavior = 'DateOnly'; }), 'fail');
+  assert.strictEqual(grade(12, (s) => { delete col(s, 'cnt_lastcontact').dateTimeBehavior; }), 'pass');
+  assert.strictEqual(grade(13, (s) => { delete col(s, 'cnt_medicalnotes').isSecured; }), 'fail');
+  assert.strictEqual(grade(13, (s) => { s.fieldSecurityProfiles[1].assignTo = { teams: ['22222222-2222-4222-8222-222222222222'] }; }), 'fail');
+  assert.strictEqual(grade(13, (s) => { s.fieldSecurityProfiles[0].permissions.pop(); }), 'fail');
+});
+
+// Fixture 11's prompt asks for a High Priority view filtered on Priority 5. The view builder reads `filters[]` entries of
+// `{ attr, op, value }` (plugins/model-apps/scripts/lib/sdk-build.js, the saved-query builder) and ignores any other spelling:
+// the fixture once wrote `filter[].column/operator`, and its view then showed every active shipment. So the fixture must carry
+// exactly the read shape, and the check must tell it from the old spelling, a wrong value and a missing filter.
+test('fixture 11 filters its High Priority view on Priority 5 in the shape the view builder reads', () => {
+  const spec = loadFixtures(path.join(__dirname, '..', 'fixtures')).find((f) => f.id === 11).spec;
+  const filtersPriorityFive = (s) => {
+    const view = (s.views || []).find((v) => v.name === 'High Priority');
+    return !!view && Array.isArray(view.filters)
+      && view.filters.some((f) => f && f.attr === 'cnt_priority' && f.op === 'eq' && f.value === 5);
+  };
+  const mutated = (mutate) => {
+    const s = structuredClone(spec);
+    mutate(s.views.find((v) => v.name === 'High Priority'));
+    return filtersPriorityFive(s);
+  };
+  assert.strictEqual(filtersPriorityFive(spec), true, 'the fixture filters Priority to 5');
+  assert.strictEqual(mutated((v) => { v.filter = [{ column: 'cnt_priority', operator: 'eq', value: 5 }]; delete v.filters; }), false, 'the old filter[].column/operator spelling');
+  assert.strictEqual(mutated((v) => { v.filters[0].value = 1; }), false, 'a wrong value');
+  assert.strictEqual(mutated((v) => { delete v.filters; }), false, 'no filter');
+});
+
+// The runner grades the same thing on a generated spec: fixture 11's expectation names the filter the prompt asks for, and the check reads
+// the conditions the view builder compiled, so a spelling it ignores grades as a missing filter.
+const FILTER_ASSERTION = 'ui: a view filter the prompt names is built from filters[] attr/op/value';
+async function gradeViewFilter(mutate, mutateEval) {
+  const fixture = fixtureFor(11);
+  const spec = structuredClone(fixture.spec);
+  if (mutate) mutate(spec.views.find((v) => v.name === 'High Priority'), spec);
+  const ev = structuredClone(evalsManifest.evals.find((e) => e.id === 11));
+  if (mutateEval) mutateEval(ev);
+  const facts = await stageFacts(spec, { fixture });
+  return ASSERTIONS.get(FILTER_ASSERTION)({ facts, spec, eval: ev });
+}
+
+test('the view-filter expectation of fixture 11 is written from the prompt and graded in its own assertion', () => {
+  const ev = evalsManifest.evals.find((e) => e.id === 11);
+  assert.deepStrictEqual(ev.expect.viewFilters, [{ entity: 'cnt_shipment', view: 'High Priority', attr: 'cnt_priority', op: 'eq', value: 5 }]);
+  assert.ok(ev.expectations.includes(FILTER_ASSERTION), 'the assertion is listed in the eval expectations');
+  assert.ok(/Priority 5/.test(ev.prompt), 'the prompt names the filter the expectation checks');
+});
+
+test('view-filter grading: the right filter passes; a missing filter, the old spelling, a wrong value, op or column fail', async () => {
+  assert.strictEqual((await gradeViewFilter()).status, 'pass');
+  const missing = await gradeViewFilter((v) => { delete v.filters; });
+  assert.strictEqual(missing.status, 'fail', 'no filter');
+  assert.match(missing.reason, /no condition cnt_priority eq 5/);
+  assert.strictEqual((await gradeViewFilter((v) => { v.filter = [{ column: 'cnt_priority', operator: 'eq', value: 5 }]; delete v.filters; })).status, 'fail', 'old filter[].column/operator spelling');
+  assert.strictEqual((await gradeViewFilter((v) => { v.filters = [{ column: 'cnt_priority', operator: 'eq', value: 5 }]; })).status, 'fail', 'old column/operator inside filters[]');
+  assert.strictEqual((await gradeViewFilter((v) => { v.filters[0].value = 1; })).status, 'fail', 'wrong value');
+  assert.strictEqual((await gradeViewFilter((v) => { v.filters[0].op = 'ne'; })).status, 'fail', 'wrong operator');
+  assert.strictEqual((await gradeViewFilter((v) => { v.filters[0].attr = 'cnt_stage'; })).status, 'fail', 'wrong column');
+  assert.strictEqual((await gradeViewFilter((v) => { v.name = 'Urgent'; })).status, 'fail', 'the filter on a view with another name');
+});
+
+test('view-filter grading: the active-records condition is neither the filter nor in the way of it', async () => {
+  assert.strictEqual((await gradeViewFilter((v) => { v.activeOnly = false; })).status, 'pass', 'activeOnly false leaves the filter');
+  assert.strictEqual((await gradeViewFilter((v) => { v.filters = []; v.activeOnly = true; })).status, 'fail', 'statecode alone is not a Priority filter');
+  assert.strictEqual((await gradeViewFilter(null, (ev) => { ev.expect.viewFilters = [{ entity: 'cnt_shipment', view: 'High Priority', attr: 'statecode', op: 'eq', value: 0 }]; })).status, 'fail', 'the auto condition is not matchable as a filter');
+  assert.strictEqual((await gradeViewFilter(null, (ev) => { delete ev.expect.viewFilters; })).status, 'fail', 'no independent expectation grades nothing');
+});
+
+test('view-filter grading: a declared view is graded as the declared compiler builds it, so a filter on a joined table is not one on the view\'s own table', async () => {
+  const join = (v) => { v.reconcile = 'declared'; v.linkEntities = [{ name: 'contact', from: 'contactid', to: 'ownerid', alias: 'c' }]; };
+  assert.strictEqual((await gradeViewFilter((v) => { v.reconcile = 'declared'; })).status, 'pass', 'declared, no join');
+  assert.strictEqual((await gradeViewFilter((v) => { v.reconcile = 'declared'; v.filters[0].value = 'High'; })).status, 'pass', 'a choice label resolves to its value as the build resolves it');
+  assert.strictEqual((await gradeViewFilter(join)).status, 'pass', 'a join the filter does not use leaves the filter on the view\'s own table');
+  const scoped = await gradeViewFilter((v) => { join(v); v.filters[0].relatedEntity = 'c'; });
+  assert.strictEqual(scoped.status, 'fail', 'the same condition scoped to the joined table constrains another table');
+  assert.match(scoped.reason, /no condition cnt_priority eq 5/);
+  assert.strictEqual((await gradeViewFilter((v) => { join(v); v.filters.push({ ...v.filters[0] }); v.filters[0].relatedEntity = 'c'; })).status, 'pass', 'an unscoped condition beside a scoped one still counts');
+  assert.strictEqual((await gradeViewFilter((v) => { join(v); v.filters[0].relatedEntity = 'nope'; })).status, 'fail', 'a declared view that does not compile builds no filter');
+});
+
+test('a declared view with a malformed join collection is graded invalid by the validator, with every other grade kept, and never throws in the facts', async () => {
+  const { gradeFixture } = require('../run-app-builder.js');
+  const base = fixtureFor(11);
+  const cases = [
+    ['linkEntities is an object', (v) => { v.reconcile = 'declared'; v.linkEntities = {}; }, /views\[0\]\.linkEntities must be an array/],
+    ['a join\'s filters is an object', (v) => { v.reconcile = 'declared'; v.linkEntities = [{ name: 'contact', from: 'contactid', to: 'ownerid', alias: 'c', filters: {} }]; }, /views\[0\]\.linkEntities\[0\]\.filters must be an array/],
+  ];
+  for (const [name, mutate, diagnostic] of cases) {
+    const spec = structuredClone(base.spec);
+    mutate(spec.views.find((v) => v.name === 'High Priority'));
+    const { results } = await gradeFixture({ ...base, spec }, evalsManifest.evals.find((e) => e.id === 11), evalsManifest);
+    assert.ok(!results.some((r) => r.text === 'stage facts computed without error'), `${name}: the facts are computed`);
+    assert.ok(results.length > 20, `${name}: the other assertions still run (${results.length})`);
+    const gate = results.find((r) => r.text === 'author: validateAppSpec(plan profile) passes with no errors');
+    assert.strictEqual(gate.result.status, 'fail', name);
+    assert.match(gate.result.reason, diagnostic, `${name}: the validator's own diagnostic is the reason`);
+    assert.strictEqual(results.find((r) => r.text === 'data: schema-facts provision exactly the expected tables').result.status, 'pass', `${name}: an unrelated grade is unchanged`);
+  }
+});
+
+test('view grading by name and the other stage assertions are unchanged by the view-filter facts', async () => {
+  const fixture = fixtureFor(11);
+  const facts = await stageFacts(fixture.spec, { fixture });
+  const ev = evalsManifest.evals.find((e) => e.id === 11);
+  const named = 'ui: wire-facts build exactly the expected views and charts';
+  assert.strictEqual(score(named, facts, fixture).status, 'pass');
+  const other = structuredClone(fixture.spec);
+  other.views[0].name = 'Urgent';
+  assert.strictEqual(ASSERTIONS.get(named)({ facts: await stageFacts(other, { fixture }), spec: other, eval: ev }).status, 'fail', 'a renamed view still fails the name check');
+  assert.deepStrictEqual(Object.keys(facts.ui.views[0]).sort(), ['columns', 'conditions', 'entity', 'name']);
+});
+
+const grade2210 = (id, mutate) => {
+  const ev = evalsManifest.evals.find((e) => e.id === id);
+  const spec = structuredClone(loadFixtures(path.join(__dirname, '..', 'fixtures')).find((f) => f.id === id).spec);
+  if (mutate) mutate(spec);
+  return ASSERTIONS.get(ev.expectations[0])({ spec, eval: ev, facts: {} }).status;
+};
+
+test('option-value grading ties each number to its label, not only to its presence', () => {
+  const priority = (s) => s.entities[0].columns.find((c) => c.schemaName === 'cnt_priority');
+  assert.strictEqual(grade2210(11), 'pass');
+  assert.strictEqual(grade2210(11, (s) => { const o = s.globalChoices[0].options; [o[0].label, o[1].label] = [o[1].label, o[0].label]; }), 'fail', 'North and South swapped keep 1 and 2');
+  assert.strictEqual(grade2210(11, (s) => { const o = priority(s).options; [o[0].label, o[1].label] = [o[1].label, o[0].label]; }), 'fail', 'Low and High swapped keep 1 and 5');
+  assert.strictEqual(grade2210(11, (s) => { priority(s).options[0].label['1036'] = 'Faible'; }), 'pass', 'a translation the prompt does not state is not graded');
+});
+
+test('field-security grading checks each profile\'s grants and named principals', () => {
+  const hr = (s) => s.fieldSecurityProfiles.find((p) => p.key === 'hr');
+  const payroll = (s) => s.fieldSecurityProfiles.find((p) => p.key === 'payroll');
+  assert.strictEqual(grade2210(13), 'pass');
+  assert.strictEqual(grade2210(13, (s) => { for (const x of hr(s).permissions) { x.read = false; x.create = false; x.update = false; } }), 'fail', 'HR granted nothing');
+  assert.strictEqual(grade2210(13, (s) => { hr(s).assignTo = { users: ['22222222-2222-4222-8222-222222222222'] }; }), 'fail', 'HR team replaced by an unrelated user');
+  assert.strictEqual(grade2210(13, (s) => { hr(s).assignTo = { teams: ['22222222-2222-4222-8222-222222222222'] }; }), 'fail', 'HR assigned to a different team');
+  assert.strictEqual(grade2210(13, (s) => { payroll(s).permissions[0].update = true; }), 'fail', 'Payroll given update');
+  assert.strictEqual(grade2210(13, (s) => { hr(s).assignTo.teams = hr(s).assignTo.teams.map((t) => t.toUpperCase()); }), 'pass', 'a GUID compares case-insensitively');
+  assert.strictEqual(grade2210(13, (s) => { payroll(s).permissions[0].update = false; }), 'pass', 'an explicit false is no grant');
+});
+
+test('app membership expectations pass on their fixtures and fail when the spec drifts from the prompt', async () => {
+  const fixtures = loadFixtures(path.join(__dirname, '..', 'fixtures'));
+  const grade = (id, mutate, evMutate) => {
+    const ev = structuredClone(evalsManifest.evals.find((e) => e.id === id));
+    const spec = structuredClone(fixtures.find((f) => f.id === id).spec);
+    if (mutate) mutate(spec);
+    if (evMutate) evMutate(ev);
+    return ASSERTIONS.get(ev.expectations[0])({ spec, eval: ev, facts: {} }).status;
+  };
+  for (const id of [14, 15]) assert.strictEqual(grade(id), 'pass', `eval ${id}`);
+  assert.strictEqual(grade(14, (s) => { delete s.app.mainFormsOnUpdate; }), 'fail');
+  assert.strictEqual(grade(14, (s) => { s.app.mainForms.contoso_item.push('Details'); }), 'fail');
+  assert.strictEqual(grade(14, (s) => { s.minimumPluginVersion = '2.20.6'; }), 'fail');
+  // The negative: "add the Summary form" expects no "exact", so the exact fixture fails it and the plain list passes.
+  const addOnly = (ev) => { ev.prompt = 'Add the Summary form to Items.'; delete ev.expect.appMembership.mainFormsOnUpdate; };
+  assert.strictEqual(grade(14, null, addOnly), 'fail');
+  assert.strictEqual(grade(14, (s) => { delete s.app.mainFormsOnUpdate; }, addOnly), 'pass');
+  assert.strictEqual(grade(15, (s) => { delete s.app.pinDeclaredArtifacts; }), 'fail');
+  assert.strictEqual(grade(15, (s) => { s.appShell.areas[0].groups[0].subAreas.push({ entity: 'cnt_expense', title: 'Expenses' }); }), 'fail');
+  assert.strictEqual(grade(15, (s) => { s.charts = []; }), 'fail');
+
+  // The all-present reader answers an exact Main-form list only when it is read strictly.
+  const spec = fixtures.find((f) => f.id === 14).spec;
+  const reader = makeAllPresentReader(spec);
+  assert.strictEqual((await reader.appMainForms('x', spec.app.mainForms)).kind, 'inconclusive');
+  assert.deepStrictEqual((await reader.appMainForms('x', spec.app.mainForms, { strict: true })).tables, [{ table: 'contoso_item', extras: [], missing: [] }]);
+});
+
+test('the branding expectations pass on their fixture, and an ordinary app ask must not get a theme', async () => {
+  const fixture = fixtureFor(19);
+  const ev19 = evalsManifest.evals.find((e) => e.id === 19);
+  const [authorText, verifyText] = ev19.expectations;
+  const grade = (mutate, evMutate) => {
+    const ev = structuredClone(ev19);
+    const spec = structuredClone(fixture.spec);
+    if (mutate) mutate(spec);
+    if (evMutate) evMutate(ev);
+    return ASSERTIONS.get(authorText)({ spec, eval: ev, facts: {} }).status;
+  };
+  assert.strictEqual(grade(), 'pass');
+  assert.strictEqual(grade((s) => { delete s.app.theme; }), 'fail', 'a branding ask with no theme');
+  assert.strictEqual(grade((s) => { s.minimumPluginVersion = '2.20.6'; }), 'fail');
+  assert.strictEqual(grade((s) => { s.app.theme.basePaletteColor = '#C50F1F'; }), 'fail', 'a colour the prompt did not ask for');
+  assert.strictEqual(grade((s) => { s.app.theme.basePaletteColor = '#0f6cbd'; }), 'pass', 'a colour compares case-insensitively');
+  assert.strictEqual(grade((s) => { delete s.app.theme.appHeader.foreground; }), 'fail');
+  assert.strictEqual(grade((s) => { s.app.theme.font = 'Segoe UI'; }), 'fail', 'a font the prompt does not name');
+  assert.strictEqual(grade((s) => { s.app.theme.logo.webResourceName = 'https://contoso.example/logo.svg'; }), 'fail', 'a URL logo');
+  assert.strictEqual(grade((s) => { s.webResources = []; }), 'fail', 'a logo that is not declared');
+  assert.strictEqual(grade((s) => { s.webResources[0].type = 'js'; }), 'fail', 'a logo that is not an image');
+  // The negative: an ordinary app prompt states no branding, so any theme on it is invented.
+  const ordinary = (ev) => { ev.prompt = 'A new Field Visits app for site visits.'; delete ev.expect.appTheme; };
+  assert.strictEqual(grade(null, ordinary), 'fail');
+  assert.strictEqual(grade((s) => { delete s.app.theme; }, ordinary), 'pass');
+
+  // verify reads the theme as API state and passes only a live one; any other state, or no reader, fails.
+  const verifyWith = async (states) => {
+    const reader = makeAllPresentReader(fixture.spec);
+    if (states === null) delete reader.appTheme;
+    else if (states) reader.appTheme = async () => states;
+    const facts = await stageFacts(fixture.spec, { fixture, verifyReader: reader });
+    return ASSERTIONS.get(verifyText)({ facts, spec: fixture.spec, eval: ev19 }).status;
+  };
+  assert.strictEqual(await verifyWith(), 'pass');
+  assert.strictEqual(await verifyWith([{ key: 'app.theme', ok: false, state: 'pendingPublish', reasons: [] }]), 'fail');
+  assert.strictEqual(await verifyWith([{ key: 'app.theme', ok: false, state: 'mismatch' }]), 'fail');
+  assert.strictEqual(await verifyWith(null), 'fail', 'no theme reader is unverified, not proven');
+});
+
+test('declared reconciliation expectations pass on their fixture and fail when the spec drifts from the prompt', () => {
+  const fixtures = loadFixtures(path.join(__dirname, '..', 'fixtures'));
+  const ev16 = evalsManifest.evals.find((e) => e.id === 16);
+  const grade = (text, mutate, evMutate) => {
+    const ev = structuredClone(ev16);
+    const spec = structuredClone(fixtures.find((f) => f.id === 16).spec);
+    if (mutate) mutate(spec);
+    if (evMutate) evMutate(ev);
+    return ASSERTIONS.get(text)({ spec, eval: ev, facts: {} }).status;
+  };
+  const [declared, search, joins] = ev16.expectations;
+  for (const text of ev16.expectations) assert.strictEqual(grade(text), 'pass', text);
+  const view = (s, name) => s.views.find((v) => v.name === name);
+  const ticket = (s) => s.entities.find((e) => e.schemaName === 'cnt_ticket');
+
+  assert.strictEqual(grade(declared, (s) => { delete view(s, 'Customer Directory').reconcile; }), 'fail', 'a view left undeclared');
+  assert.strictEqual(grade(declared, (s) => { delete s.charts[0].reconcile; }), 'fail', 'a chart left undeclared');
+  assert.strictEqual(grade(declared, (s) => { s.forms[0].reconcile = 'declared'; }), 'fail', 'reconcile on a form');
+  assert.strictEqual(grade(declared, (s) => { s.charts[0].title = 'Tickets'; }), 'fail', 'a title on a new chart');
+  assert.strictEqual(grade(declared, (s) => { view(s, 'Customer Directory').name = 'Active Customers'; }), 'fail', 'the stock default view name');
+  assert.strictEqual(grade(declared, (s) => { s.commandBars = [{ entity: 'cnt_ticket', commands: [{ key: 'close', label: 'Close' }] }]; }), 'fail', 'a command key');
+  assert.strictEqual(grade(declared, (s) => { s.minimumPluginVersion = '2.20.6'; }), 'fail');
+
+  assert.strictEqual(grade(search, (s) => { delete ticket(s).quickFind; }), 'fail', 'a new table without search columns');
+  assert.strictEqual(grade(search, (s) => { ticket(s).quickFind.findColumns = ['cnt_name']; }), 'fail', 'the ticket number the prompt names');
+  assert.strictEqual(grade(search, (s) => { ticket(s).quickFind.findColumns = ['cnt_ticketnumber']; }), 'fail', 'the primary name');
+  assert.strictEqual(grade(search, (s) => { ticket(s).changeTrackingEnabled = true; }), 'fail', 'change tracking unasked');
+  assert.strictEqual(grade(search, (s) => { ticket(s).changeTrackingEnabled = true; }, (ev) => { ev.expect.changeTracking = true; }), 'pass', 'change tracking asked for');
+  assert.strictEqual(grade(search, null, (ev) => { delete ev.expect.quickFind; }), 'fail', 'no independent expectation');
+
+  assert.strictEqual(grade(joins, (s) => { delete view(s, 'Open Tickets').linkEntities; }), 'fail', 'the join removed');
+  assert.strictEqual(grade(joins, (s) => { view(s, 'Open Tickets').columns = view(s, 'Open Tickets').columns.filter((c) => typeof c === 'string'); }), 'fail', 'no joined column shown');
+  assert.strictEqual(grade(joins, (s) => { view(s, 'Open Tickets').columns[2].relatedEntity = 'acct'; }), 'fail', 'a column naming no join');
+  assert.strictEqual(grade(joins, (s) => { delete view(s, 'Open Tickets').reconcile; }), 'fail', 'a join on an undeclared view');
+  assert.strictEqual(grade(joins, (s) => { view(s, 'Customer Directory').linkEntities = structuredClone(view(s, 'Open Tickets').linkEntities); }), 'fail', 'a join the prompt did not ask for');
+});
+
+test('configuration expectations pass on their fixture, fail when the spec drifts, and the fixture settings bind every declared item', () => {
+  const fixtures = loadFixtures(path.join(__dirname, '..', 'fixtures'));
+  const ev18 = evalsManifest.evals.find((e) => e.id === 18);
+  const fixtureSpec = fixtures.find((f) => f.id === 18).spec;
+  const grade = (mutate, evMutate) => {
+    const ev = structuredClone(ev18);
+    const spec = structuredClone(fixtureSpec);
+    if (mutate) mutate(spec);
+    if (evMutate) evMutate(ev);
+    return ASSERTIONS.get(ev18.expectations[0])({ spec, eval: ev, facts: {} }).status;
+  };
+  const secret = (s) => s.environmentVariables.find((v) => v.type === 'secret');
+  assert.strictEqual(grade(), 'pass');
+  assert.strictEqual(grade((s) => { s.minimumPluginVersion = '2.20.6'; }), 'fail', 'below the release that reads configuration');
+  assert.strictEqual(grade((s) => { secret(s).defaultValue = 'k'; }), 'fail', 'a secret value in the spec');
+  assert.strictEqual(grade((s) => { secret(s).type = 'string'; }), 'fail', 'the API key not declared secret');
+  assert.strictEqual(grade((s) => { s.environmentVariables[0].currentValue = 'https://x'; }), 'fail', 'a current value in the spec');
+  assert.strictEqual(grade((s) => { s.connectionReferences[0].connectionId = '0'; }), 'fail', 'a connection id in the spec');
+  assert.strictEqual(grade((s) => { delete s.customApis; }), 'fail', 'the Escalate action missing');
+  assert.strictEqual(grade((s) => { s.duplicateDetectionRules = []; }), 'fail', 'the duplicate rule missing');
+  assert.strictEqual(grade((s) => { s.connectionReferences.push({ logicalName: 'contoso_extra', connectorId: '/providers/Microsoft.PowerApps/apis/shared_office365' }); }), 'fail', 'a reference the prompt did not ask for');
+  assert.strictEqual(grade((s) => { delete s.solution.version; }), 'fail', 'the version the prompt names');
+  assert.strictEqual(grade((s) => { s.solution.version = '1.0.0.0'; }), 'fail', 'a different version');
+  assert.strictEqual(grade(null, (ev) => { delete ev.expect.configuration; }), 'fail', 'no independent expectation');
+
+  // The runner grades the spec alone, so the per-environment half of the fixture is checked here: its
+  // deployment-settings file binds every declared reference and gives every secret its value, with no error.
+  const { readDeploymentBindings } = require('../../../../plugins/model-apps/scripts/lib/configuration-artifacts.js');
+  const settings = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'fixtures', '18-configuration-items', 'deployment-settings.json'), 'utf8'));
+  const bindings = readDeploymentBindings(settings, fixtureSpec);
+  assert.deepStrictEqual(bindings.errors, []);
+  for (const r of fixtureSpec.connectionReferences) assert.ok(bindings.connectionReferences.has(r.logicalName.toLowerCase()), r.logicalName);
+  for (const v of fixtureSpec.environmentVariables.filter((e) => e.type === 'secret')) assert.ok(bindings.environmentVariables.has(v.schemaName.toLowerCase()), v.schemaName);
+});
+
+test('stable-identity expectations pass on their fixture, a download prompt must not gain the field, and the skill teaches the stop', () => {
+  const fixture = fixtureFor(20);
+  const ev20 = evalsManifest.evals.find((e) => e.id === 20);
+  const [optIn, explained] = ev20.expectations;
+  const grade = (mutate, evMutate) => {
+    const ev = structuredClone(ev20);
+    const spec = structuredClone(fixture.spec);
+    if (mutate) mutate(spec);
+    if (evMutate) evMutate(ev);
+    return ASSERTIONS.get(optIn)({ spec, eval: ev, facts: {} }).status;
+  };
+  assert.strictEqual(grade(), 'pass');
+  assert.strictEqual(grade((s) => { delete s.createIdentity; }), 'fail', 'a new app without stable ids');
+  assert.strictEqual(grade((s) => { s.createIdentity = 'stable-v2'; }), 'fail', 'a value the plugin does not know');
+  assert.strictEqual(grade((s) => { s.minimumPluginVersion = '2.20.6'; }), 'fail', 'below the release that reads the field');
+  assert.strictEqual(grade((s) => { for (const x of [...s.views, ...s.charts]) delete x.reconcile; }), 'fail', 'no declared view or chart to use it');
+  // The negative: a download prompt is not a new app, so the field on its spec is invented, and the plain spec passes.
+  const download = (ev) => { ev.prompt = 'Download the Equipment Loans app into a spec.'; delete ev.expect.createIdentity; };
+  assert.strictEqual(grade(null, download), 'fail');
+  assert.strictEqual(grade((s) => { delete s.createIdentity; }, download), 'pass');
+
+  // The fixture spec also passes the plugin's own validation and lint with no createIdentity finding.
+  const { validateAppSpec } = require('../../../../plugins/model-apps/scripts/lib/app-spec.js');
+  const { lintAppSpec } = require('../../../../plugins/model-apps/scripts/lib/spec-lint.js');
+  assert.deepStrictEqual(validateAppSpec(fixture.spec).errors || [], []);
+  const lint = lintAppSpec(fixture.spec);
+  const findings = [...(lint.errors || []), ...(lint.warnings || [])].map((w) => (typeof w === 'string' ? w : JSON.stringify(w)));
+  assert.deepStrictEqual(findings.filter((w) => /createIdentity|create-identity/.test(w)), []);
+
+  // The explanation is graded on the real skill, and fails when the bullet stops saying what the maker must hear.
+  const real = fs.readFileSync(path.join(__dirname, '..', '..', '..', '..', 'plugins', 'model-apps', 'skills', 'app-builder', 'SKILL.md'), 'utf8');
+  const teach = (skill) => ASSERTIONS.get(explained)({ spec: fixture.spec, eval: ev20, facts: skill === undefined ? {} : { appBuilderSkill: skill } }).status;
+  assert.strictEqual(teach(), 'pass');
+  assert.strictEqual(teach(real.replace('does not merge', 'merges')), 'fail', 'the stop described as a merge');
+  assert.strictEqual(teach(real.replace(/create-completion-required/g, 'a refusal')), 'fail', 'the stop not named');
+  assert.strictEqual(teach(real.replace(/createIdentity/g, 'stableIds')), 'fail', 'no createIdentity guidance');
+});
+
+// Optional capabilities: the spec-level opt-in, in both directions, on every fixture. What the evals grade for the offer flow
+// (#804) is this: a capability is in the spec only when the prompt asks for it, and one it asks for is authored. Whether the
+// flow makes the offer needs a transcript of a conversation, which no offline fixture records (EVAL_GUIDE.md).
+const OPTIONAL = 'author: an optional capability is in the spec only when the prompt asks for it, and each one it asks for is authored as expected';
+const NO_LOGIC = 'author: a maker who declines business rules and process flows gets no rule and no flow of any kind';
+function gradeOptional(id, mutate, mutateEval, text = OPTIONAL) {
+  const fixture = fixtureFor(id);
+  const ev = structuredClone(evalsManifest.evals.find((e) => e.id === id));
+  const spec = structuredClone(fixture.spec);
+  if (mutate) mutate(spec);
+  if (mutateEval) mutateEval(ev);
+  return ASSERTIONS.get(text)({ spec, eval: ev, facts: {} });
+}
+const reasonOf = (result) => result.reason || '';
+
+test('the opt-in check is a common assertion, so every fixture is graded by it, and every shipped fixture passes', () => {
+  assert.ok(evalsManifest.common_stage_assertions.includes(OPTIONAL));
+  const fixtures = loadFixtures(path.join(__dirname, '..', 'fixtures'));
+  assert.ok(fixtures.length >= 25);
+  for (const f of fixtures) assert.deepStrictEqual(gradeOptional(f.id), { status: 'pass' }, `fixture ${f.id}`);
+});
+
+test('an optional capability nobody asked for fails on any fixture, an older one included', () => {
+  const unasked = {
+    'an app theme': (s) => { s.app = { ...s.app, theme: { basePaletteColor: '#123456' } }; s.minimumPluginVersion = '2.21.0'; },
+    'an environment variable': (s) => { s.environmentVariables = [{ schemaName: 'new_Base', displayName: 'Base', type: 'string' }]; },
+    'a connection reference': (s) => { s.connectionReferences = [{ logicalName: 'new_sp', connectorId: 'shared_sharepointonline' }]; },
+    'a Custom API': (s) => { s.customApis = [{ uniqueName: 'new_Api' }]; },
+    'a duplicate-detection rule': (s) => { s.duplicateDetectionRules = [{ entity: 'new_customer' }]; },
+    'a solution version': (s) => { s.solution = { ...s.solution, version: '1.0.0.0' }; },
+    'a declared form': (s) => { s.forms = [...(s.forms || []), { entity: 'new_customer', formType: 'Main', name: 'Layout', reconcile: 'declared' }]; },
+    'a declared dashboard': (s) => { s.dashboards = [...(s.dashboards || []), { name: 'Board', key: 'board', reconcile: 'declared', tiles: [] }]; },
+    'a declared business rule': (s) => { s.businessRules = [...(s.businessRules || []), { entity: 'new_customer', name: 'Rule', key: 'rule', reconcile: 'declared', scope: 'Entity' }]; },
+    'a declared process flow': (s) => { s.businessProcessFlows = [...(s.businessProcessFlows || []), { entity: 'new_customer', name: 'Flow', reconcile: 'declared', stages: [] }]; },
+  };
+  const ordinary = [1, 2, 3, 4, 5, 6, 10, 11, 20];
+  for (const id of ordinary) {
+    for (const [name, mutate] of Object.entries(unasked)) {
+      assert.strictEqual(gradeOptional(id, mutate).status, 'fail', `fixture ${id}: ${name}`);
+    }
+  }
+  assert.match(reasonOf(gradeOptional(1, unasked['an app theme'])), /app\.theme is declared, but the prompt asks for no branding/);
+  assert.match(reasonOf(gradeOptional(1, unasked['a declared business rule'])), /businessRules declared on \[new_customer\], but the prompt asks to keep no businessRules declared/);
+});
+
+test('a capability the prompt asks for must be authored: deleting it, or dropping its reconcile, fails on each positive fixture', () => {
+  // Theme (19) and configuration (18).
+  assert.strictEqual(gradeOptional(19, (s) => { delete s.app.theme; }).status, 'fail', 'a branding ask with no theme');
+  for (const field of ['environmentVariables', 'connectionReferences', 'customApis', 'duplicateDetectionRules']) {
+    assert.strictEqual(gradeOptional(18, (s) => { delete s[field]; }).status, 'fail', `18: ${field} deleted`);
+  }
+  assert.strictEqual(gradeOptional(18, (s) => { delete s.solution.version; }).status, 'fail', '18: the solution version deleted');
+  // Declared forms (21), dashboards (22), rules (23), flows (24): graded by kind and table, nothing finer.
+  const positives = [
+    [21, 'forms', (x) => x.name === 'Site Layout'],
+    [22, 'dashboards', (x) => x.name === 'Field Operations'],
+    [23, 'businessRules', (x) => x.name === 'Close out a request'],
+    [24, 'businessProcessFlows', (x) => x.name === 'Claim handling'],
+  ];
+  for (const [id, kind, isIt] of positives) {
+    assert.strictEqual(gradeOptional(id, (s) => { s[kind] = s[kind].filter((x) => !isIt(x)); }).status, 'fail', `${id}: ${kind} entry deleted`);
+    assert.strictEqual(gradeOptional(id, (s) => { delete s[kind].find(isIt).reconcile; }).status, 'fail', `${id}: reconcile removed`);
+    assert.strictEqual(gradeOptional(id, (s) => { s[kind].find(isIt).reconcile = 'adopt'; }).status, 'fail', `${id}: reconcile is not "declared"`);
+    assert.match(reasonOf(gradeOptional(id, (s) => { delete s[kind].find(isIt).reconcile; })), /missing \(deleted, or without reconcile "declared"\)|missing: \[/);
+    // A name is the maker's to choose, whether or not the prompt gives one.
+    assert.strictEqual(gradeOptional(id, (s) => { s[kind].find(isIt).name = 'Another name'; }).status, 'pass', `${id}: ${kind} renamed`);
+  }
+  assert.strictEqual(gradeOptional(23, (s) => { s.businessRules.pop(); }).status, 'fail', 'one of the two rules the prompt asks for is missing');
+  // The table is graded: the artifact on another table is a different capability.
+  assert.strictEqual(gradeOptional(21, (s) => { s.forms.find((x) => x.name === 'Site Layout').entity = 'cnt_issue'; }).status, 'fail', 'a form on another table');
+  assert.strictEqual(gradeOptional(23, (s) => { s.businessRules.forEach((r) => { r.entity = 'cnt_other'; }); }).status, 'fail', 'rules on another table');
+  assert.strictEqual(gradeOptional(24, (s) => { s.businessProcessFlows[0].entity = 'cnt_other'; }).status, 'fail', 'a flow on another table');
+  // A kind the prompt did not ask for fails even on a positive fixture.
+  assert.strictEqual(gradeOptional(23, (s) => { s.businessProcessFlows = [{ entity: 'cnt_request', name: 'Extra', reconcile: 'declared', stages: [] }]; }).status, 'fail', 'a flow nobody asked for beside the rules');
+  assert.strictEqual(gradeOptional(21, (s) => { s.dashboards = [{ name: 'Board', key: 'board', reconcile: 'declared', tiles: [] }]; }).status, 'fail', 'a dashboard nobody asked for beside the form');
+  // Shape and wording are not THIS check's business, and the shapes of fixtures 22-24 are graded by their own assertions (below): another
+  // stage word, a reversed tile order, a rule scope swapped between two rules, or a changed tile kind still pass here.
+  assert.strictEqual(gradeOptional(24, (s) => { const st = s.businessProcessFlows[0].stages; st[1].name = 'Appraisal'; st[2].name = 'Outcome'; }).status, 'pass', 'other stage labels');
+  assert.strictEqual(gradeOptional(22, (s) => { s.dashboards[0].tiles.reverse(); }).status, 'pass', 'tiles in another order');
+  assert.strictEqual(gradeOptional(23, (s) => { const [r1, r2] = s.businessRules; [r1.scope, r2.scope] = [r2.scope, r1.scope]; }).status, 'pass', 'swapped scopes');
+  // The version floor still applies to a declared artifact.
+  assert.strictEqual(gradeOptional(24, (s) => { s.minimumPluginVersion = '2.20.6'; }).status, 'fail');  assert.strictEqual(gradeOptional(24, (s) => { s.minimumPluginVersion = '2.20.6'; }).status, 'fail');
+});
+
+test('the expectation side is checked too: a declared kind it does not know fails, and an ask it does not state is not allowed', () => {
+  assert.strictEqual(gradeOptional(21, null, (ev) => { ev.expect.declared.dashboard = []; }).status, 'fail', 'an unknown kind');
+  assert.strictEqual(gradeOptional(21, null, (ev) => { delete ev.expect.declared; }).status, 'fail', 'a declared form the prompt never asked for');
+  assert.strictEqual(gradeOptional(19, null, (ev) => { delete ev.expect.appTheme; }).status, 'fail', 'a theme with no branding ask');
+  assert.strictEqual(gradeOptional(18, null, (ev) => { ev.expect.configuration.customApis = []; }).status, 'fail', 'a Custom API with no ask');
+});
+
+test('what must NOT change: plain forms, dashboards, rules and flows are not optional capabilities, and a capability needs no offer record', () => {
+  // Not declared, so not the capability: ordinary authoring keeps passing.
+  assert.strictEqual(gradeOptional(1, (s) => { s.businessRules = [...(s.businessRules || []), { entity: 'new_customer', name: 'Plain rule' }]; }).status, 'pass');
+  assert.strictEqual(gradeOptional(1, (s) => { s.dashboards = [...(s.dashboards || []), { name: 'Plain board', tiles: [] }]; }).status, 'pass');
+  assert.strictEqual(gradeOptional(1, (s) => { s.environmentVariables = []; s.customApis = []; }).status, 'pass', 'an empty list is no capability');
+  // No fixture carries offer evidence and no assertion grades an offer: the evals grade the spec only.
+  for (const f of loadFixtures(path.join(__dirname, '..', 'fixtures'))) assert.strictEqual(f.evidence.offers, undefined, `fixture ${f.id}`);
+  assert.ok(![...ASSERTIONS.keys()].some((t) => /^offers:/.test(t)));
+});
+
+// The shape of a declared dashboard, business rule and process flow (fixtures 22-24). Each expectation is written from the prompt, and
+// each assertion reads what the plugin compiles for the artifact, so a mapping that drops a size, a binding, a condition or a stage fails.
+const DASHBOARD_SHAPE = 'process: a declared dashboard holds exactly the tiles the prompt describes, each bound to the view, chart or address it names and sized as asked';
+const RULE_SHAPE = 'process: each declared business rule has the condition, scope and actions the prompt describes';
+const FLOW_SHAPE = 'process: a declared process flow has exactly the stages the prompt names, in order';
+async function gradeShape(id, text, mutate, mutateEval) {
+  const fixture = fixtureFor(id);
+  const spec = structuredClone(fixture.spec);
+  if (mutate) mutate(spec);
+  const ev = structuredClone(evalsManifest.evals.find((e) => e.id === id));
+  if (mutateEval) mutateEval(ev);
+  const facts = await stageFacts(spec, { fixture });
+  return ASSERTIONS.get(text)({ facts, spec, eval: ev });
+}
+async function assertShape(id, text, mutate, reason, what) {
+  const result = await gradeShape(id, text, mutate);
+  assert.strictEqual(result.status, 'fail', `${what}: expected a failure, got ${result.status}`);
+  assert.match(reasonOf(result), reason, what);
+}
+const tilesOf = (s) => s.dashboards[0].tiles;
+const closeOutRule = (s) => s.businessRules.find((r) => r.key === 'close-out');
+const askRule = (s) => s.businessRules.find((r) => r.key === 'ask-assignee');
+
+test('the shape assertions of fixtures 22-24 are listed by their evals, and the expectations come from the prompts', () => {
+  for (const [id, text, key] of [[22, DASHBOARD_SHAPE, 'declaredDashboards'], [23, RULE_SHAPE, 'declaredRules'], [24, FLOW_SHAPE, 'declaredFlows']]) {
+    const ev = evalsManifest.evals.find((e) => e.id === id);
+    assert.ok(ev.expectations.includes(text), `eval ${id} lists its shape assertion`);
+    assert.ok(Array.isArray(ev.expect[key]) && ev.expect[key].length, `eval ${id} states ${key}`);
+  }
+  const prompt = (id) => evalsManifest.evals.find((e) => e.id === id).prompt;
+  assert.match(prompt(22), /wide list of open work orders, a chart of work orders by status and a tall crew map from https:\/\/contoso\.example\/field-map/);
+  assert.match(prompt(23), /closed request needs a resolution and its notes lock, and a request in progress with no assignee shows an error on every form/);
+  assert.match(prompt(24), /intake, assessment and a decision/);
+});
+
+test('the shipped fixtures 22-24 pass their shape assertions, and an eval that states no expectation cannot use one', async () => {
+  for (const [id, text, key] of [[22, DASHBOARD_SHAPE, 'declaredDashboards'], [23, RULE_SHAPE, 'declaredRules'], [24, FLOW_SHAPE, 'declaredFlows']]) {
+    assert.deepStrictEqual(await gradeShape(id, text), { status: 'pass' }, `fixture ${id}`);
+    const result = await gradeShape(id, text, null, (ev) => { delete ev.expect[key]; });
+    assert.strictEqual(result.status, 'fail', `fixture ${id} without ${key}`);
+    assert.match(reasonOf(result), /no independent expectation/);
+  }
+});
+
+test('declared dashboard shape: a missing, extra, unbound, re-addressed or undersized tile fails; names, order and extra size do not', async () => {
+  await assertShape(22, DASHBOARD_SHAPE, (s) => { tilesOf(s).pop(); }, /2 tile\(s\) \[list,chart\], the prompt asks for 3/, 'the map is missing');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => { tilesOf(s).push({ key: 'more', type: 'iframe', url: 'https://contoso.example/more', name: 'More' }); }, /4 tile\(s\)/, 'a tile nobody asked for');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => { delete tilesOf(s).find((t) => t.type === 'iframe').rowspan; }, /iframe of https:\/\/contoso\.example\/field-map is 12 row\(s\) tall, the prompt asks for more than 12/, 'the map is not tall');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => { tilesOf(s).find((t) => t.type === 'iframe').rowspan = 12; }, /row\(s\) tall/, 'the map is as tall as an unsized tile');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => { delete tilesOf(s).find((t) => t.type === 'list').colspan; }, /list of view "Open Work Orders" on cnt_workorder is 1 column\(s\) wide, the prompt asks for at least 2/, 'the list is not wide');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => { tilesOf(s).find((t) => t.type === 'iframe').url = 'https://contoso.example/other-map'; }, /no tile is the iframe of https:\/\/contoso\.example\/field-map/, 'the map address changed');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => {
+    s.views.push({ entity: 'cnt_workorder', name: 'All Work Orders', columns: ['cnt_name'] });
+    tilesOf(s).find((t) => t.type === 'list').view = 'All Work Orders';
+  }, /no tile is the list of view "Open Work Orders"/, 'the list shows another view');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => {
+    s.charts.push({ entity: 'cnt_workorder', name: 'Work Orders by Due', groupBy: 'cnt_dueon', measure: 'count', chartType: 'Column' });
+    tilesOf(s).find((t) => t.type === 'chart').chart = 'Work Orders by Due';
+  }, /no tile is the chart "Work Orders by Status"/, 'the chart tile shows another chart');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => { tilesOf(s).find((t) => t.type === 'chart').type = 'list'; }, /no tile is the chart "Work Orders by Status"/, 'the chart became a list');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => { delete s.dashboards[0].reconcile; }, /0 declared dashboard\(s\) \[\], the prompt asks for 1/, 'the dashboard is not declared');
+  await assertShape(22, DASHBOARD_SHAPE, (s) => { s.dashboards.push({ name: 'Second', key: 'second', reconcile: 'declared', tiles: [] }); }, /2 declared dashboard\(s\)/, 'a second declared dashboard');
+  // What the prompt leaves to the maker keeps its verdict.
+  const keeps = [
+    ['tiles in another order', (s) => { tilesOf(s).reverse(); }],
+    ['other tile names', (s) => { tilesOf(s).forEach((t, i) => { t.name = `Tile ${i}`; }); }],
+    ['a wider list and a taller map', (s) => { tilesOf(s).find((t) => t.type === 'list').colspan = 4; tilesOf(s).find((t) => t.type === 'iframe').rowspan = 30; }],
+  ];
+  for (const [what, mutate] of keeps) assert.deepStrictEqual(await gradeShape(22, DASHBOARD_SHAPE, mutate), { status: 'pass' }, what);
+});
+
+test('declared business rule shape: a changed condition, option, scope, logic or action fails; names, order and the unstated scope do not', async () => {
+  await assertShape(23, RULE_SHAPE, (s) => { closeOutRule(s).conditions[0].value = '100000000'; }, /no declared rule fires on exactly \[cnt_status Equals "Closed"\]/, 'closed became New');
+  await assertShape(23, RULE_SHAPE, (s) => { closeOutRule(s).conditions[0].operator = 'NotEqual'; }, /no declared rule fires on exactly/, 'another operator');
+  await assertShape(23, RULE_SHAPE, (s) => { closeOutRule(s).conditions[0].field = 'cnt_assignee'; }, /no declared rule fires on exactly/, 'another column');
+  await assertShape(23, RULE_SHAPE, (s) => { closeOutRule(s).actions = closeOutRule(s).actions.filter((a) => a.type !== 'LockUnlock'); }, /lacks the action\(s\) \[LockUnlock cnt_notes\]/, 'the lock is missing');
+  await assertShape(23, RULE_SHAPE, (s) => { closeOutRule(s).actions.find((a) => a.type === 'LockUnlock').lock = false; }, /lacks the action\(s\) \[LockUnlock cnt_notes\]/, 'the notes unlock');
+  await assertShape(23, RULE_SHAPE, (s) => { closeOutRule(s).actions.find((a) => a.type === 'SetBusinessRequired').required = false; }, /lacks the action\(s\) \[SetBusinessRequired cnt_resolution\]/, 'the resolution is not required');
+  await assertShape(23, RULE_SHAPE, (s) => { closeOutRule(s).actions.find((a) => a.type === 'SetBusinessRequired').field = 'cnt_notes'; }, /lacks the action\(s\) \[SetBusinessRequired cnt_resolution\]/, 'another required column');
+  await assertShape(23, RULE_SHAPE, (s) => { closeOutRule(s).actions.push({ key: 'hide', type: 'SetVisibility', field: 'cnt_notes', visible: false }); }, /carries the action\(s\) \[SetVisibility cnt_notes\] the prompt does not ask for/, 'an extra action');
+  await assertShape(23, RULE_SHAPE, (s) => { askRule(s).scope = 'Entity'; }, /its scope is Entity, the prompt asks for AllForms/, 'not every form');
+  await assertShape(23, RULE_SHAPE, (s) => { delete askRule(s).scope; }, /its scope is Entity, the prompt asks for AllForms/, 'the default scope');
+  await assertShape(23, RULE_SHAPE, (s) => { askRule(s).conditionLogic = 'OR'; }, /combine with OR, the prompt asks for AND/, 'either condition');
+  await assertShape(23, RULE_SHAPE, (s) => { askRule(s).conditions.pop(); }, /no declared rule fires on exactly \[cnt_status Equals "In Progress",cnt_assignee DoesNotContainData\]/, 'the assignee test is missing');
+  await assertShape(23, RULE_SHAPE, (s) => { askRule(s).conditions[1].operator = 'ContainsData'; }, /no declared rule fires on exactly/, 'an assignee is required rather than missing');
+  await assertShape(23, RULE_SHAPE, (s) => { askRule(s).actions[0].errorMessage = '  '; }, /lacks the action\(s\) \[ShowErrorMessage\]/, 'an empty message');
+  await assertShape(23, RULE_SHAPE, (s) => { askRule(s).actions[0].type = 'LockUnlock'; askRule(s).actions[0].lock = true; delete askRule(s).actions[0].errorMessage; }, /lacks the action\(s\) \[ShowErrorMessage\]/, 'a lock instead of an error');
+  await assertShape(23, RULE_SHAPE, (s) => { s.businessRules.pop(); }, /1 declared rule\(s\) \[Close out a request\], the prompt asks for 2/, 'one rule is missing');
+  await assertShape(23, RULE_SHAPE, (s) => { const [r1, r2] = s.businessRules; [r1.scope, r2.scope] = [r2.scope, r1.scope]; }, /its scope is Entity, the prompt asks for AllForms/, 'scopes swapped between the rules');
+  await assertShape(23, RULE_SHAPE, (s) => { closeOutRule(s).status = 'Draft'; }, /its status is Draft, the prompt asks for a rule that is Active/, 'a rule left as a draft');
+  await assertShape(23, RULE_SHAPE, (s) => { askRule(s).status = 'Inactive'; }, /its status is Inactive, the prompt asks for a rule that is Active/, 'an inactive rule');
+  const keeps = [
+    ['another rule name', (s) => { closeOutRule(s).name = 'Closing'; askRule(s).name = 'Assignee'; }],
+    ['rules in another order', (s) => { s.businessRules.reverse(); }],
+    ['conditions and actions in another order', (s) => { askRule(s).conditions.reverse(); closeOutRule(s).actions.reverse(); }],
+    ['the unstated scope of the closed rule', (s) => { closeOutRule(s).scope = 'AllForms'; }],
+    ['a rule that states it is Active', (s) => { closeOutRule(s).status = 'Active'; }],
+    ['another error message', (s) => { askRule(s).actions[0].errorMessage = 'Name an assignee.'; }],
+  ];
+  for (const [what, mutate] of keeps) assert.deepStrictEqual(await gradeShape(23, RULE_SHAPE, mutate), { status: 'pass' }, what);
+});
+
+test('declared process flow shape: a missing, extra, reordered or renamed stage fails; wording within the stage and its steps do not', async () => {
+  const flow = (s) => s.businessProcessFlows[0];
+  await assertShape(24, FLOW_SHAPE, (s) => { flow(s).stages.pop(); }, /2 stage\(s\) \[Intake,Assess\], the prompt names 3/, 'the decision is missing');
+  await assertShape(24, FLOW_SHAPE, (s) => { flow(s).stages.splice(1, 1); }, /2 stage\(s\)/, 'the assessment is missing');
+  await assertShape(24, FLOW_SHAPE, (s) => { flow(s).stages.push({ key: 'close', name: 'Close', steps: [{ key: 'x', name: 'X', field: 'cnt_decision' }] }); }, /4 stage\(s\)/, 'a stage nobody asked for');
+  await assertShape(24, FLOW_SHAPE, (s) => { flow(s).stages.reverse(); }, /stage 1 is "Decide", which is not \/intake\/i/, 'reversed');
+  await assertShape(24, FLOW_SHAPE, (s) => { const st = flow(s).stages; [st[0], st[1]] = [st[1], st[0]]; }, /stage 1 is "Assess"/, 'two swapped');
+  await assertShape(24, FLOW_SHAPE, (s) => { flow(s).stages[1].name = 'Appraisal'; }, /stage 2 is "Appraisal", which is not \/assess\/i/, 'the assessment renamed');
+  await assertShape(24, FLOW_SHAPE, (s) => { delete flow(s).reconcile; }, /0 declared flow\(s\) \[\], the prompt asks for 1/, 'the flow is not declared');
+  await assertShape(24, FLOW_SHAPE, (s) => { s.businessProcessFlows.push({ ...structuredClone(flow(s)), name: 'Another flow' }); }, /2 declared flow\(s\)/, 'a second flow');
+  const keeps = [
+    ['other wording for the same stages', (s) => { const st = flow(s).stages; st[0].name = 'Intake review'; st[1].name = 'Assessment'; st[2].name = 'Decision'; }],
+    ['another flow name', (s) => { flow(s).name = 'Handling'; }],
+    ['other steps', (s) => { flow(s).stages.forEach((st) => { st.steps = st.steps.slice(0, 1); }); }],
+    ['a stage key rename', (s) => { flow(s).stages[1].key = 'appraise'; }],
+  ];
+  for (const [what, mutate] of keeps) assert.deepStrictEqual(await gradeShape(24, FLOW_SHAPE, mutate), { status: 'pass' }, what);
+});
+
+test('the shape assertions read a declared artifact only: a plain dashboard, rule or flow never satisfies or spoils them', async () => {
+  const plainRule = { entity: 'cnt_request', name: 'Plain', conditions: [{ field: 'cnt_status', operator: 'Equals', value: '100000002', dataType: 'Picklist' }], actions: [{ type: 'LockUnlock', field: 'cnt_notes', lock: true }] };
+  assert.deepStrictEqual(await gradeShape(23, RULE_SHAPE, (s) => { s.businessRules.push(plainRule); }), { status: 'pass' }, 'a plain rule beside the declared ones');
+  await assertShape(23, RULE_SHAPE, (s) => { s.businessRules.forEach((r) => { delete r.reconcile; }); }, /0 declared rule\(s\) \[\], the prompt asks for 2/, 'no rule is declared');
+  const facts = await stageFacts(structuredClone(fixtureFor(22).spec), { fixture: fixtureFor(22) });
+  assert.deepStrictEqual(facts.declaredShapes.dashboards[0].tiles.map((t) => [t.type, t.colspan, t.rowspan]), [['list', 2, 12], ['chart', 1, 12], ['iframe', 1, 16]],
+    'an unsized tile is one column wide and the common 12 rows tall');
+});
+
+test('a maker who declines business rules and process flows gets none of ANY kind, graded independently of the declared-capability check', async () => {
+  const { gradeFixture } = require('../run-app-builder.js');
+  assert.ok(evalsManifest.evals.find((e) => e.id === 25).expectations.includes(NO_LOGIC));
+  assert.deepStrictEqual(gradeOptional(25, null, null, NO_LOGIC), { status: 'pass' });
+  const plainRule = (s) => { s.businessRules = [{ entity: 'cnt_part', name: 'Stock rule', conditions: [{ field: 'cnt_stock', operator: 'Equals', value: '0' }], actions: [{ type: 'SetBusinessRequired', field: 'cnt_price' }] }]; };
+  const plainFlow = (s) => { s.businessProcessFlows = [{ entity: 'cnt_part', name: 'Stock flow', stages: [{ name: 'One', steps: [{ name: 'Price', field: 'cnt_price' }] }] }]; };
+  for (const [name, mutate] of [['a plain business rule', plainRule], ['a plain process flow', plainFlow]]) {
+    assert.strictEqual(gradeOptional(25, mutate, null, NO_LOGIC).status, 'fail', name);
+    // The declared-capability check cannot see it (no reconcile), so this is not a duplicate of it.
+    assert.strictEqual(gradeOptional(25, mutate).status, 'pass', `${name}: invisible to the declared check`);
+    const base = fixtureFor(25);
+    const spec = structuredClone(base.spec);
+    mutate(spec);
+    const { results } = await gradeFixture({ ...base, spec }, evalsManifest.evals.find((e) => e.id === 25), evalsManifest);
+    assert.strictEqual(results.find((r) => r.text === NO_LOGIC).result.status, 'fail', `${name}: the runner reports it`);
+  }
+  // A declared one is caught by both.
+  assert.strictEqual(gradeOptional(25, (s) => { plainRule(s); s.businessRules[0].reconcile = 'declared'; }).status, 'fail');
+  // The check needs its expectation from the prompt: an eval that does not state it cannot use it.
+  assert.strictEqual(gradeOptional(25, null, (ev) => { delete ev.expect.noBusinessLogic; }, NO_LOGIC).status, 'fail');
+  // The same fixture still declines the theme and the configuration items through their own assertions.
+  assert.deepStrictEqual(evalsManifest.evals.find((e) => e.id === 25).expect.configuration, {});
+  assert.strictEqual(gradeOptional(25, (s) => { s.app.theme = { basePaletteColor: '#123456' }; s.minimumPluginVersion = '2.21.0'; }).status, 'fail');
+});

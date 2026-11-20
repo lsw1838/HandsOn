@@ -1,0 +1,367 @@
+# app-builder — capabilities
+
+What the `/app-builder` skill can do today, and how far each capability has been proven. The build
+engine is [`../scripts/lib/sdk-build.js`](../scripts/lib/sdk-build.js); the App Spec contract is
+[`../references/app-spec-schema.md`](../references/app-spec-schema.md); the wiring diagrams are in
+[`architecture.md`](architecture.md).
+
+This file records **shipped** behaviour only. Planned and unbuilt work is tracked in GitHub issues —
+the carried-over backlog is
+[#480](https://github.com/microsoft/power-platform-skills/issues/480). A roadmap committed alongside
+the code goes stale silently and states intent the code does not yet support, so the two are kept
+apart deliberately.
+
+**Evidence legend**
+- ✅ **verified live** — built end-to-end on a real Dataverse environment and torn down clean.
+- 🧪 **tested** — has automated (unit / golden / real-bundle) coverage, not exercised on a live org.
+- ⚠ **not live-verified** — plumbed through and unit-tested, awaiting a live shakeout.
+
+### Authoring & build framework — ✅ verified live
+- Interactive levelled authoring in the **main loop** — jobs-to-be-done first, then data model,
+  artifacts + page-intents, then access (env select, App Spec, lint gate, plan-mode approval).
+- Deterministic, **idempotent** build engine — discovers via the SDK (`findTables`/`findColumns`/`fetchEntityMetadata`) and creates only what's missing; new / existing / mixed envs all work.
+- **All Dataverse access via the vendored headless SDK**; metadata cached under `<app-folder>/.maker-workspace/` for reuse.
+- Phase selection (`--only`/`--skip`/`--from`/`--to`), `[n/total]` narration, `BuildHalt` gate, dry-run by default, `--sample-data` / `--publish` opt-in.
+- Bounded-concurrency for independent ops; one publish round-trip per entity + the app. A rebuild that changes nothing writes almost nothing: an existing view or form is pushed only when it differs from what was last synced, under `--publish` the tables the build changed, the tables whose Main forms its own pushes of the app add (those of the navigation each push sends), and the tables whose forms or charts the app is known to hold, are published together in one round-trip before the app (a publish naming only the app, sent first, leaves a saved form's label changes unpublished, whoever saved them) instead of once per view and form — a table the app is not known to hold a form or chart of (declared only, a lookup column's target, read only by a page, or only pinned in `app.tables`) is not published by it — and a solution's membership is read once so only the components it lacks are added. `az`-token HttpClient with transient (429 / 5xx) retry, honouring `Retry-After` up to 60 s (a 429 is waited out inside the run's throttle budget, below); a record delete, or a change set of conditional deletes (an app and its sitemap), is sent once unless its answer proves it did not run: SQL rolled it back as a deadlock victim (`Sql Number: 1205` — the last SQL number the answer gives, so a name a maker chose that quotes it in front of another SQL error is not one; for a change set, on every operation it answers; re-sent up to three times), or the server refused to start it with a 429 (re-sent on the throttle schedule). A change set that only creates columns (a new table's ordinary columns) is re-sent on a 429 alone, because a change set can commit behind any other lost or failed answer. The SDK separately re-sends an app delete that meets the platform's search-index insert race (HTTP 400, SQL 547) — a different answer, so the two layers add and never multiply. A generative page's change set is not re-sent by the client at all (an update's writes carry `If-Match: *`, so a replay would skip the SDK's version check): the page backend (`lib/genpage-sdk.js`) waits out a 429 on it — the same schedule, or the answer's `Retry-After` when that is longer, whole — and sends it again, a push at a time and through the SDK's version check each time, because a refused change set committed nothing and the page's ids and the turn's identity were fixed before the first send; six sends at most, inside one budget of five minutes for the waiting a throttled page write costs a build run (the build's own waits before it runs a phase again count too, and so do the HTTP client's own waits for a throttled read, publish, delete or column create — the answer's `Retry-After` whole, past the client's cap of a minute — and a wait of the client's that does not fit is not taken: the 429 comes back as it came and the build stops with the budget's halt; a 5xx, a reset connection and a deadlock victim's re-send are not throttling and keep their own schedule; and a change set the service refuses as a whole — answered HTTP 200 with the one part that failed — is read the same way, when the answer is complete and well-formed: a 429 is waited out, a 400, 403 or 404 is final after one send, and an answer that is incomplete inside — or holds a part that declares a transfer coding, which is not read — stays an unknown outcome), and a throttle that outlasts them leaves the build to run the pages phase again after the wait the service asked for, or to stop with a `throttle-budget-exhausted` halt that says what it asked when the next wait does not fit. A failure of the transport is sent again only when it is a reset, a timeout, an answer cut off or a temporary DNS failure — decided by Node's own error code when it has one and by its words only when it has none: a certificate that does not verify returns at once, whatever names it quotes.
+- Guardrail lint (`spec-lint.js`) + hard validator (`app-spec.js`). 🧪 full `node:test` suite + the vendored SDK's Jest suite green (`node scripts/run-tests.js --with-sdk <sdk-repo>`).
+
+### Data model (Tier 1) — ✅ verified live
+- All column types: Text · Memo · Choice · MultiChoice · Boolean · Money · DateTime · Integer · BigInt · Decimal · Double · File · Image · AutoNumber · Customer (with per-type options), incl. AutoNumber primary columns.
+- Global option sets, status reasons (idempotent, deterministic pinned values), alternate keys (idempotent).
+- Relationships: OneToMany (lookup) **and** ManyToMany; Customer (polymorphic) columns. An omitted `lookup.displayName` defaults to the parent table's display name (the declared table's; else the environment's, for a table the spec does not declare or declares without a `displayName` that the build did not create — `incident` is "Case"; else a humanized name); a rebuild relabels only the old logical-name default, in the build's own language, never a maker's label, and download leaves out a label equal to the default or to the old default. Live-verified in a single-language environment: lookups labelled with their parent's logical name (a custom table and `contact`) were repaired on the column and on the form's auto-layout field, a form field labelled with the lookup's own logical name was repaired while a label a maker set on another field was kept, an unchanged rebuild wrote no label update, a fresh build labelled the column at creation (with the parent's display name), and a label a maker set through the SDK survived a rebuild, with a field still on the old default then following it; a lookup to a declared `existing: true` table (`systemuser`) was labelled "User" from the environment, on a fresh build and as a repair of the old default; and on an environment with two languages (English and Spanish), a new lookup was labelled with its parent's name in both ("Area" / "Zona"), where 2.13.0 wrote the parent's logical name in English only. ⚠ **Not live-verified**: a repair in a second language, and download leaving a label out.
+- Sample data: Choice/MultiChoice label→int resolution (inline **and** global choices), `$parent`/`$parents` lookup binds (incl. junction rows with both sides), custom status reasons; resolve-by-name idempotency via the SDK's `seedRecordGraph`.
+- ⚠ Calculated / Rollup formula columns — `source` + `formula` plumbed through, **not live-verified**.
+- **Per-column write permissions** (`isValidForCreate` / `isValidForUpdate` / `isValidForRead`) —
+  this is how a column is made read-only. Applied on create **and** reconciled on rebuild, and each
+  flag is sent independently so setting one does not disturb the others. Live-verified by reading the
+  deployed metadata back: `IsValidForUpdate: false` with Create/Read untouched at `true`, and
+  unchanged through a download → rebuild round trip (an omitted setting means *leave alone*, never
+  *reset*). Not available on `Customer` columns — the SDK has no update path for that type at all.
+  (AB#6651276)
+- **Boolean `defaultValue`** — which option a Yes/No column starts on; the SDK previously hardcoded
+  `false`. An explicit `false` is preserved rather than treated as absent. Live-verified.
+  (AB#6648523)
+- **Whole-number `integerFormat`** — `None` · `Duration` · `TimeZone` · `Language` · `Locale`; the
+  SDK previously hardcoded `None`, so a column holding minutes could not render as a duration.
+  Live-verified as `Duration`. (AB#6648522)
+- **Table icons** (`entities[].vectorIcon` = SVG web resource → `IconVectorName`; `entities[].icon` = raster web resource → `IconMediumName`) — sets a custom table's own icon (what the modern designer + nav render). Applied after the web-resources phase via the SDK's `setEntityIcon`; hard-validated against declared web resources so an unresolvable value can't break the designer (glimmer). Live-verified: `IconVectorName` set to a published SVG web resource.
+
+### Business rules — ⚠️ environment-gated
+- `businessRules[]` — declarative form logic with no code: show/hide (`SetVisibility`), lock/unlock
+  (`LockUnlock`), set-required (`SetBusinessRequired`) and set-value (`SetFieldValue`), gated on one
+  or more conditions over the record (ANDed). Sixteen operators, taken from the SDK's own table:
+  `Equals` · `DoesNotEqual` · `IsGreaterThan` · `IsGreaterThanEqualTo` · `IsLessThan` ·
+  `IsLessThanEqualTo` · `Contains` · `DoesNotContain` · `BeginsWith` · `DoesNotBeginWith` ·
+  `EndsWith` · `DoesNotEndWith` · `On` · `NotOn` · `ContainsData` · `DoesNotContainData`.
+- **The SDK writes a rule through the bound `CreateProcessWithWfomJson` member, or not at all.** The
+  client-side workflow-XAML compiler it used to fall back on was removed upstream, because it covered
+  4 of the 7 action types and a single clause and therefore silently narrowed a rule into something
+  that did not say what the author wrote. An environment that does not declare that member **cannot
+  host business rules** — and that is the common case rather than an edge case. Where the member is
+  declared, a rule can still fail with a server-side MissingMethodException, which is a platform
+  defect on that environment rather than a rule-shape problem. A production environment declares the
+  member but answers the first rule with HTTP 400 `0x80040216` ("An unexpected error occurred."),
+  a platform limit; nothing is created. The build then skips them,
+  warns once naming the member, and builds everything else normally; `--verify` reports them as *not
+  applicable on this environment* rather than missing, so the exit code, the deployed baseline and
+  the `--changed-only` snapshot are unaffected.
+- The operator allowlist is load-bearing rather than cosmetic: the SDK resolves an operator it does
+  not recognise to **Equals**, so `GreaterThan` (the natural misspelling of `IsGreaterThan`) would
+  deploy, activate and quietly test equality. The spec pins the list against the bundle's own table
+  in both directions.
+- **Every rule is checked by the business-rule designer's own completeness validator before it is
+  written.** The push cannot tell you a rule is wrong: a condition tree in an unexpected shape is
+  merged onto the node, ignored by the serializer, and written as a rule with no clauses and no
+  actions — HTTP 204, activated, and it never fires. The SDK exposes the same validator the designer
+  gates its Save button on, and nothing on the push path runs it, so the build does. Findings **halt**
+  the build and are reported verbatim; a bundle without the validator, or one that faults, is skipped
+  rather than allowed to block a build it cannot judge. Measured against the bundle: every shape this
+  spec surface can author — all sixteen operators, all four action types, every scope and status,
+  multi-condition and multi-action — reports zero findings, so this cannot reject a rule that was
+  previously buildable.
+- `dataType` is currently **decorative** — measured across every accepted token, on both the
+  condition and the action path, the SDK types every literal as `String`. It is still validated as a
+  closed set so a typo is caught.
+- Every field is validated against the rule's own entity, so a rule naming a column that does not
+  exist is rejected up front rather than deploying and never firing.
+- Additive on rebuild (matched by `entity` + `name`, reused if present); torn down with the app.
+- **Activating a rule creates a second `workflows` row, and that is normal.** Dataverse keeps the
+  definition (`type 1`, no parent) and an activated copy (`type 2`, parented to it). Live-measured: a
+  Draft create yields one row, a plain `PATCH` to `statecode 1` yields two — and a PATCH cannot create
+  anything, so the platform makes it. Every business-rule query in build, verify and teardown filters
+  `type eq 1`; omitting it made the build attempt to delete the copy (405), warn about a duplicate
+  that did not exist, and would have made `--verify` fail every active rule.
+- Live-verified end to end through the App Spec on an environment that supports it: rules authored
+  from `businessRules[]` deployed, activated, and the platform's own generated `clientdata` named the
+  authored columns.
+
+### Forms, views & charts — ✅ verified live
+- Adaptive main forms (auto + explicit tabs/sections), related-record sub-grids (1:N **and** N:N, placed with `tab` / `column` / `after` / `before`), Notes/timeline section.
+  Explicit edits order tabs and sections, **not existing fields**. New listed fields and relative
+  `fieldOptions[x].after` placement are occupancy-safe; a full row may split, and an unsafe move is
+  skipped with a warning. Stored overflow repair, idempotent rebuilds and middle insertion are
+  **live-verified**. Atomic failure/retry and dependency-ordered anchor chains are covered by
+  offline SDK workspace tests. Verify rejects duplicate cell/control IDs across each form. See the
+  [form-layout contract](../references/app-spec-schema.md) for placement and verification limits.
+- Quick-create + quick-view forms (`forms[].formType`); quick-view **placement** on a host form via a lookup (`forms[].quickViews[]`).
+- **Per-form security roles** (`forms[].securityRoles`) — offer a form to named `personas[]`, or to
+  `everyone`, with optional `fallbackForm` and `order`. The roles are **not** a relationship
+  (`systemform` reports `CanBeInManyToMany: { Value: false, CanBeChanged: false }` and there is no
+  `systemformrole` entity, so no association shape can ever work); they live inside `formxml` as a
+  `<DisplayConditions>` element. Note the direction: a form with **no** assignment is offered to
+  **every** role, so this **restricts** a form rather than granting it — and removing a restriction
+  is an explicit `everyone: true`, not deleting the block. Applied in the **security** phase, because
+  the persona's role does not exist until then, and the write lands on the **unpublished** layer, so
+  it takes effect after a publish. Live-verified: the persona's real role id inside
+  `<DisplayConditions Order="2">` on the restricted form, `<Everyone />` on its unrestricted sibling.
+  (AB#6648526)
+- Form JS event handlers (`onload`/`onsave`/`onchange`) wired via web resources.
+- Views with rich filters (`eq-userid`/`this-week`/`in`/`not-in`/… + Choice-label resolution against the environment's own option metadata — a label no option answers to stops the build before any view is written, and before anything is written where the environment already shows it (where the spec numbers a column's options — inline, or a declared global choice — an option a maker renamed still resolves to the spec's own number, with a warning that says it is an assumption, unless the environment shows the options are numbered otherwise, as when options were added after the column was built); a spec with a localized label is checked in the views phase only, so no label-bearing read runs ahead of creating a multi-language label); default Active/Inactive view **column enrichment** via the SDK's `enrichDefaultViews`. Live-verified: `account.industrycode` "Accounting" resolved to its option value on create, the dry run marked a view with a mistyped label `? unknown` and listed the valid labels, a typo halted the build before anything was written (no solution, publisher or table), and an inline option a maker renamed still resolved to the spec's own number, with a warning, and `--verify` passed; an option renamed in a declared global choice did the same (a new view got the spec's number, and `--verify` passed on a view 2.13.0 had built), and an option inserted into the spec's list after the column was built stopped the build before any view was written, where 2.13.0 bound the wrong option, silently; an option a maker added (at the next free number, or in another publisher's range) or deleted and re-created, together with a rename of the filtered option, was bound to the spec's own number with a warning, and `--verify` passed; so was an option renamed only in case; options renamed only in case on a column whose spec has since numbered them otherwise stopped the build before the view was written, naming the option; and the dry run marked every existing view `= reuse` with the same warnings the build gives, including one whose filter label no longer names an option. ⚠ **Not live-verified**: a column bound to a system global choice or to a declared one that already existed with other values, MultiChoice and status-reason labels, the global option set read, `--verify` on those columns, and the localized-spec deferral.
+- **Editing an existing view is additive.** A rebuild appends spec columns the view lacks and keeps
+  every column already there, so a column a maker added in the designer survives — and a column
+  removed from the spec, or a new order, does not apply. Filters and sort are not re-applied either
+  (the build warns). `--verify` fails on a missing spec column, filter condition or sort key (or
+  authored sort keys out of order), but not on extra deployed ones, so it cannot confirm a removal. Remove or reorder view columns in Maker, or
+  tear down and rebuild.
+- Choice-column charts. `--verify` checks each chart's type, table, group-by column and measure (plus an
+  explicit description and a declared title), not only its name; a filter, join or second series fails.
+
+### Custom grid rendering (preview) — ✅ SDK live-verified, environment-gated
+- `entities[].columns[].visualization` — render a column as a `RadialDial`, `LineChart`, `HeatMap`
+  or `StarRating` in **every** grid and view that shows it, instead of plain text. `None` clears it.
+  Per-*column* metadata (a `controlconfiguration` row bound to the attribute), so it is declared once
+  on the column rather than on each view.
+- Type-only: the renderers use built-in defaults (dial 0–100, stars 0–5) with no tuning parameters.
+  Column-type compatibility is **not** validated — the platform does not enforce a clean "numeric
+  only" rule (`LineChart` is documented for a *text* column of comma-separated numbers), so guessing
+  a constraint would reject valid specs. Guidance lives in the schema doc.
+- Re-asserted on every build, for pre-existing columns as well as new ones, converging to a single
+  configuration row. Omitting the field leaves a deployed renderer alone; `"None"` is how a spec
+  actively clears one.
+- **Environment-gated preview.** Where the platform has not provisioned it, the backing
+  `controlconfigurations` table is absent and every call 404s; the build **skips** the step (the
+  column and all other artifacts still deploy) and verify reports no divergence. Live-measured: the
+  table was present on **1 of 18** test environments, so a missing renderer is an environment
+  question first, not a spec bug.
+- Live-verified on a provisioned environment: set from scratch, updated in place (the rebuild path),
+  re-asserted without duplicating the config row, all four renderers accepted, and cleared with
+  `None` — 6/6.
+
+### App shell & navigation — ✅ verified live
+- App module + sitemap; **multi-area sitemaps** — every `appShell.areas[]` maps to its own `<Area>` (icon + groups + subareas; order follows array order). The app is **self-contained for export/import**: its **sitemap** is added to the solution (componenttype 62), each **generative page** the build writes or keeps joins it too (as the page table's own component type, read from the environment — offline-tested; the add of the app never brings the pages), and its **tile icon** is an in-solution web resource — `app.icon` (a declared image web resource) or a generated default SVG — never an arbitrary external/managed icon.
+- **App membership (offline-tested; reference transport measured):** `app.tables` preserves hidden
+  table components independently of navigation; `app.mainForms` selects active Main forms by name.
+  Create is exact for Main membership; updates stop adding excluded forms but never remove existing
+  members unless `app.mainFormsOnUpdate: "exact"` asks for it (2.21.0, a removal from the app that
+  needs `--allow-destructive`; the app is published only once the published layer reads back the list).
+  `app.pinDeclaredArtifacts: true` (2.21.0) also pins the spec's own forms, views, charts and
+  dashboards, so a chart of a table outside the navigation joins the app. Build and download use the current layer; verify checks the published layer.
+  Download carries both fields with a `2.13.0` capability floor, without adopting schema for
+  hidden stock/unclassified type-1 tables even when an asset references them. Mixed SDK/current
+  navigation and unresolved immutable identity are refused rather than emitted as a rebuildable spec. See
+  [the App Spec contract](../references/app-spec-schema.md) for
+  name rules, runtime-lag limits and loss notes; the SDK serialization is covered by
+  `scripts/tests/app-main-forms-real-bundle.test.js`.
+- Generative pages (**genpage-first**) for overview / dashboard surfaces — written through the SDK (`scripts/lib/genpage-sdk.js`); the SDK finalizes the sitemap with `GenPage` subareas.
+- Dashboards (chart / list / iframe / webresource tiles) with **sitemap placement** (auto-pinned as an app component). Tiles render in a **multi-column grid** (2-wide) rather than one stacked full-width column. A dashboard a build created and then stopped before adding to the app's solution (killed, its answer lost, or the add and its undo both refused) is added by the **next build**, which recorded its id in the workspace before the create (`dashboard-creation.*.json`) and reads that exact row back — never a second dashboard, never a namesake (`scripts/tests/dashboard-creation-recovery-real-bundle.test.js`).
+- **Rebuilding an existing app keeps its navigation** (AB#6726727). The build used to hand the SDK a sitemap recomputed from the spec with no trace of the live nodes, so every entry was re-created from scratch — new ids and the designer's defaults for a *new* entry — and a designer-made dashboard entry lost its launcher `Url` and with it the dashboard icon. Each entry the spec keeps is now written onto the live entry it corresponds to (`scripts/lib/sitemap-merge.js`), so everything the spec cannot describe survives, and every dashboard entry carries `Url="/workplace/home_dashboards.aspx"`, as the designer writes it. A title or icon changed in the designer since the spec's baseline (the last apply or download for that environment) is kept and reported; with no baseline the build reports each change it makes to an existing entry. A downloaded dashboard is bound by the id the download recorded, so one renamed in the designer is not recreated under its old name.
+- Modern command-bar buttons — functional **JS on-click** + static hidden/disabled, incl. **flyout / split-button menus**.
+- Web resources (JS / HTML / CSS) shipped + added to the solution; idempotent (reuse by name). One whose publication the SDK could not confirm (`WEB_RESOURCE_UNVERIFIED` — its publish refused under the customization lock, say) is still added to the solution, recorded in the build workspace, and written again by id on the next run, never created twice (`lib/web-resource-records.js`; `web-resource-unconfirmed.test.js`).
+
+### Existing command button state (`commandStates[]`) — ✅ verified live (grid and form bars)
+- `list-command-states.js` (read-only) lists the modern command buttons of an app's tables by row id, with
+  their bar, scope, stored `hidden` / `disabled` and whether each is a candidate (and the reasons it is not,
+  from the row's shape).
+- `commandStates[]` (`minimumPluginVersion: "2.24.0"`) sets the stored `hidden` / `disabled` flags of an
+  existing **table-scoped** button, picked by that row id, with one conditional flag-only update per changed
+  row — only in a full build with `--publish`, and only with the exact approvals a dry run prints (one per row
+  version and intent, one per table to publish). App-scoped buttons, other button properties and creating a
+  button are out of scope; keyed `commands[]` cannot be combined with it.
+- Measured against the platform API: a row read straight after the update returns the saved flags and a new
+  row version before any publish; a stale version is refused (412) and the newer content kept; the table
+  publication the build already makes answers success. `--verify` checks those stored flags only.
+- **Verified live in a browser:** after the build's own approved update and table publication, the served
+  grid and form command bars of two apps sharing the table hid and showed the button as declared, for a plain
+  and a managed-routed table, and a button set to `disabled` was not shown at all. A saved change reached a
+  fresh browser session at once; a session with cached data kept the old bar until it reloaded its data.
+- **Not verified in a browser:** the sub-grid (`ContextualTab`) bar, checked through the API only. `--verify`
+  checks the stored flags, not what a browser paints.
+- Tests: `scripts/tests/command-state-*.test.js`, `list-command-states.test.js`.
+
+### App theme and header logo (Preview) — 🧪 tested
+- `app.theme` sets the app's **modern theme** — a base palette colour (or explicit palette slots), header
+  colours, an optional font — and a **header logo** (an existing image web resource and its tooltip).
+  Declared only on an explicit branding request; see [the App Spec contract](../references/app-spec-schema.md)
+  for the fields. Floor `minimumPluginVersion: "2.21.0"`.
+- **Omitted vs `null`.** An omitted theme is never read or written: existing specs build exactly as before.
+  `null` removes the app's own override, and the app inherits the environment's theme again.
+- **What the build writes.** Through the SDK (`setAppTheme`, never with its own app publish): a content-named
+  version web resource `<prefix>_/apptheme/<hash>.xml` (published on its own, because the app reads it) and
+  the app's `CustomThemeDefinition` setting row as a draft. Both join the solution (component type 61 for the
+  web resource, plus the app setting). An equal theme writes nothing. Every theme read runs under a strict
+  read policy: a row the build cannot place, or a write whose outcome is unknown, ends the theme step as
+  `APP_THEME_INCOMPLETE`, which is never re-sent automatically, and a later run on the same SDK refuses to
+  touch that app's theme rather than guess.
+- **App-wide publication.** The theme is published with the **app**, by the build's single app publication
+  (no extra publish). An app publication publishes every pending change of the app, not only the theme, and a
+  withheld app publication (an exact Main-form list not yet proven) leaves the theme saved but owed.
+- **Proof after publication.** After the app publication that paid the theme is accepted, the build reads the
+  theme back once. An unresolved, unreadable or mismatching theme leaves the build incomplete
+  (`APP_THEME_UNVERIFIED`); what was saved is kept and the publish is not sent again — check it with
+  `--verify`, then re-run. `--verify` passes only a live theme, and says that this is **API state, not render
+  proof**: what a browser paints is checked in the app.
+- **Membership repair.** An unchanged theme whose records are missing from the solution is not repaired
+  silently: the build stops with `APP_THEME_MEMBERSHIP_MISSING` and names the repair (add the type 61 web
+  resource and the app setting to the solution, then run again).
+- **Retention.** Theme version web resources are never deleted (a version is shared by every app whose theme
+  has the same bytes). The logo is only referenced: a downloaded logo is `external: true` and teardown keeps
+  it, a logo that is only referenced is never touched, and a logo that is also declared in `webResources[]`
+  without `external` follows the normal `webResources` teardown rules.
+- **Download (opt-in, strict).** Only `--include-capabilities` reads the theme. A theme the spec cannot state
+  (the platform's "no theme" value, raw attributes, a logo that is gone or not an image, this publisher's
+  own logo that cannot be exported, or a logo not known to be another publisher's or managed — for example an
+  empty or vanished image when the app's publisher cannot be read) refuses the download **before anything is written**;
+  `--allow-lossy-download` writes the spec without `app.theme` and names the loss. This publisher's own logo
+  is exported as an `external: true` web resource; a logo known to be another publisher's or managed stays a reference
+  that must exist where the spec is built. A theme saved but not yet published is downloaded with a note.
+
+### Generative-page management — three-authority, id-based — 🧪 tested
+- **Three-authority page identity.** IDENTITY = durable `<app>_pagemanifest` (key→pageId map), outranked by the spec's own `pages[].pageId` for a downloaded (edit-snapshot) spec. EXISTENCE = the environment's page list through the SDK — decides create-vs-reuse for crash-safe convergence (`enumerateEnv`, no `--app-id`). MEMBERSHIP = the app's sitemap `GenPageId` set, read fail-closed via `fetchSitemap` (`scripts/lib/sitemap-pages.js`) — drives placement, download enumeration, and verify. All page matching is by id, never by display name.
+- **Edit-snapshot `pageId`.** Download keeps each page's deployed `GenPageId` as `pages[].pageId` in the emitted spec. On rebuild, this highest-authority id is confirmed against EXISTENCE and reused — so a downloaded app (including Maker-added pages) rebuilds without creating duplicates.
+- **Validation: every page must be sitemap-placed.** A `pages[]` entry absent from the `appShell` sitemap is rejected; navigation-only (headless) pages are not supported. A "detail" page is a normal sitemap page receiving input via `pageInput`.
+- **Safety HALTs:** `pages-removed` (live page dropped from spec — re-add or `--allow-destructive` detaches the nav SubArea, page left deployed), `pages-shared-across-apps` (`--allow-destructive` does NOT bypass; detach the page from the other app with `scripts/genpage.js remove-from-app`, or in Maker), `pages-identity-conflict`, `pages-manifest-corrupt`, `pages-existence-failed`, `pages-sitemap-read-failed`, `pages-shared-check-failed`.
+- **Verify and download** match by id with exact set-equality (EXISTENCE + MEMBERSHIP); a manifest-uncorrelatable page surfaces `unableToRun`.
+- **Scroll context of generated pages.** The generative-page host renders a page in a container of fixed height and never scrolls it (measured live at 1366x768 and 1920x1080), so `check-griffel-styles.js` also checks that every page generated in Phase 1.5 has a bounded element that scrolls (`scripts/lib/page-scroll.js`, a static check of the layouts it recognises: `@media` overrides and sibling heights are not read). A layout it can show would clip, or cannot read, is refused with the edit that fixes it; a downloaded page gets a note (`--existing`). Measured in the host: a bare flex-column root clips, and the stated edit (`height: "100%"`, `overflowY: "auto"`, `boxSizing: "border-box"`) scrolls to the last row. (AB#6793599)
+- **Caller-held page turn ids.** `genpage-upload.js --turn-id <guid> --app-dir <folder>` lets a host retry one complete page edit after a lost answer without recording the turn twice; the id is bound to the complete request (content, binding mode, publication) in `<folder>/.maker-workspace/turns`, and a reuse asking for anything else is refused with nothing written. A host that lends the backend its own SDK passes `deps.turnBindings` (a retained store shared by every process that retries the turn, whose reads see every completed write) and `deps.turnCompilerIdentity`. Under a turn, a resumed create's placement is finished only when the app's published navigation is read and shows the page. The build never passes a turn id. A retry from another folder or machine, or after the store was erased, is unsupported and not detected.
+
+### AI-first features — ✅ verified live
+- `ai` block → `ai-features` phase: form-fill, NL search, NL charts, M365 Copilot, and per-table Copilot **row summaries** with tailored `GptDynamicPrompt-2` prompts (auto-selected candidate tables; skips lookup/config/junction + D365-owned incident/lead/opportunity).
+- **Admin-gated**: preflights each setting (`RetrieveSetting`), skips/warns when off, never fails the build. NL grid search is **environment-gated** (`EnableNLGridSearch`), not per-app. Standalone reporter `scripts/ai-preflight.js`.
+- **The readiness gate is not the whole truth, and the report now says so.** A feature's gate and its
+  actual setting are *different rows*, and a gate can read off while the feature is switched on at
+  environment scope — so it runs in every app on that org. Live-measured: gate `EnableNLGridSearch`
+  = `false` while `NLGridSearchSetting` = `2` at environment scope (NL search on), and
+  `NLChartDataVisualizationSetting` = `1` by default — *Auto*, its platform default. Preflight resolves the
+  effective value per feature — app-scope override → environment → default — reports those as
+  *in effect via the environment/default setting*, and **suppresses the admin action**, so nobody is
+  sent to the admin centre to switch on something already running. A value it cannot read never
+  counts as in effect, so a genuine action is never hidden. A platform-default value (*Default*, or
+  *Auto* for charts) is reported as the platform's decision, neither on nor off.
+- **Every per-app AI setting is a tri-state, and `1` is not "on"** (AB#6714731). Per the platform's
+  own settings UI, form fill (all four settings), NL grid search and M365 store 0 = *Default*,
+  1 = *Off*, 2 = *On*, and NL charts store 0 = *Off*, 1 = *Auto*, 2 = *On*. Builds used to write `1`
+  for `true` outside the form-fill family — turning NL grid search and M365 **off** and leaving
+  charts on *Auto* — and `--verify` expected the same `1`. The plugin now encodes every flag itself
+  (`true` → `2`; `false` → that setting's *Off*) and verifies against the same table, so the next
+  build of an affected app writes `2`.
+- **Form fill is a real "off", not a naming mix-up** (measured 2026-08-28). Unlike NL search, the
+  gate and the per-app setting share one name — `FormFillBarUXEnabled` — confirmed against the
+  SDK's own `AI_GATE`/per-app maps, so there is no second setting hiding a different answer. It
+  reads `0` at org *and* app scope, and it is `0` on **all 161** orgs in the test tenant.
+- **`formFill` is the assist TOOLBAR only, and the report now says so.** "AI form fill assistance"
+  is a family; `FormFillBarUXEnabled` governs one member of it. Three siblings are neither covered
+  by that flag nor exposed by the App Spec: `FormFillFileUploadEnabled` (file upload),
+  `FormPredictSmartPasteEnabled` (smart paste) and `FormPredictEnabled` (edit-form predictions).
+  Calling the flag "Form fill" overclaimed in both directions — it reported the feature unavailable
+  to someone who may have had smart paste working, and implied enabling it turned the family on. All
+  four members were measured off across 40 orgs, so nothing is silently on here; exposing the
+  siblings would be a feature (new spec keys plus live verification), not a rename.
+- **The setting names are now pinned against the bundle.** Nothing previously did: every test
+  hardcoded the same strings the source does, so an upstream rename would have left the suite green
+  while the build wrote to a setting that no longer exists — the same shape as the
+  `success`→`saved` rename that silently disarmed the 412 guard. `sdk-uptake-contract.test.js`
+  compares `AI_APP_SETTING` to the SDK's map and asserts the gate/per-app names stay distinct.
+
+### Business process flows — ✅ verified live
+- `businessProcessFlows[]` — the staged process bar on a record: ordered `stages[]`, each with
+  ordered `steps[]` bound to columns of the same table. **Every step must bind a `field`**: the
+  platform refuses a step without one (`datafieldname of ControlStep cannot be null or empty`), so
+  there is no field-less "checklist" step — bind a Boolean flag for a manual check-off. `status`
+  defaults to `Active` because an inactive BPF is not merely inert, it is **invisible** — the stage
+  bar does not render at all.
+- Deployed as a `workflows` row (**category 4 / type 1 / businessprocesstype 0**) whose XAML the
+  vendored SDK compiles from the authored stages; an `Active` flow is activated in the same push
+  (`statecode 1` / `statuscode 2`). Every query in build, verify and teardown goes through one
+  `bpfFilter`, which scopes to the DEFINITION row and excludes both the platform's activated `type 2`
+  copy and same-named **task flows** (also category 4) — the two mistakes that cost real time on
+  business rules.
+- Additive on rebuild (matched by `entity` + `name`, reused if present, Active/Draft state converged
+  in both directions, a stage or step edit that leaves every deployed stage in place applied in one
+  push — steps put in another order within their stage included — while one that would remove a stage
+  or a step, reorder the stages, or that cannot be told from a removal is refused, with the reason: no
+  stage or step edit is then applied, and the requested Active/Draft state is handled independently; an
+  edit the SDK refuses (the stages of a flow that holds a branch, the steps of a stage that holds an
+  action) is reported as not applied — and the flow
+  re-added to the solution on every run so a failed component add is repaired rather than inherited);
+  torn down with the app, deactivate-then-delete, before its table. Deleting
+  an activated flow cascades a **backing-table** drop that used to run past the client's 60 s HTTP
+  timeout; writes now wait up to 5 minutes, and teardown still polls the row rather than reporting a
+  failure for work the server completed if even that is exceeded.
+  A new `business-process-flows` build phase sits next to `business-rules` (16 now).
+- **Each write in a flow's create is conditioned on the token the previous write returned** (vendored
+  SDK): the create echoes its token, the activation is sent only on it, and a rollback deletes only on
+  a token the create produced — so a concurrent edit is refused, never activated or deleted. This
+  exposed a transport hazard, found live: activating a flow on a table created seconds earlier ran
+  past the old 60 s wait, the activation committed anyway, and the transport's re-send was refused as
+  a version conflict, failing the build. Writes now wait up to 5 minutes and a conditional write that
+  gets no answer is never re-sent (`scripts/lib/sdk-http-client.js`); a fresh build of that app then
+  passed live.
+- **The derived unique name is a TABLE name, and it is guarded on both sides.** Dataverse stores the
+  flow as `new_<name lower-cased, non-alphanumerics stripped>` — the derivation ignores the table
+  *and* the solution's publisher prefix — and activation creates an org-owned backing table with that
+  logical name. So the name collides with three things, not one: another flow, a table the spec
+  declares, and anything already in the environment. The first two are rejected at the plan gate; the
+  third is a build-time probe that checks **both** `workflows` (by `uniquename`) and table metadata
+  (by logical name) and **halts** naming whichever owns it, instead of letting the create fail with a
+  platform error about a table the author never mentioned. It runs only on the create path, never on
+  reuse, and is best-effort — a diagnostic must never be the thing that breaks a build.
+- **v1 is single-entity and linear on purpose.** The SDK also models cross-entity stages, branching
+  and stage actions; the spec gate **rejects** those keys — as an allow-list at flow, stage *and* step
+  level — rather than ignoring them, so a flow never quietly deploys as something other than what was
+  authored. The allow-list shape matters: the SDK's normalizers copy a fixed key set and discard the
+  rest, so a stage `branch` or a step's `fieldLogicalName` (instead of `field`) would otherwise pass
+  validation and deploy bound to nothing.
+- **Who may run a flow** — `securityRoles: { "personas": [...] }` (#513). A flow's grants are
+  `create/read/write/delete` privileges on the backing table that activation creates, so they are
+  applied in the `security` phase once both the flow and the personas' roles exist, against the
+  flow's deployed `uniquename` read back rather than derived. `verify-model-app` proves each persona
+  holds them (`bpf-roles`) and fails closed when the backing table cannot be read. Rejected: an empty
+  `personas` list, the form-only keys `everyone`/`fallbackForm`/`order`, and grants on a Draft flow
+  (there is no backing table until activation).
+- **Live-verified**: build (11 created, verify 8/8), rebuild (flow reused, solution component
+  re-added), and teardown (exit 0, with an independent query confirming both the workflow row and its
+  activation-created backing table are gone). An invalid spec is refused pre-flight with no writes.
+- Two platform facts the validator encodes, both found by adversarial review and measured against the
+  bundle: a flow **name must be unique across the whole spec** (the derived `uniquename` ignores the
+  table and strips case/punctuation, and activation creates a backing table with that name, so two
+  colliding flows cannot both deploy); and a stage must carry **at least one step** (the SDK
+  substitutes a placeholder named "New Step" for an empty stage).
+- Unblocked a defect in the vendored SDK, fixed upstream and re-vendored: the hybrid XML grammar walk
+  descended into TEXT nodes, and `@xmldom/xmldom` (what the SDK's DOM shim installs headlessly)
+  exposes a text node's `childNodes` as `null` where jsdom returns an empty NodeList. Every BPF push
+  therefore threw `TypeError: Cannot read properties of null (reading 'length')` in the vendored
+  bundle — input-independent — while the SDK's own jsdom-only suite stayed green. Pinned by a real-bundle
+  test here and by a `@jest-environment node` regression upstream.
+
+### Configuration creates and recovery — 🧪 tested
+- **Default builds** create declared environment variables, connection references, Custom APIs and duplicate detection rules one row at a time at ids fixed in advance, save a receipt in the app workspace before the first request, and read every row back before a unit counts as finished. An environment variable value is never sent with the solution header and is not a required solution member. This is separate from **protected configuration** (`configurationIdentity: "stable-v1"`), which binds each row in the managed binding store and is described in `AGENTS.md`.
+- **An interrupted create stops the next build, `--changed-only` run and teardown** of that workspace with a `configuration-create-*` code and `retry: "never"`. The way forward is `configuration-recovery.js` (`inspect`, `prepare`, `resolve`), which sends `GET` requests only and changes nothing but the local receipt: accept the current state, defer the root, cancel a unit that was never sent, or quarantine an unreadable receipt. A missing row is described for completion by hand at its recorded id, never resent. A build continues past a quarantine only with the invocation-only `--acknowledge-quarantined-configuration <id>[,<id>...]`. See [configuration-create-recovery.md](configuration-create-recovery.md).
+
+### Edit flow (download → edit → rebuild) — ✅ verified live
+- `download-model-app.js` pulls a **deployed app** back into an editable App Spec (+ page code, icons, referenced entities, and the app's **real unmanaged solution** — `recoverAppSolution` enumerates the app's solution memberships and excludes the built-in `Active`/`Default`/`Basic` system solutions, so the spec names the right container for a later clean teardown); edit the spec and re-run the idempotent build — **create and edit share one path** (reuses app/tables, updates pages in place, keeps `GenPage` subareas). The app-shell phase **re-syncs the sitemap + components of any existing app** (fetch → recompute-from-spec → push → publish), so subarea add/rename/reorder edits land for **page-less apps too** — not just generative-page apps — and `--only app-shell` can force the rewrite. **Classic DashBoard subareas are *designed* to round-trip** — the dashboard is reconstructed into `dashboards[]` with **id-passthrough tiles** (each tile carries the deployed view/chart ids), so a rebuild recreates it against the existing views/charts without re-declaring them. **This now works end to end.** It previously did not: the vendored SDK’s `fetchArtifact(‘dashboard’, …)` threw `Cannot read properties of null (reading ‘length’)` while deserializing the `<parameters>` block it had itself serialized, so no tiles were recovered and the subarea was dropped — which failed the whole download unless `--allow-lossy-download` was passed. Root cause upstream: the grammar walk descended into **text** nodes, and the bundled XML parser returns `null` for a text node’s children. Fixed in the SDK and re-vendored; measured across the re-vendor as **0/4 → 4/4** round-trips (list tile, both chart-parameter spellings, and a tile with an empty parameter value), and pinned by `scripts/tests/dashboard-roundtrip.test.js`, which feeds a serialized dashboard straight back in. ([#478](https://github.com/microsoft/power-platform-skills/issues/478)) **Round-trip scope (not yet "complete"):** tables, relationships, sitemap/appShell, generative pages (code, prompt, data sources, model, and connector and Custom API bindings — `pages[].connectorBindings` / `pages[].actionBindings`, stated by an allowlist of the properties the references document, each with a value of a shape known to be safe, and only whole — a list holding a connection id, a credential or anything else is left out of the spec, reported by its place and never its value, and the page keeps it — which a rebuild writes into any environment; what they name is not carried: the download lists the connection references, Custom APIs and service resources another environment must already have, and a rebuild stops, before it writes anything, at a connection reference there that is for another connector), icons, dashboards, and solution round-trip; **forms, views, charts, and commands do NOT yet** — view hydration was tried and reverted (LIVE-verified the deployed savedquery set can't reliably distinguish author views from Dataverse's auto-generated Active/Inactive/QuickFind system views). All survive on the live app (a rebuild preserves them by discovery) but are absent from the downloaded spec, so edit them in Maker or a fresh spec. The exception is the managed download (`--include-managed --managed-manifest <store file>`): it brings back declared forms, dashboards, business rules and business process flows the store proves, and each declared view a `createIdentity: "stable-v1"` build created when the store proves it unchanged and the app's solution still holds it, so a rebuild from it writes nothing to the view while the rest of the rebuild (its publishes, sitemap and app components) runs as usual (with its environment-bound `viewId`; any other is named in `managedViews.omitted`), and each such declared chart whose published query a declaration states exactly and that the solution still holds (with no id: a rebuild through the same store binds it; any other is named in `managedCharts.omitted`), and, for an app built with `configurationIdentity: "stable-v1"`, each environment variable the store proves unchanged, without its value, default or value schema (any other is named in `managedEnvironmentVariables.omitted`), each such connection reference, without its connection (any other is named in `managedConnectionReferences.omitted`), and each such Custom API that has no implementation yet, with its complete parameters (any other is named in `managedCustomApis.omitted`); it never brings back a duplicate rule, since the store does not record the status its build left it in (each is named in `managedDuplicateDetectionRules.omitted`). **Column types round-trip too, including Choice/MultiChoice** — their option sets are read per table, a local set becoming inline `options[]` (localizations preserved) and a shared one a `globalChoice` reference plus a `globalChoices[]` declaration; a column whose option set cannot be read is left untyped *and named*, and the App Spec cannot express option **values**, so a fresh rebuild re-bases them to `100000000 + index`. **File and Image columns** come back typed too — by their `AttributeTypeName` (FileType / ImageType), as both report `AttributeType` "Virtual", which an earlier release left out of every download without a word — with the `maxSizeKb` each was made with (left out when it is 10240 KB, the size a build gives a column that sets none) and, for an Image column the environment reports as the table's primary image, `isPrimaryImage: true` (a read of that detail that fails, or answers without a column, leaves the column typed without it, and the download says which read or column it was; the platform makes a table's first Image column its primary image whatever its create asks, so a rebuild into a fresh environment makes the spec's first Image column the primary image, whichever column carries the flag); the table's own image (`entityimage`) and the platform's companions of each column are not written, nor is the relationship the platform makes with each File or Image column (`FileAttachment_<table>_<column>` to `fileattachment`, `ImageDescriptor_<table>_<column>` to `imagedescriptor`) — the column brings it back, so it is neither carried in `relationships[]` nor warned about — and a column of any other type the App Spec cannot express is left out *and named*. **`relationships[]` are reconstructed** ([#567](https://github.com/microsoft/power-platform-skills/issues/567)): every custom 1:N whose parent is one of the app's tables or a stock table, and every custom N:N between two of the app's tables, each flagged `existing: true` (a teardown of the downloaded spec keeps it), with a deployed schema name kept whenever it is not the one the prefix would generate and a lookup label kept unless it is the default. One that `relationships[]` cannot express — a polymorphic lookup, a parent that is a custom table the app does not include (or whose metadata could not be read), an N:N to a table outside the app — is left out and *named* in the download's warnings and closing note: it stays on the deployed app, so a rebuild into the same environment leaves it alone, but a rebuild into a fresh environment does not create it.
+- **Crash-safe page tree.** A download stages the new `pages/` tree in a hidden folder and publishes it only after the download's checks and validation have passed (a lossy download without `--allow-lossy-download`, or an App Spec that fails validation, is refused first). Publishing writes the tree into a hidden swap folder beside `pages/`, checks that every page folder and file it wrote is still there (as a folder or a regular file, not a link), moves the previous tree aside, moves the new one in and removes the previous one last: a refusal or failure before then leaves `pages/` as it was and a failed move puts it back; when that is not possible, or the run stops between the two moves, the previous tree stays in the named hidden folder, which a later download reports. The spec is written after the pages are published, so a failed spec write leaves the new pages with the previous spec. Every operation in the download's own folders first checks the folder is still the one it made. Live-verified against 2.24.0: with folder creation denied in the output folder, and on a lossy-download refusal, 2.24.0 lost the maker's page edits and 2.25.0 kept `pages/` byte for byte. ([#814](https://github.com/microsoft/power-platform-skills/issues/814))
+- **Portable schema (covered by offline real-bundle round trips):** downloads keep supported column format/length/range/precision options, Boolean labels, date format and AutoNumber masks; primary name length/mask; custom unmanaged Active/Inactive status reasons and alternate keys; solution/global-choice display names; and dashboard tile dimensions. Money numeric precision is retained only for `PrecisionSource: 2`, which the SDK always creates; effective precision still depends on the target transaction currency, so numeric equality is not currency equivalence. Column/organization-controlled and unknown sources are diagnosed with precision omitted, keeping the typed Money column and range. Status labels use the resolved authoring LCID, not the caller's UI language; a missing requested translation is diagnosed rather than substituted. An unavailable optional Keys collection loses no independent table, column or navigation metadata. Values equal to the SDK's create defaults are left implicit, except primary name lengths stay explicit so a fresh build can correct an environment that overrides the table create's length. An own-publisher unmanaged SVG table icon is captured with its `vectorIcon` reference and an `external: true` resource declaration, protecting a shared icon from teardown. Proven-equal status/key definitions and standalone Integer formats send no schema write on a same-environment rebuild; missing definitions and actual format edits still take the existing create/update path. Table icons retain their assignment and specific-table publish even when the saved name matches, so a failed publish can be completed on rerun. Inconclusive or malformed metadata is reported rather than treated as a known default.
+- **Still outside that schema round trip:** script resources, raster/foreign/managed table icons, `roleGrants[]`, `sampleData`, Boolean defaults, column capabilities, BigInt ranges, DateTime behavior and unsupported/managed status reasons. Existing column length/range edits remain create-only; a downloaded dashboard still needs its source view/chart ids mapped, and its pinned `dashboardId` removed, before creating a separate dashboard in another environment. The new schema coverage is not a claim of full app cloning or new live verification.
+- Live regression on the edit path found + fixed **4 bugs**, then re-verified clean.
+- `verify-model-app.js` — read-only reconcile of spec vs deployed (exits non-zero on anything missing). Sitemap checks are **element-scoped**: an area/subarea icon is matched on its own `<Area>`/`<SubArea>` element, and a **dashboard subarea** is verified by resolving the dashboard id (systemform type 0 — by a downloaded spec's pinned `dashboardId` first, else by name) and matching the sitemap's `DefaultDashboard` — so a value reused elsewhere can't produce a false pass — and that entry must carry the dashboard launcher `Url`, without which the app shows a placeholder icon for it. **Multi-area sitemaps** and the dashboard-subarea path were re-verified live (positive + negative). A table's **status reasons** (each by its label, under its state, at the value the spec pins) and **alternate keys** (each by its name, over exactly its columns) are checked when the table declares them — one read each, none for a table that declares neither.
+
+### Teardown — ✅ verified live
+- `teardown-model-app.js` deletes exactly what an App Spec declares, in dependency-safe order (app → dashboards → commands → business rules → business process flows → forms → **security roles** → charts → views → relationships → AI row summaries → tables [children-first] → web-resources → global choices → solution). Forms/charts/views/relationships are removed **before** tables (a table delete doesn't reliably cascade cross-references); **web resources are removed AFTER tables** (a table's icon web resource is referenced by the table). A business rule / business process flow is deactivated before it is deleted, because Dataverse refuses to delete an activated process.
+- **Configuration recovery evidence blocks teardown.** A teardown holds the app's build lock and stops with `configuration-create-workspace-in-use` before it deletes anything, and again before it moves or removes the workspace, while the workspace holds an open or deferred configuration create, an unreadable receipt, or a quarantine. See [configuration-create-recovery.md](configuration-create-recovery.md#teardown).
+- **Classifier-safe** (every id resolved from a spec-declared name via an exact-match, entity-scoped filter), dry-run by default, best-effort continue, not-found aware, undeletable (system/managed) artifacts recorded as `skipped`. A **restricted system solution** (`Active`/`Default`/`Basic`) is skipped rather than attempted (Dataverse 400s any delete of one), so a downloaded spec that defaulted its solution to `Default` tears down cleanly. An already-gone relationship (Dataverse 400 *"…but 0 were found"*) is tolerated as deleted, like the table not-found case. A step that finds nothing says `(not found)` and is counted so — a default-view reset with no default view, a relationship the SDK's lookup does not find, a table its read did not list, a global choice whose delete is answered 404 — so a teardown run again reads `0 deleted, N not found` instead of counting each of those as deleted; the exit status is unchanged. A **publisher is never deleted** — the build reuses one by prefix and other solutions may share it — and the closing summary says so in one line, so the publisher a maker finds left behind is expected.
+- **An app whose sitemap carries an unpublished edit tears down cleanly.** A sitemap has two tokens: the unpublished-aware read returns a *content* token that runs ahead of the row while an edit is pending, and Dataverse validates `If-Match` against the *row*. The vendored SDK now conditions each delete on the row token from a by-id read. Live-verified on the same pending-edit app: the previous bundle's teardown failed with 412 on the delete `$batch`; this one deleted everything, and an independent query confirmed every row gone.
+
+### Tooling & internals — ✅ verified live
+- ASCII **form wireframe** preview (`preview-form.js`); phase-grouped build log with per-step status glyphs (`✓`/`⊘`/`✗`) + a closing summary.
+- **SDK consolidation** — the SDK owns the Dataverse mechanics (`seedRecordGraph`, `enrichDefaultViews`, AI settings/row-summaries, artifact `resolveArtifact`/`findArtifact`/`deleteAppCascade`); the plugin keeps the judgment (spec validation, choice/status resolution, `$parent`→bind translation, candidate selection).
+

@@ -1,0 +1,21 @@
+# $set-pp updates project connection settings after verifying the target.
+[mcp_servers.playwright]
+enabled = true
+url = "http://127.0.0.1:8931/mcp"
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+
+[mcp_servers.dataverse-dexcrmdev]
+command = "cmd"
+args = ["/c", "npx", "-y", "@microsoft/dataverse@latest", "mcp", "https://dexcrmdev.crm5.dynamics.com/"]
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+
+[mcp_servers.dataverse-dexcrmdev.env]
+DATAVERSE_OPERATION_CONTEXT = "app=dataverse-skills/1.19.0;skill=mcp-direct;agent=codex"
+
+[plugins."canvas-apps@workshop-minimal-power-platform"]
+enabled = true
+
+[plugins."dataverse@workshop-minimal-power-platform"]
+enabled = true

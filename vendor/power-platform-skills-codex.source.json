@@ -1,0 +1,28 @@
+{
+  "sourceType": "user-provided-local-copy",
+  "sourceCommit": "3a017729c414d7d0295ad201e2bf29be3304217c",
+  "classification": "Microsoft upstream with community Codex metadata",
+  "filesCopied": 3478,
+  "fileHashVerification": "PASS at initial copy; projectLocalPatches applied subsequently",
+  "excluded": [
+    ".git",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    "*.pyc",
+    "actual .env files"
+  ],
+  "projectPlugins": [
+    "canvas-apps",
+    "dataverse",
+    "power-automate"
+  ],
+  "platformCallsMade": false,
+  "runtimesOrPackagesInstalledDuringCopy": false,
+  "projectLocalPatches": [
+    "plugins/canvas-apps/.codex.mcp.json: mcp_servers to mcpServers",
+    "plugins/power-automate/.codex.mcp.json: mcp_servers to mcpServers; flowagent cwd ."
+  ],
+  "sourceArchiveSubpath": "codex-port/power-platform-skills-codex",
+  "setupGuide": "docs/getting-started.md"
+}

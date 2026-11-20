@@ -1,0 +1,4 @@
+interface:
+  display_name: "Set PP"
+  short_description: "Prepare the Power Platform development environment"
+  default_prompt: "$set-pp로 개발 환경과 프로젝트 연결을 준비해 줘."

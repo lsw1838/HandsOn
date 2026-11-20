@@ -1,0 +1,707 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { runDownload, preserveAuthoredLanguageCode } = require('../download-model-app.js');
+const { APP, PUBLISHED, CURRENT, PAGE, FORM_A, FORM_B, DASHBOARD } = require('./helpers/app-membership-sdk.js');
+const { fakeGenpage } = require('./helpers/fake-genpage.js');
+const FORM_C = '33333333-0000-4000-8000-000000000004';
+const FORM_D = '33333333-0000-4000-8000-000000000006';
+const UNKNOWN = '33333333-0000-4000-8000-000000000005';
+const SITEMAP = '55555555-0000-4000-8000-000000000001';
+const NINE = ['account', 'contact', 'task', 'email', 'appointment', 'phonecall', 'systemuser', 'team', 'annotation'];
+const metadataId = (index) => `66666666-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
+const catalogForm = (formid, name, activation = 1, table = 'account') =>
+  ({ formid, name, type: 2, objecttypecode: table, formactivationstate: activation, formxml: '<form/>' });
+
+function downloadSdk({
+  navigation = ['account', 'contact'], tables = NINE, custom = [], assetTables = [], members = [],
+  catalog = [catalogForm(FORM_A, 'Summary'), catalogForm(FORM_B, 'Alternate')],
+  placeholder = false, deleted = false, draft = false, page = false,
+  sdkNavigation = navigation, sdkPage = page, missingSitemap = false, unpublishedOnly = false,
+  identity = 'contoso_membership', identitySpelling = 'uniqueName', displayName = 'Membership', unknownCustom = [],
+  currentExtraXml = '', sdkExtraSubAreas = [],
+  attributes = [{ logicalName: 'contoso_unrelated', attributeType: 'String', isCustomAttribute: true }], capabilityReads = null,
+} = {}) {
+  const calls = [];
+  const metadataReads = [];
+  const names = [...new Set([...navigation, ...tables, ...assetTables, ...(placeholder ? ['entity'] : [])])];
+  const ids = Object.fromEntries(names.map((name, index) => [name, metadataId(index)]));
+  const logicalOfId = Object.fromEntries(Object.entries(ids).map(([name, id]) => [id, name]));
+  const viewIds = Object.fromEntries(assetTables.map((name, index) => [name, `77777777-0000-4000-8000-${String(index + 1).padStart(12, '0')}`]));
+  const xmlFor = (names, hasPage, extra = '') => '<SiteMap><Area><Group>'
+    + names.map((name) => `<SubArea Entity="${name}" Title="${name}"/>`).join('')
+    + (hasPage ? `<SubArea GenPageId="${PAGE}" Title="Draft Overview"/>` : '') + extra + '</Group></Area></SiteMap>';
+  const xml = xmlFor(navigation, page, currentExtraXml);
+  const publishedXml = draft ? xmlFor(['account'], false) : xml;
+  const currentLayer = draft ? CURRENT : PUBLISHED;
+  const sdk = {
+    fetchArtifact: async () => ({
+      name: displayName, [identitySpelling]: identity, description: '',
+      ...(missingSitemap ? { siteMap: { areas: [] } } : { siteMap: { areas: [{ title: 'Main', groups: [{ title: 'Records', subAreas: [
+        ...sdkNavigation.map((entity) => ({ type: 'Entity', entity, title: entity })),
+        ...(sdkPage ? [{ type: 'GenPage', genPageId: PAGE, title: 'Draft Overview' }] : []),
+        ...sdkExtraSubAreas,
+      ] }] }] } }),
+    }),
+    fetchEntityMetadata: async (logical) => {
+      metadataReads.push(logical);
+      return {
+        logicalName: logical, schemaName: logical, displayName: logical, isCustomEntity: custom.includes(logical),
+        primaryNameAttribute: logical === 'annotation' ? '' : 'name',
+        attributes, relationships: [],
+      };
+    },
+    queryRecords: async (set, opts = {}) => {
+      calls.push({ set, opts });
+      const filter = opts.filter || '';
+      if (set === 'appmodule') return unpublishedOnly ? [] : [{ appmoduleid: APP, appmoduleidunique: PUBLISHED, uniquename: 'contoso_membership' }];
+      if (set === 'appmodulecomponent') {
+        const type = Number((/componenttype eq (\d+)/.exec(filter) || [])[1]);
+        if (type === 62) return [{ objectid: SITEMAP, componenttype: 62 }];
+        assert.equal(opts.paginate, true);
+        assert.equal(opts.top, undefined);
+        const published = draft && filter.includes(PUBLISHED);
+        if (type === 1) return [...(published ? ['account'] : tables).map((name) => ids[name]), ...(placeholder ? [ids.entity] : []), ...(deleted ? [UNKNOWN] : [])]
+          .map((objectid) => ({ objectid, componenttype: 1 }));
+        if (type === 26) return (published ? [] : assetTables).map((name) => ({ objectid: viewIds[name], componenttype: 26 }));
+        if (type === 60) return (published ? [] : members).map((objectid) => ({ objectid, componenttype: 60 }));
+        return [];
+      }
+      if (set === 'sitemap') return [{ sitemapxml: publishedXml }];
+      if (set === 'savedquery') return assetTables.filter((name) => filter.includes(viewIds[name]))
+        .map((name) => ({ savedqueryid: viewIds[name], name: `${name} view`, returnedtypecode: name }));
+      if (set === 'systemform') return catalog.filter((row) => filter.includes(`formid eq ${row.formid}`));
+      return [];
+    },
+    dataverse: { get: async (url) => {
+      calls.push({ url });
+      if (url.startsWith('/appmodules/Microsoft.Dynamics.CRM.RetrieveUnpublishedMultiple')) {
+        const published = { appmoduleid: APP, appmoduleidunique: PUBLISHED, componentstate: 0 };
+        if (unpublishedOnly) return { status: 200, body: { value: [{ appmoduleid: APP, appmoduleidunique: CURRENT, componentstate: 1 }] } };
+        return { status: 200, body: { value: draft
+          ? [published, { appmoduleid: APP, appmoduleidunique: CURRENT, componentstate: 1 }] : [published] } };
+      }
+      if (url.startsWith('/sitemaps/Microsoft.Dynamics.CRM.RetrieveUnpublishedMultiple')) {
+        const current = { sitemapid: SITEMAP, sitemapxml: xml, componentstate: draft || unpublishedOnly ? 1 : 0 };
+        return { status: 200, body: { value: draft
+          ? [{ sitemapid: SITEMAP, sitemapxml: publishedXml, componentstate: 0 }, current] : [current] } };
+      }
+      // The --include-capabilities reads (lib/date-behavior.js, lib/schema-feature-contract.js readTableFlags), answered per table.
+      const capability = /^\/EntityDefinitions\(LogicalName='([^']+)'\)(\/Attributes\/Microsoft\.Dynamics\.CRM\.DateTimeAttributeMetadata)?\?\$select=(IsDuplicateDetectionEnabled|LogicalName,DateTimeBehavior)/.exec(url);
+      if (capability && capabilityReads) {
+        calls.push({ capability: `${capability[2] ? 'dates' : 'flags'} ${capability[1]}` });
+        return capabilityReads[capability[2] ? 'dates' : 'flags'](capability[1]);
+      }
+      const byId = /^\/EntityDefinitions\(([0-9a-f-]+)\)/i.exec(url);
+      if (byId) {
+        const logical = logicalOfId[byId[1].toLowerCase()];
+        return logical ? { status: 200, body: { LogicalName: logical,
+          ...(unknownCustom.includes(logical) ? {} : { IsCustomEntity: custom.includes(logical) }) } } : { status: 404, body: null };
+      }
+      if (url.includes('/Relationships') || /\/(?:ManyToOne|OneToMany|ManyToMany)Relationships/.test(url)) return { status: 200, body: { value: [] } };
+      if (url.includes('/Attributes')) return { status: 200, body: { value: [] } };
+      if (url.includes('/EntityDefinitions(')) return { status: 200, body: {} };
+      if (url.startsWith('/systemforms')) {
+        const table = /objecttypecode eq '([^']+)'/.exec(url);
+        return { status: 200, body: { value: table
+          ? catalog.filter((row) => row.type === 2 && row.objecttypecode === table[1])
+          : catalog.filter((row) => url.includes(`formid eq ${row.formid}`)) } };
+      }
+      if (url.startsWith('/appmodulecomponents')) {
+        assert.ok(url.includes(unpublishedOnly ? CURRENT : currentLayer), 'download describes the server-current membership');
+        return { status: 200, body: { value: members.map((objectid) => ({ objectid, componenttype: 60 })) } };
+      }
+      throw new Error(`unexpected download read ${url}`);
+    } },
+  };
+  return { sdk, calls, metadataReads };
+}
+
+async function download(t, options = {}, priorFloor) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'app-membership-download-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  if (priorFloor) fs.writeFileSync(path.join(directory, 'app-spec.json'), JSON.stringify({ minimumPluginVersion: priorFloor }));
+  const fake = downloadSdk(options);
+  if (options.wrapSdk) fake.sdk = options.wrapSdk(fake.sdk, directory);
+  const warnings = [];
+  const original = process.stderr.write;
+  process.stderr.write = (text) => { warnings.push(String(text)); return true; };
+  let result;
+  try {
+    result = await runDownload({
+      sdk: fake.sdk, appId: APP, appUnique: options.unpublishedOnly ? undefined : 'contoso_membership', outDir: directory, includeCapabilities: options.includeCapabilities, allowLossy: options.allowLossy,
+      // This fake serves no theme reads, so the theme capture that --include-capabilities also does is off unless a test
+      // asks for it (the app.theme tests below; `captureTheme: undefined` leaves runDownload's own default).
+      ...('captureTheme' in options ? (options.captureTheme === undefined ? {} : { captureTheme: options.captureTheme }) : { captureTheme: false }),
+      genpage: fakeGenpage({ pages: options.page ? [{ pageId: PAGE, name: 'Draft Overview', source: 'export default function Page() { return null; }', dataSources: [] }] : [] }),
+    });
+  } finally { process.stderr.write = original; }
+  assert.equal(result.ok, options.expectRefusal ? false : true, JSON.stringify(result));
+  return { ...fake, result, warnings, directory };
+}
+
+test('nine type-1 members round-trip seven hidden stock references without adopting their schema', async (t) => {
+  const { result, metadataReads } = await download(t);
+  assert.deepEqual(result.spec.app.tables, NINE.slice(2).sort());
+  assert.deepEqual(result.spec.entities.map((entity) => entity.schemaName).sort(), ['account', 'contact']);
+  assert.deepEqual(metadataReads.sort(), ['account', 'contact'], 'hidden stock tables must not read/copy unrelated custom columns or relationships');
+  assert.equal(result.spec.minimumPluginVersion, '2.13.0');
+});
+
+test('custom hidden tables go to entities and app.tables, while stock tables without a primary name still remain references', async (t) => {
+  const { result, metadataReads } = await download(t, { tables: ['account', 'contact', 'contoso_hidden', 'annotation'], custom: ['contoso_hidden'] });
+  assert.deepEqual(result.spec.app.tables, ['annotation', 'contoso_hidden']);
+  assert.ok(result.spec.entities.some((entity) => entity.schemaName === 'contoso_hidden' && entity.existing === true));
+  assert.ok(!result.spec.entities.some((entity) => entity.schemaName === 'annotation'));
+  assert.ok(!metadataReads.includes('annotation'), 'membership-only tables do not require a primary-name column');
+});
+
+test('view-derived hidden stock tables keep the existing schema hydration behavior', async (t) => {
+  const { result } = await download(t, { tables: ['account', 'contact'], assetTables: ['task'] });
+  const task = result.spec.entities.find((entity) => entity.schemaName === 'task');
+  assert.ok(task);
+  assert.ok(task.columns.some((column) => column.schemaName === 'contoso_unrelated'));
+  assert.equal(result.spec.app.tables, undefined, 'an asset-only table has no type-1 membership to round-trip');
+});
+
+test('a hidden stock type-1 table remains membership-only even when a view references it', async (t) => {
+  const { result, metadataReads } = await download(t, {
+    navigation: ['account'], tables: ['account', 'task'], assetTables: ['task'],
+  });
+  assert.deepEqual(result.spec.app.tables, ['task']);
+  assert.deepEqual(result.spec.entities.map((entity) => entity.schemaName), ['account']);
+  assert.deepEqual(metadataReads, ['account'], 'the Task view is a reference, not permission to adopt unrelated custom columns');
+});
+
+test('download preserves draft navigation and its Main restriction from the same current layer', async (t) => {
+  const { result, calls } = await download(t, {
+    draft: true, navigation: ['account', 'task'], tables: ['account', 'task', 'email'], members: [FORM_A],
+    catalog: [catalogForm(FORM_A, 'Task Summary', 1, 'task'), catalogForm(FORM_B, 'Task Alternate', 1, 'task')],
+  });
+  assert.deepEqual(result.spec.app.mainForms, { task: ['Task Summary'] });
+  assert.deepEqual(result.spec.app.tables, ['email']);
+  assert.deepEqual(result.spec.entities.map((entity) => entity.schemaName).sort(), ['account', 'task']);
+  for (const call of calls.filter((entry) => entry.set === 'appmodulecomponent')) {
+    assert.ok(call.opts.filter.includes(CURRENT), 'navigation, type-1 and type-60 reads must not use the old published layer');
+  }
+});
+
+test('a draft Help URL absent from the older SDK navigation refuses download', async (t) => {
+  const { result, metadataReads } = await download(t, {
+    draft: true, navigation: ['account'], tables: ['account'],
+    currentExtraXml: '<SubArea Url="https://contoso.example/Help" Title="Help"/>', expectRefusal: true,
+  });
+  assert.match(result.error, /sitemap.*SDK.*publish.*download again/i);
+  assert.equal(result.spec, undefined, 'no rebuildable spec may silently omit Help');
+  assert.deepEqual(metadataReads, [], 'refuse before hydration rather than reporting droppedSubareas: 0');
+});
+
+test('a draft dashboard absent from the older SDK navigation refuses download', async (t) => {
+  const { result, metadataReads } = await download(t, {
+    draft: true, navigation: ['account'], tables: ['account'],
+    currentExtraXml: `<SubArea DefaultDashboard="${DASHBOARD}" Url="/workplace/home_dashboards.aspx" Title="Overview"/>`,
+    expectRefusal: true,
+  });
+  assert.match(result.error, /sitemap.*SDK.*publish.*download again/i);
+  assert.equal(result.spec, undefined, 'no rebuildable spec may silently omit the dashboard');
+  assert.deepEqual(metadataReads, []);
+});
+
+test('published-first SDK navigation cannot be combined with the selected draft tables and Main restriction', async (t) => {
+  const { result, metadataReads } = await download(t, {
+    draft: true, navigation: ['account', 'task'], sdkNavigation: ['account'], tables: ['account', 'task'],
+    members: [FORM_A], catalog: [catalogForm(FORM_A, 'Task Summary', 1, 'task'), catalogForm(FORM_B, 'Task Alternate', 1, 'task')],
+    expectRefusal: true,
+  });
+  assert.match(result.error, /sitemap.*unpublished change.*SDK.*consistently.*publish.*download again/i);
+  assert.equal(result.spec, undefined, 'a mixed snapshot must never become a rebuildable spec');
+  assert.deepEqual(metadataReads, [], 'refuse before misclassifying the draft navigation table as hidden');
+});
+
+test('a never-published app with current XML but no SDK sitemap is refused', async (t) => {
+  const { result } = await download(t, {
+    unpublishedOnly: true, navigation: ['account'], tables: ['account'], missingSitemap: true,
+    identity: 'contoso_original', displayName: 'Renamed Draft', expectRefusal: true,
+  });
+  assert.match(result.error, /sitemap.*SDK.*publish.*download again/i);
+  assert.equal(result.spec, undefined);
+});
+
+test('a draft-only generative page missing from the SDK navigation cannot be silently dropped', async (t) => {
+  const { result } = await download(t, {
+    draft: true, page: true, sdkPage: false, navigation: ['account'], tables: ['account'], expectRefusal: true,
+  });
+  assert.match(result.error, /sitemap.*SDK.*publish.*download again/i);
+  assert.equal(result.spec, undefined);
+});
+
+test('a draft GUID download recovers the SDK immutable uniqueName before manifest, prefix and hydration', async (t) => {
+  const { result, calls } = await download(t, {
+    unpublishedOnly: true, navigation: ['account'], tables: ['account'], page: true,
+    identity: 'contoso_original', displayName: 'Renamed Draft',
+  });
+  assert.equal(result.spec.app.uniqueName, 'contoso_original');
+  assert.equal(result.spec.app.name, 'Renamed Draft');
+  assert.equal(result.spec.solution.publisherPrefix, 'contoso');
+  assert.ok(calls.some((call) => call.set === 'webresource' && /contoso_original_pagemanifest/.test(call.opts.filter)),
+    'manifest lookup must use the fetched immutable identity, not a derived display-name identity');
+});
+
+test('a draft GUID download also recovers the legacy uniquename spelling', async (t) => {
+  const { result } = await download(t, {
+    unpublishedOnly: true, navigation: ['account'], tables: ['account'],
+    identity: 'contoso_original', identitySpelling: 'uniquename', displayName: 'Renamed Draft',
+  });
+  assert.equal(result.spec.app.uniqueName, 'contoso_original');
+  assert.equal(result.spec.solution.publisherPrefix, 'contoso');
+});
+
+test('a download without an immutable server identity is refused rather than deriving one from display name', async (t) => {
+  const { result } = await download(t, {
+    unpublishedOnly: true, navigation: ['account'], tables: ['account'], identity: null,
+    displayName: 'Renamed Draft', expectRefusal: true,
+  });
+  assert.match(result.error, /immutable.*unique name.*(resolve|read)|identity.*(resolve|read)/i);
+  assert.equal(result.spec, undefined);
+});
+
+test('unknown custom classification keeps a hidden type-1 table as a reference even with a companion view', async (t) => {
+  const { result, warnings, metadataReads } = await download(t, {
+    navigation: ['account'], tables: ['account', 'task'], assetTables: ['task'], unknownCustom: ['task'],
+  });
+  assert.deepEqual(result.spec.app.tables, ['task']);
+  assert.deepEqual(result.spec.entities.map((entity) => entity.schemaName), ['account']);
+  assert.deepEqual(metadataReads, ['account']);
+  assert.ok(result.notRoundTripped.appMembership.some((note) => note.table === 'task' && /custom\/stock status.*without adopting its schema/.test(note.reason)));
+  assert.match(warnings.join(''), /task.*custom\/stock|custom\/stock.*task/);
+});
+
+test('draft-only generative navigation uses the current sitemap rather than the published page set', async (t) => {
+  const { result, calls } = await download(t, { draft: true, page: true, navigation: ['account'], tables: ['account'] });
+  assert.deepEqual(result.spec.pages.map((entry) => entry.pageId), [PAGE]);
+  assert.equal(result.droppedSubareas, 0);
+  assert.ok(calls.some((call) => call.url && call.url.startsWith('/sitemaps/Microsoft.Dynamics.CRM.RetrieveUnpublishedMultiple')));
+});
+
+test('placeholder and deleted type-1 components are omitted with explicit not-round-tripped notes', async (t) => {
+  const { result, warnings } = await download(t, { tables: ['account', 'contact', 'task'], placeholder: true, deleted: true });
+  assert.deepEqual(result.spec.app.tables, ['task']);
+  assert.ok(!result.spec.entities.some((entity) => entity.schemaName === 'entity'));
+  assert.match(warnings.join(''), /entity.*(placeholder|corrupt)/i);
+  assert.match(warnings.join(''), /404|no longer exists/);
+  assert.ok(result.notRoundTripped.appMembership.some((note) => /entity/.test(note.reason)));
+});
+
+test('download shares the current component inventory across membership and description reads', async (t) => {
+  const { calls } = await download(t, { members: [FORM_A] });
+  for (const type of [1, 26, 59, 60]) {
+    const queries = calls.filter((call) => call.set === 'appmodulecomponent' && new RegExp(`componenttype eq ${type}$`).test(call.opts.filter));
+    assert.equal(queries.length, 1, `component type ${type} should be inventoried once`);
+  }
+});
+
+test('a non-empty strict active Main subset emits names and the capability floor', async (t) => {
+  const { result } = await download(t, { tables: ['account', 'contact'], members: [FORM_A] });
+  assert.deepEqual(result.spec.app.mainForms, { account: ['Summary'] });
+  assert.equal(result.spec.minimumPluginVersion, '2.13.0');
+  assert.deepEqual(result.spec.forms, [], 'membership capture must not invent a lossy form layout');
+});
+
+test('the Main names of a restriction are listed in code-unit order, whatever the host locale collates them as', async (t) => {
+  // "Übersicht" collates before "Zusammenfassung" in the root locale ("Ü" sorts as a U) and after it in code units, so a list
+  // sorted with `localeCompare` came out differently on a machine with another locale or ICU version.
+  const { result } = await download(t, {
+    tables: ['account', 'contact'], members: [FORM_A, FORM_B],
+    catalog: [catalogForm(FORM_A, '\u00dcbersicht'), catalogForm(FORM_B, 'Zusammenfassung'), catalogForm(FORM_C, 'Other')],
+  });
+  assert.deepEqual(result.spec.app.mainForms, { account: ['Zusammenfassung', '\u00dcbersicht'] });
+});
+
+test('the Main names of a restriction stay in alphabetical order whatever their case', async (t) => {
+  // Raw code units would put "Summary" before "alternate"; the order is the dictionary's, as it was.
+  const { result } = await download(t, {
+    tables: ['account', 'contact'], members: [FORM_A, FORM_B],
+    catalog: [catalogForm(FORM_A, 'Summary'), catalogForm(FORM_B, 'alternate'), catalogForm(FORM_C, 'Other')],
+  });
+  assert.deepEqual(result.spec.app.mainForms, { account: ['alternate', 'Summary'] });
+});
+
+test('full active Main membership is omitted instead of inventing a restriction', async (t) => {
+  const { result } = await download(t, { tables: ['account', 'contact'], members: [FORM_A, FORM_B] });
+  assert.equal(result.spec.app.mainForms, undefined);
+  assert.equal(result.spec.app.tables, undefined);
+  assert.equal(result.spec.minimumPluginVersion, undefined);
+});
+
+test('empty active Main membership is omitted with a not-round-tripped explanation', async (t) => {
+  const { result, warnings } = await download(t, { tables: ['account', 'contact'], members: [] });
+  assert.equal(result.spec.app.mainForms, undefined);
+  assert.ok(result.notRoundTripped.appMembership.some((note) => note.table === 'account' && /no active Main/.test(note.reason)));
+  assert.match(warnings.join(''), /not.round.tripped.*no active Main/i);
+});
+
+test('ambiguous Main names, including inactive normalized twins, are not emitted by name', async (t) => {
+  const { result, warnings } = await download(t, {
+    tables: ['account', 'contact'], members: [FORM_A],
+    catalog: [catalogForm(FORM_A, 'Resume'), catalogForm(FORM_B, 'R\u00e9sum\u00e9', 0), catalogForm(FORM_C, 'Other')],
+  });
+  assert.equal(result.spec.app.mainForms, undefined);
+  assert.match(warnings.join(''), /not.round.tripped.*ambiguous.*Resume/i);
+});
+
+test('the note about Main forms that cannot be named lists them in code-unit order, whatever order the catalog answers in', async (t) => {
+  // Two active forms are named "Summary" and two "Alternate"; one of each is in the app. Neither name is unique in the catalog, so the restriction cannot be written
+  // by name and the note names the forms it could not address. The catalog query has no `$orderby`, so it answers in an order Dataverse does not fix: two downloads
+  // of one app, which differ in nothing else, then said "'Summary', 'Alternate'" in one and "'Alternate', 'Summary'" in the other, in the structured result and on stderr.
+  const catalog = [catalogForm(FORM_A, 'Summary'), catalogForm(FORM_B, 'Alternate'), catalogForm(FORM_C, 'Summary'), catalogForm(FORM_D, 'Alternate')];
+  const runs = [];
+  for (const order of [catalog, [...catalog].reverse()]) {
+    const { result, warnings } = await download(t, { tables: ['account', 'contact'], members: [FORM_A, FORM_B], catalog: order });
+    runs.push({ spec: result.spec, notRoundTripped: result.notRoundTripped, stderr: warnings.join('') });
+  }
+  const [forward, reversed] = runs;
+  assert.equal(forward.spec.app.mainForms, undefined, 'an ambiguous name is not written into the spec');
+  const note = forward.notRoundTripped.appMembership.find((entry) => entry.table === 'account' && /ambiguous/.test(entry.reason));
+  assert.match(note.reason, /^ambiguous or unreadable Main form name\(s\) 'Alternate', 'Summary' of account;/);
+  assert.deepEqual(reversed.notRoundTripped, forward.notRoundTripped, 'the structured result does not depend on the catalog order');
+  assert.equal(reversed.stderr, forward.stderr, 'nor does what the download says on stderr');
+  assert.deepEqual(reversed.spec, forward.spec);
+});
+
+test('a form without a name is listed in that note by its id, among the names and in the same order', async (t) => {
+  // A member with no readable name is named by its id, which sorts with the names ('3' before 'a'), whatever order the catalog answers in. "Alternate" is not unique
+  // in the catalog either, so both members are ambiguous.
+  const catalog = [catalogForm(FORM_A, ''), catalogForm(FORM_B, 'Alternate'), catalogForm(FORM_C, 'Alternate'), catalogForm(FORM_D, 'Summary')];
+  for (const order of [catalog, [...catalog].reverse()]) {
+    const { result } = await download(t, { tables: ['account', 'contact'], members: [FORM_A, FORM_B], catalog: order });
+    const note = result.notRoundTripped.appMembership.find((entry) => entry.table === 'account' && /ambiguous/.test(entry.reason));
+    assert.match(note.reason, new RegExp(`name\\(s\\) '${FORM_A}', 'Alternate' of account;`));
+  }
+});
+
+test('inactive and deleted pins do not erase the active restriction; their losses are named', async (t) => {
+  const { result, warnings } = await download(t, {
+    tables: ['account', 'contact'], members: [FORM_A, FORM_B, UNKNOWN],
+    catalog: [catalogForm(FORM_A, 'Summary'), catalogForm(FORM_B, 'Retired', 0), catalogForm(FORM_C, 'Other')],
+  });
+  assert.deepEqual(result.spec.app.mainForms, { account: ['Summary'] });
+  assert.match(warnings.join(''), /not.round.tripped.*Retired.*inactive/i);
+  assert.match(warnings.join(''), new RegExp(UNKNOWN));
+  assert.ok(result.notRoundTripped.appMembership.some((note) => note.id === UNKNOWN));
+});
+
+test('unclassifiable form pins retain any readable name in the loss report', async (t) => {
+  const { result, warnings } = await download(t, {
+    tables: ['account', 'contact'], members: [FORM_A, FORM_C],
+    catalog: [
+      catalogForm(FORM_A, 'Summary'), catalogForm(FORM_B, 'Alternate'),
+      { formid: FORM_C, name: 'Unclassified form', objecttypecode: 'account' },
+    ],
+  });
+  assert.deepEqual(result.spec.app.mainForms, { account: ['Summary'] });
+  const note = result.notRoundTripped.appMembership.find((entry) => entry.id === FORM_C);
+  assert.equal(note.name, 'Unclassified form');
+  assert.match(warnings.join(''), /Unclassified form.*could not be classified/);
+});
+
+test('malformed or missing form component ids do not erase an encodable active restriction', async (t) => {
+  for (const id of ['not-a-form-id', null]) {
+    const { result, warnings } = await download(t, {
+      tables: ['account', 'contact'], members: [FORM_A, id],
+    });
+    assert.deepEqual(result.spec.app.mainForms, { account: ['Summary'] });
+    assert.ok(result.notRoundTripped.appMembership.some((note) => note.kind === 'mainForms' && /objectid|GUID/.test(note.reason)));
+    assert.match(warnings.join(''), /not.round.tripped.*(objectid|GUID)/);
+  }
+});
+
+test('dashboard and same-named QuickView pins do not count as Main membership', async (t) => {
+  const { result } = await download(t, {
+    tables: ['account', 'contact'], members: [FORM_A, DASHBOARD, FORM_C],
+    catalog: [
+      catalogForm(FORM_A, 'Summary'), catalogForm(FORM_B, 'Alternate'),
+      { formid: DASHBOARD, name: 'Overview', type: 0, objecttypecode: 'none' },
+      { formid: FORM_C, name: 'Summary', type: 6, objecttypecode: 'account' },
+    ],
+  });
+  assert.deepEqual(result.spec.app.mainForms, { account: ['Summary'] });
+});
+
+test('membership emission never downgrades a higher authored capability floor', async (t) => {
+  const { result } = await download(t, {}, '2.14.0');
+  assert.equal(result.spec.minimumPluginVersion, '2.14.0');
+});
+
+test('authored-option preservation also protects the membership floor without inventing one for legacy specs', () => {
+  const deps = { existsSync: () => true, readFileSync: () => '{"languageCode":1031,"minimumPluginVersion":"2.15.0"}' };
+  const spec = { app: { tables: ['task'] }, minimumPluginVersion: '2.13.0' };
+  preserveAuthoredLanguageCode(spec, 'app-spec.json', deps);
+  assert.equal(spec.minimumPluginVersion, '2.15.0');
+  assert.equal(spec.languageCode, 1031);
+  const legacy = { app: {} };
+  preserveAuthoredLanguageCode(legacy, 'app-spec.json', deps);
+  assert.equal(legacy.minimumPluginVersion, undefined);
+});
+
+// ------------------------------------------------------------------------------------------------ --include-capabilities and the 2.21.0 floor
+
+const DATED = [
+  { logicalName: 'contoso_due', displayName: 'Due', attributeType: 'DateTime', isCustomAttribute: true },
+  { logicalName: 'contoso_seen', displayName: 'Seen', attributeType: 'DateTime', isCustomAttribute: true },
+  { logicalName: 'contoso_note', displayName: 'Note', attributeType: 'String', isCustomAttribute: true },
+];
+const dateRows = (rows) => ({ status: 200, body: { value: rows.map(([LogicalName, behavior]) => ({ LogicalName, DateTimeBehavior: { Value: behavior }, CanChangeDateTimeBehavior: { Value: true } })) } });
+const flagsBody = (dup, tracking, search) => ({ status: 200, body: { IsDuplicateDetectionEnabled: { Value: dup }, ChangeTrackingEnabled: tracking, SyncToExternalSearchIndex: search, CanEnableSyncToExternalSearchIndex: { Value: true } } });
+const capabilityReads = (dates, flags) => ({ dates, flags });
+const capabilityCalls = (calls) => calls.filter((c) => c.capability).map((c) => c.capability).sort();
+
+test('--include-capabilities off: the download makes the reads it always made and writes no date behaviour or table flag', async (t) => {
+  const reads = capabilityReads(() => assert.fail('no date read without the flag'), () => assert.fail('no flags read without the flag'));
+  const { result, calls } = await download(t, { attributes: DATED, capabilityReads: reads });
+  assert.deepEqual(capabilityCalls(calls), []);
+  const account = result.spec.entities.find((e) => e.schemaName === 'account');
+  assert.deepEqual(account.columns.filter((c) => c.type === 'DateTime').map((c) => c.dateTimeBehavior), [undefined, undefined]);
+  assert.equal(account.searchEnabled, undefined);
+  assert.equal(result.spec.minimumPluginVersion, '2.13.0', 'a spec with no 2.21.0 field keeps the floor it had');
+});
+
+test('--include-capabilities on: one date read and one flags read per table, only the non-default answers are written, and the spec asks for 2.21.0', async (t) => {
+  const reads = capabilityReads(
+    (table) => dateRows(table === 'account' ? [['contoso_due', 'DateOnly'], ['contoso_seen', 'UserLocal']] : [['contoso_due', 'TimeZoneIndependent'], ['contoso_seen', 'UserLocal']]),
+    (table) => (table === 'account' ? flagsBody(true, true, true) : flagsBody(false, false, false)));
+  const { result, calls } = await download(t, { attributes: DATED, capabilityReads: reads, includeCapabilities: true });
+  assert.deepEqual(capabilityCalls(calls), ['dates account', 'dates contact', 'flags account', 'flags contact']);
+  const byName = (table) => result.spec.entities.find((e) => e.schemaName === table);
+  const behaviours = (table) => Object.fromEntries(byName(table).columns.filter((c) => c.type === 'DateTime').map((c) => [c.schemaName, c.dateTimeBehavior]));
+  assert.deepEqual(behaviours('account'), { contoso_due: 'DateOnly', contoso_seen: undefined });
+  assert.deepEqual(behaviours('contact'), { contoso_due: 'TimeZoneIndependent', contoso_seen: undefined });
+  assert.deepEqual([byName('account').searchEnabled, byName('account').changeTrackingEnabled, byName('account').duplicateDetectionEnabled], [true, true, true]);
+  assert.deepEqual([byName('contact').searchEnabled, byName('contact').changeTrackingEnabled, byName('contact').duplicateDetectionEnabled], [undefined, undefined, undefined], 'an off flag is left out: turning one off is never asked for');
+  assert.equal(result.spec.minimumPluginVersion, '2.21.0');
+});
+
+test('--include-capabilities on: a read that gives no answer leaves its facts out and says which table and why; a table with no Date and Time column gets no date read', async (t) => {
+  const reads = capabilityReads(() => ({ status: 503, body: {} }), (table) => (table === 'account' ? { status: 503, body: {} } : flagsBody(true, false, false)));
+  const { result, calls, warnings } = await download(t, { attributes: DATED, capabilityReads: reads, includeCapabilities: true });
+  const account = result.spec.entities.find((e) => e.schemaName === 'account');
+  assert.deepEqual(account.columns.filter((c) => c.type === 'DateTime').map((c) => c.dateTimeBehavior), [undefined, undefined]);
+  assert.equal(account.duplicateDetectionEnabled, undefined);
+  assert.equal(result.spec.entities.find((e) => e.schemaName === 'contact').duplicateDetectionEnabled, true);
+  const warning = warnings.find((w) => w.includes('--include-capabilities could not read'));
+  assert.match(warning, /account \(Date and Time behaviours: HTTP 503; table flags: the read gave no answer\), contact \(Date and Time behaviours: HTTP 503\)/);
+  assert.equal(capabilityCalls(calls).filter((c) => c.startsWith('dates')).length, 2);
+  const plain = await download(t, { capabilityReads: capabilityReads(() => assert.fail('no Date and Time column, no date read'), () => flagsBody(false, false, false)), includeCapabilities: true });
+  assert.deepEqual(capabilityCalls(plain.calls), ['flags account', 'flags contact']);
+  assert.equal(plain.result.spec.minimumPluginVersion, '2.13.0');
+});
+
+test('--include-capabilities on: an answered read that leaves a Date and Time column or a table flag unstated names it in the warning, with no extra read', async (t) => {
+  const capabilityWarning = (warnings) => warnings.find((w) => w.includes('--include-capabilities could not read'));
+  // account: the typed list omits contoso_seen and states no behaviour for contoso_due; its flags answer states nothing.
+  // contact: every column and flag is stated (UserLocal and off flags are the quiet defaults).
+  const reads = capabilityReads(
+    (table) => (table === 'account'
+      ? { status: 200, body: { value: [{ LogicalName: 'contoso_due', DateTimeBehavior: null, CanChangeDateTimeBehavior: { Value: true } }] } }
+      : dateRows([['contoso_due', 'UserLocal'], ['contoso_seen', 'UserLocal']])),
+    (table) => (table === 'account' ? { status: 200, body: {} } : flagsBody(false, false, false)));
+  const { result, calls, warnings } = await download(t, { attributes: DATED, capabilityReads: reads, includeCapabilities: true });
+  assert.deepEqual(capabilityCalls(calls), ['dates account', 'dates contact', 'flags account', 'flags contact'], 'one date read and one flags read per table');
+  const account = result.spec.entities.find((e) => e.schemaName === 'account');
+  assert.deepEqual(account.columns.filter((c) => c.type === 'DateTime').map((c) => c.dateTimeBehavior), [undefined, undefined]);
+  assert.deepEqual([account.searchEnabled, account.changeTrackingEnabled, account.duplicateDetectionEnabled], [undefined, undefined, undefined]);
+  const warning = capabilityWarning(warnings);
+  assert.ok(warning, 'an unstated capability is reported, not taken as the default');
+  assert.match(warning, /account \([^)]*contoso_due[^)]*\)/);
+  assert.match(warning, /account \([^)]*contoso_seen[^)]*\)/);
+  assert.match(warning, /account \([^)]*table flags[^)]*duplicateDetectionEnabled[^)]*\)/);
+  assert.doesNotMatch(warning, /contact \(/, 'stated defaults stay quiet');
+
+  // A flags answer that states only some flags keeps the ones it states and names the rest.
+  const partial = await download(t, {
+    capabilityReads: capabilityReads(() => assert.fail('no Date and Time column, no date read'),
+      () => ({ status: 200, body: { IsDuplicateDetectionEnabled: { Value: true }, ChangeTrackingEnabled: 'yes' } })),
+    includeCapabilities: true,
+  });
+  assert.equal(partial.result.spec.entities.find((e) => e.schemaName === 'account').duplicateDetectionEnabled, true);
+  assert.match(capabilityWarning(partial.warnings), /account \(table flags: the answer does not state changeTrackingEnabled, searchEnabled\)/);
+
+  // Every column and flag stated: no warning at all.
+  const quiet = await download(t, { attributes: DATED, capabilityReads: capabilityReads(() => dateRows([['contoso_due', 'DateOnly'], ['contoso_seen', 'UserLocal']]), () => flagsBody(false, false, false)), includeCapabilities: true });
+  assert.equal(capabilityWarning(quiet.warnings), undefined);
+});
+
+test('a downloaded secured column asks for 2.21.0 without the flag, and a higher floor on disk is kept', async (t) => {
+  const secured = [{ logicalName: 'contoso_salary', displayName: 'Salary', attributeType: 'Money', isCustomAttribute: true, isSecured: true }];
+  const { result } = await download(t, { attributes: secured });
+  assert.equal(result.spec.entities.find((e) => e.schemaName === 'account').columns.find((c) => c.schemaName === 'contoso_salary').isSecured, true);
+  assert.equal(result.spec.minimumPluginVersion, '2.21.0');
+  const kept = await download(t, { attributes: secured }, '2.24.0');
+  assert.equal(kept.result.spec.minimumPluginVersion, '2.24.0');
+});
+
+// app.theme (Preview). lib/app-theme.js downloadAppTheme (its reads are pinned in app-theme*.test.js) is replaced by an
+// answer; what is pinned is where runDownload asks for it, and what it writes, refuses or exports with that answer.
+const appTheme = require('../lib/app-theme.js');
+const OWN_LOGO = 'contoso_/images/logo.svg';
+const themeAnswer = (t, answer) => {
+  const asked = [];
+  t.mock.method(appTheme, 'downloadAppTheme', async (ctx) => { asked.push(ctx); return answer; });
+  return asked;
+};
+const captured = (theme, logo) => ({ status: 'captured', theme, pendingPublish: false, ...(logo ? { logo: { webResourceName: logo, webResourceType: 11 } } : {}) });
+const withLogoRow = (name, row) => (sdk) => ({ ...sdk, queryRecords: async (set, opts = {}) => (set === 'webresource' && String(opts.filter || '').includes(name) ? (row ? [row] : []) : sdk.queryRecords(set, opts)) });
+const filesIn = (directory) => fs.readdirSync(directory, { recursive: true });
+
+test('app.theme: no --include-capabilities, no theme read and no field; the flag reads it once and writes it with the 2.21.0 floor', async (t) => {
+  const asked = themeAnswer(t, captured({ basePaletteColor: '#0f6cbd' }));
+  const plain = await download(t, { captureTheme: undefined });
+  assert.equal(asked.length, 0);
+  assert.equal(plain.result.spec.app.theme, undefined);
+  assert.equal(plain.result.spec.minimumPluginVersion, '2.13.0');
+  const flagged = await download(t, { captureTheme: undefined, includeCapabilities: true, capabilityReads: capabilityReads(() => dateRows([]), () => flagsBody(false, false, false)) });
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].appId, APP);
+  assert.deepEqual(flagged.result.spec.app.theme, { basePaletteColor: '#0f6cbd' });
+  assert.equal(flagged.result.spec.minimumPluginVersion, '2.21.0');
+});
+
+test('app.theme: a theme that cannot be stated exactly refuses a strict download before anything is written', async (t) => {
+  themeAnswer(t, { status: 'refused', code: 'APP_THEME_UNREPRESENTABLE' });
+  const { result, directory } = await download(t, { captureTheme: true, page: true, expectRefusal: true });
+  assert.equal(result.code, 'APP_THEME_UNREPRESENTABLE');
+  assert.match(result.error, /--allow-lossy-download/);
+  assert.deepEqual(filesIn(directory), [], 'no page, no spec, nothing');
+});
+
+test('app.theme: --allow-lossy-download leaves the field out, names the loss, and the rest of the spec is written', async (t) => {
+  themeAnswer(t, { status: 'refused', code: 'APP_THEME_READ_INCOMPLETE' });
+  const { result, warnings } = await download(t, { captureTheme: true, allowLossy: true });
+  assert.equal(result.spec.app.theme, undefined);
+  assert.ok(warnings.some((w) => /app\.theme was LEFT OUT \(APP_THEME_READ_INCOMPLETE\)/.test(w)), warnings.join(''));
+  assert.equal(result.spec.minimumPluginVersion, '2.13.0', 'no theme, no theme floor');
+});
+
+test('app.theme: a removal pending its publish is written as null and said to be unpublished', async (t) => {
+  themeAnswer(t, { status: 'captured', theme: null, pendingPublish: true });
+  const { result, warnings } = await download(t, { captureTheme: true });
+  assert.equal(result.spec.app.theme, null);
+  assert.ok(warnings.some((w) => /SAVED theme, which is not published yet: the removal/.test(w)));
+});
+
+test('app.theme: this publisher\'s logo is exported as an external image, which a teardown keeps', async (t) => {
+  themeAnswer(t, captured({ logo: { webResourceName: OWN_LOGO } }, OWN_LOGO));
+  const { result } = await download(t, { captureTheme: true, wrapSdk: withLogoRow(OWN_LOGO, { name: OWN_LOGO, webresourcetype: 11, content: 'PHN2Zz4=', ismanaged: false }) });
+  assert.deepEqual(result.spec.app.theme, { logo: { webResourceName: OWN_LOGO } });
+  const logo = (result.spec.webResources || []).find((wr) => wr.name === OWN_LOGO);
+  assert.equal(logo && logo.external, true, JSON.stringify(result.spec.webResources));
+  assert.equal(logo.contentBase64, 'PHN2Zz4=');
+});
+
+test('app.theme: a logo of this publisher that cannot be exported refuses a strict download, and is left out with the theme when lossy', async (t) => {
+  themeAnswer(t, captured({ logo: { webResourceName: OWN_LOGO } }, OWN_LOGO));
+  const strict = await download(t, { captureTheme: true, expectRefusal: true, wrapSdk: withLogoRow(OWN_LOGO, null) });
+  assert.equal(strict.result.code, 'APP_THEME_LOGO_UNEXPORTABLE');
+  assert.equal(fs.existsSync(path.join(strict.directory, 'app-spec.json')), false);
+  const lossy = await download(t, { captureTheme: true, allowLossy: true, wrapSdk: withLogoRow(OWN_LOGO, null) });
+  assert.equal(lossy.result.spec.app.theme, undefined);
+  assert.ok(!(lossy.result.spec.webResources || []).some((wr) => wr.name === OWN_LOGO));
+  assert.ok(lossy.warnings.some((w) => /APP_THEME_LOGO_UNEXPORTABLE/.test(w)));
+});
+
+test('app.theme: a strict download whose logo of this publisher cannot be exported refuses before any page is written', async (t) => {
+  themeAnswer(t, captured({ logo: { webResourceName: OWN_LOGO } }, OWN_LOGO));
+  const { result, directory } = await download(t, { captureTheme: true, page: true, expectRefusal: true, wrapSdk: withLogoRow(OWN_LOGO, null) });
+  assert.equal(result.code, 'APP_THEME_LOGO_UNEXPORTABLE');
+  assert.deepEqual(filesIn(directory), [], 'no page, no spec, nothing');
+});
+
+test('app.theme: the logo is read once, before the pages, and that read is what is exported', async (t) => {
+  themeAnswer(t, captured({ logo: { webResourceName: OWN_LOGO } }, OWN_LOGO));
+  const reads = [];
+  const row = { name: OWN_LOGO, webresourcetype: 11, content: 'PHN2Zz4=', ismanaged: false };
+  const wrapSdk = (sdk, directory) => {
+    const inner = withLogoRow(OWN_LOGO, row)(sdk);
+    return { ...inner, queryRecords: async (set, opts = {}) => { if (set === 'webresource' && String(opts.filter || '').includes(OWN_LOGO)) reads.push(filesIn(directory).length); return inner.queryRecords(set, opts); } };
+  };
+  const { result } = await download(t, { captureTheme: true, page: true, wrapSdk });
+  assert.deepEqual(reads, [0], 'one logo read, made while the output folder was still empty');
+  assert.equal(result.spec.webResources.find((wr) => wr.name === OWN_LOGO).contentBase64, 'PHN2Zz4=');
+});
+
+test('app.theme: another publisher\'s logo stays a bare reference that must exist where the spec is built', async (t) => {
+  const foreign = 'msdyn_/images/logo.svg';
+  themeAnswer(t, captured({ logo: { webResourceName: foreign } }, foreign));
+  const { result, warnings } = await download(t, { captureTheme: true });
+  assert.deepEqual(result.spec.app.theme, { logo: { webResourceName: foreign } });
+  assert.ok(!(result.spec.webResources || []).some((wr) => wr.name === foreign));
+  assert.ok(warnings.some((w) => /referenced, not exported/.test(w)));
+});
+
+// A logo that is not exported is kept as a reference only when it is KNOWN to be another publisher's or managed. When the
+// app's publisher cannot be read, a missing or empty image is neither: the strict download refuses it before writing.
+const publisherUnread = (row) => (sdk) => {
+  const inner = withLogoRow(OWN_LOGO, row)(sdk);
+  return { ...inner, queryRecords: async (set, opts = {}) => {
+    if (set === 'solutioncomponent') throw new Error('solution membership unreadable');
+    return inner.queryRecords(set, opts);
+  } };
+};
+const LOGO_ROW = { name: OWN_LOGO, webresourcetype: 11, content: 'PHN2Zz4=', ismanaged: false };
+for (const [label, row] of [
+  ['an empty unmanaged image', { ...LOGO_ROW, content: '' }],
+  ['an image gone before the export', null],
+  ['a readable image whose management is not stated', { ...LOGO_ROW, ismanaged: undefined }],
+]) {
+  test(`app.theme: publisher unknown, ${label}: a strict download refuses before anything is written, and leaves an earlier spec as it was`, async (t) => {
+    themeAnswer(t, captured({ logo: { webResourceName: OWN_LOGO } }, OWN_LOGO));
+    const { result, directory, warnings } = await download(t, { captureTheme: true, page: true, expectRefusal: true, wrapSdk: publisherUnread(row) }, '2.13.0');
+    assert.equal(result.code, 'APP_THEME_LOGO_UNEXPORTABLE', JSON.stringify(result));
+    assert.match(result.error, /--allow-lossy-download/);
+    assert.deepEqual(filesIn(directory), ['app-spec.json'], 'no page, no new file');
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, 'app-spec.json'), 'utf8')), { minimumPluginVersion: '2.13.0' });
+    assert.ok(!warnings.some((w) => /referenced, not exported/.test(w)), 'never called another publisher\'s or managed');
+  });
+  test(`app.theme: publisher unknown, ${label}: --allow-lossy-download leaves the theme out and names the loss`, async (t) => {
+    themeAnswer(t, captured({ logo: { webResourceName: OWN_LOGO } }, OWN_LOGO));
+    const { result, warnings } = await download(t, { captureTheme: true, page: true, allowLossy: true, wrapSdk: publisherUnread(row) });
+    assert.equal(result.spec.app.theme, undefined);
+    assert.ok(!(result.spec.webResources || []).some((wr) => wr.name === OWN_LOGO));
+    assert.ok(warnings.some((w) => /app\.theme was LEFT OUT \(APP_THEME_LOGO_UNEXPORTABLE\)/.test(w)), warnings.join(''));
+  });
+}
+
+test('app.theme: publisher unknown, a readable managed logo stays a reference, and is said to be managed', async (t) => {
+  themeAnswer(t, captured({ logo: { webResourceName: OWN_LOGO } }, OWN_LOGO));
+  const { result, warnings } = await download(t, { captureTheme: true, page: true, wrapSdk: publisherUnread({ ...LOGO_ROW, ismanaged: true }) });
+  assert.deepEqual(result.spec.app.theme, { logo: { webResourceName: OWN_LOGO } });
+  assert.ok(!(result.spec.webResources || []).some((wr) => wr.name === OWN_LOGO));
+  assert.ok(warnings.some((w) => /header logo '[^']+' is managed, so it is referenced, not exported/.test(w)), warnings.join(''));
+});
+
+test('app.theme: publisher unknown, a readable unmanaged logo is refused, as it was', async (t) => {
+  themeAnswer(t, captured({ logo: { webResourceName: OWN_LOGO } }, OWN_LOGO));
+  const { result, directory } = await download(t, { captureTheme: true, page: true, expectRefusal: true, wrapSdk: publisherUnread(LOGO_ROW) });
+  assert.equal(result.code, 'APP_THEME_LOGO_UNEXPORTABLE');
+  assert.deepEqual(filesIn(directory), []);
+});
+
+test('app.theme: publisher known, an empty logo of this publisher is refused, and a managed one with content stays a reference', async (t) => {
+  themeAnswer(t, captured({ logo: { webResourceName: OWN_LOGO } }, OWN_LOGO));
+  const empty = await download(t, { captureTheme: true, page: true, expectRefusal: true, wrapSdk: withLogoRow(OWN_LOGO, { ...LOGO_ROW, content: '' }) });
+  assert.equal(empty.result.code, 'APP_THEME_LOGO_UNEXPORTABLE');
+  assert.deepEqual(filesIn(empty.directory), []);
+  const managed = await download(t, { captureTheme: true, wrapSdk: withLogoRow(OWN_LOGO, { ...LOGO_ROW, ismanaged: true }) });
+  assert.deepEqual(managed.result.spec.app.theme, { logo: { webResourceName: OWN_LOGO } });
+  assert.ok(!(managed.result.spec.webResources || []).some((wr) => wr.name === OWN_LOGO));
+  assert.ok(managed.warnings.some((w) => /is managed, so it is referenced, not exported/.test(w)), managed.warnings.join(''));
+});
+
+test('app.theme: a spec that keeps app.theme on re-download keeps a higher floor its author set', async (t) => {
+  themeAnswer(t, captured({ basePaletteColor: '#0f6cbd' }));
+  const { result } = await download(t, { captureTheme: true }, '2.30.0');
+  assert.equal(result.spec.minimumPluginVersion, '2.30.0');
+});

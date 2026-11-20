@@ -1,0 +1,4 @@
+interface:
+  display_name: "Connect PP"
+  short_description: "Connect Dataverse and the Canvas Studio session"
+  default_prompt: "$connect-pp로 Dataverse와 Canvas Studio를 연결해 줘."

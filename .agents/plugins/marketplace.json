@@ -1,0 +1,32 @@
+{
+  "name": "workshop-minimal-power-platform",
+  "interface": {
+    "displayName": "Power Platform Project"
+  },
+  "plugins": [
+    {
+      "name": "canvas-apps",
+      "source": {
+        "source": "local",
+        "path": "./vendor/power-platform-skills-codex/plugins/canvas-apps"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "dataverse",
+      "source": {
+        "source": "local",
+        "path": "./vendor/power-platform-skills-codex/plugins/dataverse"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

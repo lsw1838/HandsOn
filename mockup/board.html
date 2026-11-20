@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>팀 게시판 · 화면 목업</title>
+  <style>
+    :root { color-scheme: light; font-family: "Segoe UI", "맑은 고딕", sans-serif; color: #172033; background: #f4f6fa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { height: 72px; background: white; border-bottom: 1px solid #e2e7ef; }
+    .header-inner { max-width: 1160px; margin: auto; padding: 0 28px; height: 100%; display: flex; align-items: center; justify-content: space-between; }
+    .brand { display: flex; align-items: center; gap: 12px; font-size: 18px; font-weight: 750; }
+    .mark { width: 34px; height: 34px; border-radius: 10px; background: #2458df; color: white; display: grid; place-items: center; font-size: 19px; }
+    .header-note { color: #657187; font-size: 13px; }
+    main { max-width: 1160px; margin: 40px auto; padding: 0 28px; }
+    .intro { margin-bottom: 28px; }
+    .eyebrow { margin: 0 0 8px; color: #2458df; font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+    h1 { font-size: 30px; letter-spacing: -.04em; margin: 0 0 10px; }
+    .subtitle { margin: 0; color: #657187; font-size: 14px; line-height: 1.6; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 24px; align-items: start; }
+    .card { background: white; border: 1px solid #e2e7ef; border-radius: 14px; overflow: hidden; }
+    .card-heading { padding: 22px 24px; border-bottom: 1px solid #e9edf3; display: flex; align-items: center; gap: 10px; }
+    h2 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
+    .count { background: #eef3ff; color: #2458df; border-radius: 20px; padding: 3px 8px; font-size: 12px; font-weight: 700; }
+    .list { margin: 0; padding: 0; list-style: none; }
+    .post { padding: 22px 24px; border-bottom: 1px solid #edf0f5; }
+    .post:last-child { border-bottom: 0; }
+    .post-title { margin: 0 0 7px; font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+    .post-body { margin: 0 0 13px; color: #657187; font-size: 13px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .post-date { color: #8993a4; font-size: 12px; }
+    form { padding: 24px; }
+    label { display: block; font-size: 13px; font-weight: 650; margin-bottom: 8px; }
+    input, textarea { width: 100%; padding: 11px 12px; border: 1px solid #cfd7e4; border-radius: 8px; font: inherit; font-size: 14px; background: white; color: inherit; }
+    input:focus, textarea:focus { outline: 2px solid #c5d5ff; border-color: #2458df; }
+    textarea { min-height: 164px; resize: vertical; line-height: 1.6; }
+    .field { margin-bottom: 20px; }
+    .actions { display: flex; justify-content: flex-end; }
+    button { border: 0; border-radius: 8px; background: #2458df; color: white; padding: 11px 22px; font: inherit; font-size: 14px; font-weight: 650; cursor: pointer; }
+    button:hover { background: #1949c9; }
+    .message { min-height: 20px; color: #2458df; font-size: 12px; margin: 16px 0 0; }
+    footer { margin-top: 18px; color: #8993a4; font-size: 12px; }
+
+    [hidden] { display: none !important; }
+    .post { padding: 0; }
+    .post-link { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: center; width: 100%; min-height: 94px; text-align: left; padding: 18px 24px; background: white; color: #172033; border-radius: 0; }
+    .post-link:hover { background: #f7f9fd; }
+    button:focus-visible { outline: 2px solid #2458df; outline-offset: -3px; }
+    .post-title, .post-date { display: block; }
+    .post-body { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin-bottom: 8px; font-weight: 400; }
+    .post-date { color: #657187; font-weight: 400; }
+    .post-arrow { color: #4d628f; font-size: 25px; font-weight: 400; }
+    .empty { padding: 24px; color: #657187; font-size: 14px; }
+    dialog { width: min(580px, calc(100% - 24px)); max-height: calc(100dvh - 24px); padding: 0; border: 1px solid #e2e7ef; border-radius: 14px; color: inherit; background: white; box-shadow: 0 16px 42px #17203325; }
+    dialog::backdrop { background: #17203375; }
+    .dialog-header { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 24px; background: white; border-bottom: 1px solid #e9edf3; z-index: 1; }
+    .dialog-header button, .button-secondary { background: #eef2f8; color: #25334d; }
+    .dialog-header button:hover, .button-secondary:hover { background: #e0e7f1; }
+    .dialog-header button { padding: 8px 13px; }
+    .detail, .delete-panel { padding: 24px; }
+    .detail-title { margin: 6px 0 14px; font-size: 22px; overflow-wrap: anywhere; }
+    .detail-body { min-height: 70px; margin: 0 0 26px; color: #35425a; font-size: 15px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .actions { flex-wrap: wrap; gap: 8px; }
+    .button-danger { background: #a82a36; }
+    .button-danger:hover { background: #8d202b; }
+    .delete-panel p { margin: 0 0 20px; line-height: 1.6; overflow-wrap: anywhere; }
+    @media (max-width: 800px) { main { margin: 24px auto; padding: 0 20px; } .workspace { grid-template-columns: 1fr; } .header-inner { padding: 0 20px; } .header-note { display: none; } }
+  </style>
+</head>
+<body>
+  <header><div class="header-inner"><div class="brand"><span class="mark" aria-hidden="true">▤</span>팀 게시판</div><span class="header-note">함께 나누는 우리 팀의 소식</span></div></header>
+  <main>
+    <section class="intro"><p class="eyebrow">TEAM BOARD</p><h1>우리 팀의 이야기를 모아요</h1><p class="subtitle">새 글을 작성하거나, 목록에서 글을 선택해 자세히 볼 수 있습니다.</p></section>
+    <div class="workspace">
+      <section class="card" aria-labelledby="list-title"><div class="card-heading"><h2 id="list-title">최근 소식</h2><span id="count" class="count">3</span></div><ul id="posts" class="list"></ul></section>
+      <section class="card" aria-labelledby="write-title"><div class="card-heading"><h2 id="write-title">새 글 작성</h2></div>
+        <form id="new-post">
+          <div class="field"><label for="title">제목</label><input id="title" name="title" placeholder="어떤 소식인가요?" maxlength="100" required></div>
+          <div class="field"><label for="body">내용</label><textarea id="body" name="body" placeholder="함께 나누고 싶은 내용을 적어 주세요."></textarea></div>
+          <div class="actions"><button type="submit">등록하기</button></div><p id="message" class="message" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+    </div>
+    <footer>화면 목업 · 새로고침하면 예시 데이터로 돌아갑니다.</footer>
+  </main>
+  <dialog id="post-dialog" aria-labelledby="dialog-heading">
+    <div class="dialog-header">
+      <h2 id="dialog-heading" tabindex="-1">글 상세</h2>
+      <button type="button" id="close-dialog">닫기</button>
+    </div>
+
+    <section id="detail-panel" class="detail">
+      <time id="detail-date" class="post-date"></time>
+      <h3 id="detail-title" class="detail-title"></h3>
+      <p id="detail-body" class="detail-body"></p>
+      <div class="actions">
+        <button type="button" id="delete-post" class="button-secondary">삭제</button>
+        <button type="button" id="edit-post">수정</button>
+      </div>
+    </section>
+
+    <form id="edit-panel" hidden>
+      <div class="field"><label for="edit-title">제목</label><input id="edit-title" name="title" maxlength="100" required></div>
+      <div class="field"><label for="edit-body">내용</label><textarea id="edit-body" name="body"></textarea></div>
+      <div class="actions">
+        <button type="button" id="cancel-edit" class="button-secondary">취소</button>
+        <button type="submit">변경 저장</button>
+      </div>
+    </form>
+
+    <section id="delete-panel" class="delete-panel" hidden>
+      <p id="delete-question"></p>
+      <div class="actions">
+        <button type="button" id="cancel-delete" class="button-secondary">취소</button>
+        <button type="button" id="confirm-delete" class="button-danger">글 삭제</button>
+      </div>
+    </section>
+  </dialog>
+
+  <script>
+
+    const byId = (id) => document.getElementById(id);
+    const posts = [
+      { id: 1, title: '이번 주 팀 미팅 안내', body: '이번 주에는 각자 진행한 일과 다음 주 계획을 함께 공유합니다.\n\n시간: 금요일 오후 2시\n장소: 3층 회의실' },
+      { id: 2, title: '함께 개선할 아이디어가 있나요?', body: '작은 불편도 좋아요. 팀과 나누고 싶은 아이디어를 남겨 주세요.' },
+      { id: 3, title: '팀 게시판을 시작합니다', body: '새로운 소식과 필요한 이야기를 한곳에서 확인해 보세요.' }
+    ].map((post, index) => ({ ...post, createdAt: new Date(Date.now() - index * 86400000) }));
+
+    const dateFormat = new Intl.DateTimeFormat('ko-KR', { dateStyle: 'medium' });
+    const list = byId('posts');
+    const message = byId('message');
+    const newForm = byId('new-post');
+    const dialog = byId('post-dialog');
+    const heading = byId('dialog-heading');
+    const detail = byId('detail-panel');
+    const editForm = byId('edit-panel');
+    const deletePanel = byId('delete-panel');
+    let nextId = 4;
+    let selectedPost = null;
+
+    function element(tag, className, text) {
+      const node = document.createElement(tag);
+      node.className = className;
+      node.textContent = text;
+      return node;
+    }
+
+    function render() {
+      list.replaceChildren();
+      for (const post of posts) {
+        const item = element('li', 'post', '');
+        const button = element('button', 'post-link', '');
+        button.type = 'button';
+        button.dataset.postId = String(post.id);
+        button.setAttribute('aria-haspopup', 'dialog');
+        button.setAttribute('aria-label', post.title);
+        const summary = document.createElement('span');
+        summary.append(
+          element('span', 'post-title', post.title),
+          element('span', 'post-body', post.body),
+          element('span', 'post-date', dateFormat.format(post.createdAt))
+        );
+        const arrow = element('span', 'post-arrow', '›');
+        arrow.setAttribute('aria-hidden', 'true');
+        button.append(summary, arrow);
+        button.addEventListener('click', () => openPost(post));
+        item.append(button);
+        list.append(item);
+      }
+      if (posts.length === 0) list.append(element('li', 'empty', '등록된 글이 없습니다.'));
+      byId('count').textContent = posts.length;
+    }
+
+    function showPanel(panel, label) {
+      for (const entry of [detail, editForm, deletePanel]) entry.hidden = entry !== panel;
+      heading.textContent = label;
+    }
+
+    function showDetail() {
+      byId('detail-title').textContent = selectedPost.title;
+      byId('detail-body').textContent = selectedPost.body || '본문이 없습니다.';
+      const date = byId('detail-date');
+      date.dateTime = selectedPost.createdAt.toISOString();
+      date.textContent = dateFormat.format(selectedPost.createdAt);
+      showPanel(detail, '글 상세');
+    }
+
+    function openPost(post) {
+      selectedPost = post;
+      showDetail();
+      dialog.showModal();
+      heading.focus();
+    }
+
+    function readFields(form) {
+      const titleInput = form.elements.namedItem('title');
+      const title = titleInput.value.trim();
+      if (!title || title.length > 100) {
+        titleInput.setCustomValidity('제목은 1~100자로 입력해 주세요.');
+        titleInput.reportValidity();
+        return null;
+      }
+      return { title, body: form.elements.namedItem('body').value.trim() };
+    }
+
+    for (const form of [newForm, editForm]) {
+      const input = form.elements.namedItem('title');
+      input.addEventListener('input', () => input.setCustomValidity(''));
+    }
+
+    newForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const fields = readFields(newForm);
+      if (!fields) return;
+      posts.unshift({ ...fields, id: nextId++, createdAt: new Date() });
+      render();
+      newForm.reset();
+      message.textContent = '글을 등록했습니다.';
+    });
+
+    byId('edit-post').addEventListener('click', () => {
+      const input = byId('edit-title');
+      input.setCustomValidity('');
+      input.value = selectedPost.title;
+      byId('edit-body').value = selectedPost.body;
+      showPanel(editForm, '글 수정');
+      input.focus();
+    });
+
+    editForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const fields = readFields(editForm);
+      if (!fields) return;
+      Object.assign(selectedPost, fields);
+      render();
+      showDetail();
+      heading.focus();
+    });
+
+    byId('delete-post').addEventListener('click', () => {
+      byId('delete-question').textContent = '“' + selectedPost.title + '” 글을 삭제하시겠습니까?';
+      showPanel(deletePanel, '삭제 확인');
+      byId('cancel-delete').focus();
+    });
+
+    byId('cancel-edit').addEventListener('click', () => {
+      showDetail();
+      byId('edit-post').focus();
+    });
+    byId('cancel-delete').addEventListener('click', () => {
+      showDetail();
+      byId('delete-post').focus();
+    });
+    byId('confirm-delete').addEventListener('click', () => {
+      const index = posts.findIndex((post) => post.id === selectedPost.id);
+      posts.splice(index, 1);
+      render();
+      message.textContent = '글을 삭제했습니다.';
+      dialog.close();
+    });
+    byId('close-dialog').addEventListener('click', () => dialog.close());
+    dialog.addEventListener('close', () => {
+      const row = list.querySelector('[data-post-id="' + selectedPost.id + '"]');
+      (row || list.querySelector('.post-link') || byId('title')).focus();
+      selectedPost = null;
+    });
+
+    render();
+  </script>
+</body>
+</html>

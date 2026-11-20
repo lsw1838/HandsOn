@@ -1,0 +1,362 @@
+'use strict';
+// Change classifier for `--changed-only` (changed-only design, deliverable #5 decision core, PURE).
+//
+// Given the CURRENT spec and the LAST-APPLIED spec — BOTH annotated with on-disk content hashes by
+// content-hash.js (so .tsx/contentPath byte edits are visible) — decide whether the diff can be applied
+// via the fast path, and if not, WHY (and what debt to record). FAIL-CLOSED: a change is fast-eligible
+// ONLY if it is PROVABLY one of the four convergent shapes; anything else forces a full build. The build
+// engine is ADDITIVE, not convergent (existing chart/command/dashboard defs and web-resource CONTENT are
+// SKIPPED on rebuild; views only UNION columns; forms reconcile fields but not placement), so an edit to
+// such an artifact does not converge even under a FULL build — those edits record sticky DEBT that blocks
+// snapshot eligibility until a proven-fresh recreation clears it (design §"Eligibility state machine").
+//
+// The four convergent shapes (the ONLY fast-path edits in v1):
+//   #1 page     — .tsx byte change to an EXISTING page, key→pageId map + name/nav/semantics unchanged.
+//   #2 form     — explicit-layout field-set add/remove, placement-exact. NOT decided here: form placement
+//                 convergence can only be proven against the DEPLOYED form projection (the spec's
+//                 layout:'auto' forms don't even carry placement), so form edits are conservatively
+//                 full-build + debt-candidate; the build-time verifier clears the debt iff it converged.
+//   #3 view     — pure APPEND of columns (prior columns are a prefix of current; nothing else changed).
+//   #4 app-shell— structural sitemap change only (the whole app object unchanged).
+//
+// PURE + I/O-free. Consumes the ANNOTATED specs (caller runs annotateContentHashes first).
+
+const { diffPhases, stableStringify } = require('./phase-diff.js');
+const { stageEditApplies } = require('./bpf-stages.js');
+
+// Phases that, when changed, always force a full build. data-model ripples into everything; solution/
+// sample-data/ai have no convergent fast shape. A full build applies them correctly, so NO debt.
+const FULL_BUILD_PHASES = new Set(['data-model', 'solution', 'sample-data', 'ai-features', 'security']);
+
+// Stable identity keys per artifact type, used to align current vs prior entries (added / edited / removed).
+const identityOf = {
+  view: (v) => `${low(v.entity)}|${v.name}`,
+  chart: (c) => `${low(c.entity)}|${c.name}`,
+  command: (c) => `${low(c.entity)}|${c.name || c.label || ''}`,
+  dashboard: (d) => `${d.name}`,
+  form: (f) => `${low(f.entity)}|${f.formType || 'Main'}|${f.name || ''}`,
+  page: (p) => `${p.key || p.name}`,
+  webResource: (w) => `${w.name}`,
+  // A rule and a flow are both identified by (entity, name) — the same pair the build's reuse query
+  // and the teardown resolver use, so the classifier cannot disagree with them about which is which.
+  businessRule: (r) => `${low(r.entity)}|${r.name}`,
+  businessProcessFlow: (p) => `${low(p.entity)}|${p.name}`,
+};
+
+function low(s) { return String(s == null ? '' : s).toLowerCase(); }
+
+// Compare two objects for structural equality IGNORING the listed keys (order-independent via
+// stableStringify). Used to ask "is everything EXCEPT columns / __contentSha identical?".
+function equalExcept(a, b, ignoreKeys) {
+  const strip = (o) => {
+    const c = { ...(o || {}) };
+    for (const k of ignoreKeys) delete c[k];
+    return c;
+  };
+  return stableStringify(strip(a)) === stableStringify(strip(b));
+}
+
+// Is `prefix` an exact leading prefix of `full` (deep per-element equality, prefix.length <= full.length)?
+function isColumnPrefix(prefix, full) {
+  const p = prefix || [];
+  const f = full || [];
+  if (p.length > f.length) return false;
+  for (let i = 0; i < p.length; i++) {
+    if (stableStringify(p[i]) !== stableStringify(f[i])) return false;
+  }
+  return true;
+}
+
+// Index an array by identity, returning a Map(identity -> entry). Non-array -> empty map.
+function indexBy(arr, keyFn) {
+  const m = new Map();
+  for (const item of Array.isArray(arr) ? arr : []) {
+    if (item && typeof item === 'object') m.set(keyFn(item), item);
+  }
+  return m;
+}
+
+// Split current vs prior artifact arrays into added / removed / common(edited-or-same) by identity.
+function alignByIdentity(curArr, priorArr, keyFn) {
+  const cur = indexBy(curArr, keyFn);
+  const prior = indexBy(priorArr, keyFn);
+  const added = [], removed = [], common = [];
+  for (const [k, v] of cur) { if (!prior.has(k)) added.push({ id: k, cur: v }); else common.push({ id: k, cur: v, prior: prior.get(k) }); }
+  for (const [k, v] of prior) { if (!cur.has(k)) removed.push({ id: k, prior: v }); }
+  return { added, removed, common };
+}
+
+// ---- per-phase detectors. Each returns { fast:[shapes], full:[reasons], debt:[entries] }. ----
+
+// #1 pages: every changed page must be CONTENT-ONLY (same key, same pageId, same name/nav/semantics; only
+// __contentSha differs). An added page (full build creates it — no debt), a removed page (removal
+// convergence unproven — debt), or a structural page edit (name/nav/pageId changed → possibly a sitemap
+// change) forces a full build.
+function classifyPages(cur, prior) {
+  const out = { fast: [], full: [], debt: [] };
+  const { added, removed, common } = alignByIdentity(cur.pages, prior.pages, identityOf.page);
+  if (added.length) out.full.push(`pages: ${added.length} new page(s) added (${added.map((a) => a.id).join(', ')}) — a new artifact needs a full build`);
+  for (const r of removed) {
+    out.full.push(`pages: page '${r.id}' removed — removal is not a convergent fast shape`);
+    out.debt.push({ artifactType: 'page', identity: r.id, reason: 'page-removed' });
+  }
+  for (const c of common) {
+    const structuralSame = equalExcept(c.cur, c.prior, ['__contentSha']);
+    const contentDiffers = (c.cur.__contentSha || null) !== (c.prior.__contentSha || null);
+    if (structuralSame && contentDiffers) {
+      out.fast.push({ shape: 'page', phase: 'pages', identity: c.id, detail: 'tsx content changed (re-upload only)' });
+    } else if (!structuralSame) {
+      // name / navigatesTo / pageId / semantics changed — not a pure content re-upload.
+      out.full.push(`pages: page '${c.id}' changed structurally (name/nav/pageId/semantics) — not a content-only re-upload`);
+    }
+    // structuralSame && !contentDiffers => in the diff for another reason (or a hash tie) → ignore.
+  }
+  return out;
+}
+
+// #3 views: every changed view must be a PURE COLUMN APPEND (prior columns are an exact prefix of current;
+// everything else identical). A removed/reordered/edited column set does NOT converge (the engine only
+// UNIONS columns and never removes/reorders) → full build + debt. A new view → full build creates it.
+//
+// #845: two declared views may share one name on one table under two keys (views[].key). Aligned by `entity|name` alone, the
+// later of the two takes the place of the earlier on both sides (indexBy keeps the last), so an edit of the earlier one was not
+// seen at all. A name shared that way is aligned by its name AND key instead (viewAlignment). A shared name whose views cannot
+// all be told apart by a key of their own (a legacy workspace, a key missing or repeated) cannot be aligned: if anything in it
+// changed, which view changed cannot be said, so it is a full build with debt, as a non-append edit is.
+function classifyViews(cur, prior) {
+  const out = { fast: [], full: [], debt: [] };
+  const { alignKey, label, debtIdentity, unalignable } = viewAlignment(cur.views, prior.views);
+  for (const [id, sides] of unalignable) {
+    if (stableStringify(sides.cur) === stableStringify(sides.prior)) continue;
+    out.full.push(`views: the views named '${id}' share their name on the table without a key of their own each, and one of them changed — which one cannot be told, so it is not convergent`);
+    out.debt.push({ artifactType: 'view', identity: id, reason: 'view-nonappend-edit' });
+  }
+  const alignable = (arr) => (Array.isArray(arr) ? arr.filter((v) => !(v && typeof v === 'object' && unalignable.has(identityOf.view(v)))) : arr);
+  const aligned = alignByIdentity(alignable(cur.views), alignable(prior.views), alignKey);
+  const named = (e) => ({ ...e, id: label(e.cur || e.prior), debtId: debtIdentity(e.cur || e.prior) });
+  const [added, removed, common] = [aligned.added.map(named), aligned.removed.map(named), aligned.common.map(named)];
+  if (added.length) out.full.push(`views: ${added.length} new view(s) added — a new artifact needs a full build`);
+  for (const r of removed) { out.full.push(`views: view '${r.id}' removed`); out.debt.push({ artifactType: 'view', identity: r.debtId, reason: 'view-removed' }); }
+  for (const c of common) {
+    const restSame = equalExcept(c.cur, c.prior, ['columns']);
+    const colsSame = stableStringify(c.cur.columns || []) === stableStringify(c.prior.columns || []);
+    if (restSame && colsSame) continue; // some other slice noise — nothing to do for this view
+    if (restSame && isColumnPrefix(c.prior.columns, c.cur.columns) && (c.cur.columns || []).length > (c.prior.columns || []).length) {
+      out.fast.push({ shape: 'view', phase: 'views', identity: c.id, detail: `append ${(c.cur.columns || []).length - (c.prior.columns || []).length} column(s)` });
+    } else {
+      // width/order/filter/sort change, a non-append column edit, or a removal/reorder — the additive
+      // engine only unions columns, so this cannot be converged incrementally.
+      out.full.push(`views: view '${c.id}' changed beyond a pure column-append (reorder/remove/width/filter/sort) — not convergent`);
+      out.debt.push({ artifactType: 'view', identity: c.debtId, reason: 'view-nonappend-edit' });
+    }
+  }
+  return out;
+}
+
+// How classifyViews aligns the current views with the prior ones. A name (`entity|name`, identityOf.view) held by one view on each
+// side aligns by that name, exactly as before. A name held by two or more views on either side aligns by [name, key] when every one
+// of them, on both sides, has a key of its own (a non-empty string, not repeated): JSON, so it cannot collide with a plain name.
+// Otherwise the name is `unalignable` (id -> { cur, prior }: its views on each side, in order). `label` is how a message names a
+// view: its `entity|name`, plus its key when the name is shared. A debt entry names it by `debtIdentity` instead, which is its
+// alignment key: `entity|name` for a name held once, exactly as before, and the [name, key] JSON for a shared one. The label is
+// for a person and cannot be the identity: a view may be named like another's label ("Twin (view key v2)" beside the keyed Twin
+// v2), and the snapshot keeps one entry per identity (apply-snapshot.js addDebt), so two changed views would owe one debt. JSON
+// cannot collide with a plain name: no table's logical name starts with '['.
+function viewAlignment(curViews, priorViews) {
+  const side = (arr) => (Array.isArray(arr) ? arr.filter((v) => v && typeof v === 'object') : []);
+  const groups = new Map();
+  for (const [name, arr] of [['cur', side(curViews)], ['prior', side(priorViews)]]) {
+    for (const v of arr) {
+      const id = identityOf.view(v);
+      if (!groups.has(id)) groups.set(id, { cur: [], prior: [] });
+      groups.get(id)[name].push(v);
+    }
+  }
+  const ownKeys = (members) => members.every((v) => typeof v.key === 'string' && v.key !== '') && new Set(members.map((v) => v.key)).size === members.length;
+  const keyed = new Set();
+  const unalignable = new Map();
+  for (const [id, sides] of groups) {
+    if (sides.cur.length < 2 && sides.prior.length < 2) continue;
+    if (ownKeys(sides.cur) && ownKeys(sides.prior)) keyed.add(id);
+    else unalignable.set(id, sides);
+  }
+  const alignKey = (v) => (keyed.has(identityOf.view(v)) ? JSON.stringify([identityOf.view(v), v.key]) : identityOf.view(v));
+  const label = (v) => (keyed.has(identityOf.view(v)) ? `${identityOf.view(v)} (view key ${v.key})` : identityOf.view(v));
+  return { alignKey, label, debtIdentity: alignKey, unalignable };
+}
+
+// #4 app-shell: fast ONLY when the SITEMAP structure (appShell) changed but the app object is
+// byte-identical. The object is compared WHOLE, so a change to any app field — name, description,
+// routing description, icon — is not a sitemap-only edit.
+function classifyAppShell(cur, prior) {
+  const out = { fast: [], full: [], debt: [] };
+  const appSame = stableStringify(cur.app || null) === stableStringify(prior.app || null);
+  const shellSame = stableStringify(cur.appShell || null) === stableStringify(prior.appShell || null);
+  if (appSame && !shellSame) {
+    out.fast.push({ shape: 'app-shell', phase: 'app-shell', identity: 'sitemap', detail: 'sitemap structure changed (app object unchanged)' });
+  } else if (!appSame) {
+    out.full.push('app-shell: the app object changed — not a sitemap-only edit');
+  }
+  return out;
+}
+
+// Additive-skipped artifacts (charts/commands/dashboards) + web-resources: an ADDED one is created by a
+// full build (no debt); an EDITED existing one is SKIPPED by the additive engine (debt); a REMOVED one's
+// deletion is unproven (debt). Always full build (never a fast shape in v1).
+function classifyAdditive(cur, prior, phase, type, arrKey, opts = {}) {
+  // `convergedKeys` names the fields the ENGINE reconciles on an existing artifact. An edit confined
+  // to them still needs a full build, but it is applied — so recording it as permanent debt claims a
+  // divergence that will not exist after the rebuild. Business rules and business process flows both
+  // converge `status` (each reuse branch flips statecode in both directions), so a Draft->Active edit
+  // must not be filed as `-edit-not-convergent`.
+  const convergedKeys = opts.convergedKeys || [];
+  // `appliedEdit` is the same idea for a field the engine applies only SOMETIMES: { keys, applies(cur, prior) }. An edit confined to
+  // `convergedKeys` plus `keys` is applied when `applies` says so — a business process flow's `stages`, where an edit that leaves
+  // every deployed stage in place is written in place and one that would remove or move a stage or a step is refused.
+  const appliedEdit = opts.appliedEdit || null;
+  const reconciledKeys = [...convergedKeys, ...(appliedEdit ? appliedEdit.keys : [])];
+  const out = { fast: [], full: [], debt: [] };
+  const { added, removed, common } = alignByIdentity(cur[arrKey], prior[arrKey], identityOf[type]);
+  if (added.length) out.full.push(`${phase}: ${added.length} new ${type}(s) added — full build`);
+  for (const r of removed) { out.full.push(`${phase}: ${type} '${r.id}' removed`); out.debt.push({ artifactType: type, identity: r.id, reason: `${type}-removed` }); }
+  for (const c of common) {
+    if (stableStringify(c.cur) !== stableStringify(c.prior)) {
+      const onlyConverged = convergedKeys.length && equalExcept(c.cur, c.prior, convergedKeys);
+      const applied = onlyConverged || (appliedEdit && equalExcept(c.cur, c.prior, reconciledKeys) && appliedEdit.applies(c.cur, c.prior));
+      // Name only the keys that actually differ. "status/securityRoles changed" when just one did is
+      // the kind of small inaccuracy that makes a reader stop trusting the whole report.
+      const changed = reconciledKeys.filter((k) => stableStringify(c.cur && c.cur[k]) !== stableStringify(c.prior && c.prior[k]));
+      out.full.push(applied
+        ? `${phase}: ${type} '${c.id}' ${(changed.length ? changed : convergedKeys).join('/')} changed — reconciled by a full build`
+        : `${phase}: ${type} '${c.id}' edited — the additive build engine skips edits to an existing ${type}`);
+      if (!applied) out.debt.push({ artifactType: type, identity: c.id, reason: `${type}-edit-not-convergent` });
+    }
+  }
+  return out;
+}
+
+// forms: conservatively full build. An ADDED form is created by a full build (no debt). An EDITED existing
+// form records a debt-candidate: a pure field-ADD converges (engine appends to the first section) but a
+// placement/subgrid/event/quickView edit does NOT — which is which can only be proven at build time
+// against the deployed form projection, so the classifier records the debt and the build-time verifier
+// clears it iff convergence is proven (design §"Eligibility state machine").
+function classifyForms(cur, prior) {
+  const out = { fast: [], full: [], debt: [] };
+  const { added, removed, common } = alignByIdentity(cur.forms, prior.forms, identityOf.form);
+  if (added.length) out.full.push(`forms: ${added.length} new form(s) added — full build`);
+  for (const r of removed) { out.full.push(`forms: form '${r.id}' removed`); out.debt.push({ artifactType: 'form', identity: r.id, reason: 'form-removed' }); }
+  for (const c of common) {
+    if (stableStringify(c.cur) !== stableStringify(c.prior)) {
+      out.full.push(`forms: form '${c.id}' edited — full build (placement convergence verified at build time)`);
+      out.debt.push({ artifactType: 'form', identity: c.id, reason: 'form-edit-verify-at-build' });
+    }
+  }
+  return out;
+}
+
+// commandStates[]: matched by row id. Every change is applied by a full build, which reads each declared row and asks for approval of what it
+// finds (lib/command-state-run.js), so none is debt. An entry no longer declared leaves its row's flags as they are: that is not a divergence
+// a later build could close either, so it is said and not recorded.
+function classifyCommandStates(cur, prior) {
+  const out = { fast: [], full: [], debt: [] };
+  const byRow = (list) => new Map((Array.isArray(list) ? list : []).map((e) => [String((e && e.rowId) || '').toLowerCase(), e]));
+  const now = byRow(cur.commandStates);
+  const before = byRow(prior.commandStates);
+  for (const [id, entry] of now) {
+    if (!before.has(id)) out.full.push(`commands: command state of row '${id}' added — applied by a full build`);
+    else if (stableStringify(entry) !== stableStringify(before.get(id))) out.full.push(`commands: command state of row '${id}' changed — applied by a full build`);
+  }
+  for (const id of before.keys()) {
+    if (!now.has(id)) out.full.push(`commands: command state of row '${id}' no longer declared — a build leaves the row's flags as they are`);
+  }
+  return out;
+}
+
+// THE classifier. `current` / `prior` are ANNOTATED specs. Returns:
+//   { verdict:'noop'|'fast'|'full', changedPhases, fastChanges, fullReasons, debt }
+// verdict 'fast' ⇒ every changed phase yielded a convergent shape (fastChanges) and there are no
+// fullReasons; the caller may take the fast path (after the snapshot-eligibility + live drift gates).
+function classifyChanges(current, prior) {
+  const cur = current || {};
+  if (!prior) {
+    return { verdict: 'full', changedPhases: diffPhases(cur, null), fastChanges: [], fullReasons: ['no prior snapshot — a first/foreign build is always full'], debt: [] };
+  }
+  const changedPhases = diffPhases(cur, prior);
+  if (changedPhases.length === 0) {
+    return { verdict: 'noop', changedPhases: [], fastChanges: [], fullReasons: [], debt: [] };
+  }
+  const fastChanges = [], fullReasons = [], debt = [];
+  const merge = (r) => { fastChanges.push(...r.fast); fullReasons.push(...r.full); debt.push(...r.debt); };
+
+  for (const phase of changedPhases) {
+    if (FULL_BUILD_PHASES.has(phase)) {
+      fullReasons.push(`${phase}: changed — always a full build`);
+      continue;
+    }
+    // Every changed phase must account for its change: a fast shape or a reason for a full build. A phase whose slice changed
+    // while its detectors found nothing (a change they do not look at, or an entry hidden by another of the same identity, #845)
+    // would otherwise ride along with another phase's fast shape — a pages-only run would then skip it and record the new spec
+    // as applied. So it is a full build, as it already is when no phase found anything (below).
+    const before = fastChanges.length + fullReasons.length;
+    switch (phase) {
+      case 'pages': merge(classifyPages(cur, prior)); break;
+      case 'views': merge(classifyViews(cur, prior)); break;
+      case 'app-shell': merge(classifyAppShell(cur, prior)); break;
+      case 'forms': merge(classifyForms(cur, prior)); break;
+      case 'charts': merge(classifyAdditive(cur, prior, 'charts', 'chart', 'charts')); break;
+      case 'commands': merge(classifyAdditive(cur, prior, 'commands', 'command', 'commands')); merge(classifyCommandStates(cur, prior)); break;
+      case 'dashboards': merge(classifyAdditive(cur, prior, 'dashboards', 'dashboard', 'dashboards')); break;
+      case 'web-resources': merge(classifyAdditive(cur, prior, 'web-resources', 'webResource', 'webResources')); break;
+      // Both are additive discover-reconcile: the engine creates what is missing and does NOT reapply
+      // condition edits to an existing rule ("recreate to change"), so an edit is real debt. The ONE
+      // exception is `status`: both reuse branches converge statecode in both directions, so a
+      // status-only change is applied by a rebuild and is not debt. A flow's stages are the other
+      // exception, but only for the edits the build applies in place (below).
+      case 'business-rules': merge(classifyAdditive(cur, prior, 'business-rules', 'businessRule', 'businessRules', { convergedKeys: ['status'] })); break;
+      // `securityRoles` converges too, and for a stronger reason than `status`: a BPF grant always
+      // targets a PERSONA role, which the security phase applies with `ReplacePrivilegesRole` — so a
+      // rebuild both ADDS a newly-declared persona and REMOVES one that was dropped. Filing it as
+      // permanent debt disabled every later fast apply over a divergence that a full build erases.
+      // (`roleGrants[]` would NOT qualify: it is additive and cannot revoke.)
+      //
+      // `stages` converge when the build applies the edit in place: a stage added or renamed, a step
+      // added, renamed, rebound, made required or optional or moved. One that would remove a stage or
+      // a step, or reorder the stages, is REFUSED by the build (a record may sit on that stage), so
+      // it stays debt. stageEditApplies asks the build's own plan, so the two cannot disagree.
+      case 'business-process-flows': merge(classifyAdditive(cur, prior, 'business-process-flows', 'businessProcessFlow', 'businessProcessFlows', {
+        convergedKeys: ['status', 'securityRoles'],
+        appliedEdit: { keys: ['stages'], applies: (curFlow, priorFlow) => stageEditApplies(priorFlow, curFlow) },
+      })); break;
+      default:
+        // An unrecognized changed phase must never silently pass as fast (fail-closed).
+        fullReasons.push(`${phase}: changed — no fast-path shape recognized`);
+    }
+    if (fastChanges.length + fullReasons.length === before) fullReasons.push(`${phase}: changed, but no change in it could be classified — full build (fail-closed)`);
+  }
+
+  // Dedup debt (a phase can push the same identity twice across detectors is unlikely, but be safe).
+  const debtKey = (d) => `${d.artifactType}\u0000${d.identity}\u0000${d.reason}`;
+  const dedupDebt = [...new Map(debt.map((d) => [debtKey(d), d])).values()];
+
+  const verdict = fullReasons.length === 0 && fastChanges.length > 0 ? 'fast' : 'full';
+  // Fail-closed: if a phase reported changed but no detector produced a shape OR a reason (a hash tie or
+  // annotation artifact), fall to a full build with an explicit reason rather than a silent pass.
+  if (verdict === 'full' && fullReasons.length === 0 && fastChanges.length === 0) {
+    fullReasons.push('changed phase(s) produced no recognized fast shape — full build (fail-closed)');
+  }
+  return { verdict, changedPhases, fastChanges, fullReasons, debt: dedupDebt };
+}
+
+module.exports = {
+  classifyChanges,
+  // exported for focused unit tests
+  classifyPages,
+  classifyViews,
+  classifyAppShell,
+  classifyForms,
+  classifyAdditive,
+  isColumnPrefix,
+  equalExcept,
+  alignByIdentity,
+  identityOf,
+};

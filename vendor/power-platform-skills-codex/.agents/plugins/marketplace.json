@@ -1,0 +1,140 @@
+{
+  "name": "power-platform-skills-codex-community",
+  "interface": {
+    "displayName": "Power Platform Skills (Codex port)"
+  },
+  "plugins": [
+    {
+      "name": "power-pages",
+      "source": {
+        "source": "local",
+        "path": "./plugins/power-pages"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "model-apps",
+      "source": {
+        "source": "local",
+        "path": "./plugins/model-apps"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "pcf",
+      "source": {
+        "source": "local",
+        "path": "./plugins/pcf"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "mcp-apps",
+      "source": {
+        "source": "local",
+        "path": "./plugins/mcp-apps"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "canvas-apps",
+      "source": {
+        "source": "local",
+        "path": "./plugins/canvas-apps"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "code-apps-preview",
+      "source": {
+        "source": "local",
+        "path": "./plugins/code-apps"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "mobile-app",
+      "source": {
+        "source": "local",
+        "path": "./plugins/mobile-apps"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "power-apps-mobile-extension",
+      "source": {
+        "source": "local",
+        "path": "./plugins/power-apps-mobile-extension"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "power-automate",
+      "source": {
+        "source": "local",
+        "path": "./plugins/power-automate"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "process-intelligence",
+      "source": {
+        "source": "local",
+        "path": "./plugins/process-intelligence"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "dataverse",
+      "source": {
+        "source": "local",
+        "path": "./plugins/dataverse"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+    "schemaVersion":  1,
+    "projectName":  "PowerPlatformProject",
+    "solution":  {
+                     "uniqueName":  "PowerPlatformHandsOnMvp",
+                     "publisherName":  "PowerPlatformHandsOn",
+                     "publisherPrefix":  "ppho",
+                     "sourceDirectory":  "solution/source"
+                 },
+    "development":  {
+                        "environmentName":  "DEX_CRM_DEV",
+                        "environmentId":  "d7d08350-4adb-e952-a3fb-322466ea1e90",
+                        "dataverseUrl":  "https://dexcrmdev.crm5.dynamics.com/",
+                        "canvasAppId":  null,
+                        "appPlayUrl":  null
+                    },
+    "target":  {
+                   "environmentName":  null,
+                   "environmentId":  null,
+                   "dataverseUrl":  null
+               },
+    "canvas":  {
+                   "workDirectory":  "canvas-work/app",
+                   "supportingFiles":  [
+
+                                       ],
+                   "synchronizationState":  "unknown"
+               },
+    "data":  {
+                 "provider":  "dataverse"
+             },
+    "automation":  {
+                       "contractsPath":  "docs/flows/contracts.json"
+                   },
+    "testing":  {
+                    "playwrightMcpUrl":  "http://127.0.0.1:8931/mcp",
+                    "dataWritesAuthorized":  false,
+                    "timeoutMs":  15000
+                }
+}

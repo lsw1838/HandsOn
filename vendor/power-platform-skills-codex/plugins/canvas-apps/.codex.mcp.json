@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "canvas-authoring": {
+      "command": "dnx",
+      "args": [
+        "Microsoft.PowerApps.CanvasAuthoring.McpServer",
+        "--yes"
+      ]
+    }
+  }
+}
